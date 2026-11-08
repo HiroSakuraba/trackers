@@ -1,0 +1,46 @@
+{
+  "program": "frankenlife-m0",
+  "model_version": "field-ecology-v1/fl-core-0.1",
+  "stack": {
+    "asupersync": "460306de2aa4169510873716018ade44fdb01534",
+    "frankentorch": "287e14d335dd79d4e0e704c0e9d4231e1d64fcc5",
+    "franken_numpy": "20159e89c4ba2d6822b395eeff538f8c47ed8b6f",
+    "franken_manim": "a12661bc59cef63526538afb7bd885bd5bf5ca04"
+  },
+  "capabilities": {
+    "asupersync": "RuntimeBuilder (2 workers); one region scope owning world-owner, renderer and driver tasks; bounded mpsc control channel; watch channel of committed render epochs (latest only); cx.checkpoint() between ticks",
+    "frankentorch": "frankentorch-kernel-cpu bmm_tensor_contiguous_f32_into over persistent per-topology slabs; independent weights per organism; executor = FrankenTorch's internal Rayon pool (not Asupersync-scheduled); tolerance-equivalent to the fl-core scalar reference, not bitwise",
+    "franken_numpy": "NdLayout descriptors for the field checked against fl-core buffers; ArrayStorage::F32 planes; fnp-io .npz export of the final epoch",
+    "franken_manim": "fmn render() native PNG per published epoch: one ImageMobject (field) + up to 12 DotClouds (color buckets)",
+    "inference_backend": "Compare",
+    "known_gaps": [
+      "world.step() runs on the owner task rather than Asupersync's blocking pool",
+      "FrankenTorch CPU bmm uses its own Rayon pool (executor boundary, plan §3.4)",
+      "DotCloud has one color per cloud: organism colors are quantized to 12 buckets",
+      "no Metal path on this Linux host; no durable command journal"
+    ]
+  },
+  "result": {
+    "stop": "completed",
+    "ticks": 256,
+    "population": 4096,
+    "births": 0,
+    "deaths": 0,
+    "ledger_cumulative_residual": -2.849236164781388e-6,
+    "final_state_hash": "52ac89749a88dd21",
+    "control_state_hash": "52ac89749a88dd21",
+    "runtime_and_observers_are_view_neutral": true,
+    "torch_max_abs_logit_diff_vs_reference": 4.33996319770813e-7,
+    "torch_stats": "TorchStats { calls: 256, evaluations: 1048576, genome_uploads: 4096, evictions: 0, batched_matmuls: 768, padded_slot_evaluations: 0 }",
+    "torch_resident_weight_bytes": 163643392,
+    "epochs_published": 5,
+    "frames_rendered": 5,
+    "epochs_skipped_by_renderer": 0,
+    "last_render": "runs/m0_compare/frames/tick_00000256.png (376815 bytes)",
+    "npz_bytes": 2344816,
+    "wall_seconds": 16.093736057,
+    "owner_step_wall_seconds": 15.033426961999998,
+    "renderer_wall_seconds": 0.493655808,
+    "achieved_ticks_per_wall_second": 17.02871877763409
+  }
+}

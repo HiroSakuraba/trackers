@@ -112,7 +112,7 @@ impl SceneConstruct for EpochScene<'_> {
             let gain = if b % 2 == 1 { 1.0 } else { 0.62 };
             let color = Srgb { r: (c[0] * gain) as f64, g: (c[1] * gain) as f64, b: (c[2] * gain) as f64 };
             let cloud = DotCloud::new(pts.iter().map(|&p| to_scene(p))).with_radius(radius).with_glow_factor(1.0).colored(color, 1.0);
-            stage.add(cloud.with_z_index(1))?;
+            stage.add(cloud)?;
         }
         stage.wait(1.0 / 30.0)?;
         Ok(())
@@ -125,6 +125,8 @@ pub fn render_png(epoch: &RenderEpoch, path: &Path, pixels: u32) -> Result<Rende
     opts.config.camera.resolution = (pixels, pixels);
     opts.config.camera.background_color = "#020308".into();
     opts.config.camera.fps = 30;
+    // Image content (the field) is drawn by FrankenManim's camera route.
+    opts.camera = Some(opts.camera_config().map_err(|e| format!("{e}"))?);
     let frame_height = opts.config.sizes.frame_height;
     let mut scene = EpochScene { epoch, frame_height };
     render(&mut scene, opts).map_err(|e| format!("{e}"))

@@ -1,0 +1,46 @@
+{
+  "program": "frankenlife-m0",
+  "model_version": "field-ecology-v1/fl-core-0.1",
+  "stack": {
+    "asupersync": "460306de2aa4169510873716018ade44fdb01534",
+    "frankentorch": "287e14d335dd79d4e0e704c0e9d4231e1d64fcc5",
+    "franken_numpy": "20159e89c4ba2d6822b395eeff538f8c47ed8b6f",
+    "franken_manim": "a12661bc59cef63526538afb7bd885bd5bf5ca04"
+  },
+  "capabilities": {
+    "asupersync": "RuntimeBuilder (2 workers); one region scope owning world-owner, renderer and driver tasks; bounded mpsc control channel; watch channel of committed render epochs (latest only); cx.checkpoint() between ticks",
+    "frankentorch": "frankentorch-kernel-cpu bmm_tensor_contiguous_f32_into over persistent per-topology slabs; independent weights per organism; executor = FrankenTorch's internal Rayon pool (not Asupersync-scheduled); tolerance-equivalent to the fl-core scalar reference, not bitwise",
+    "franken_numpy": "NdLayout descriptors for the field checked against fl-core buffers; ArrayStorage::F32 planes; fnp-io .npz export of the final epoch",
+    "franken_manim": "fmn render() native PNG per published epoch: one ImageMobject (field) + up to 12 DotClouds (color buckets)",
+    "inference_backend": "Reference",
+    "known_gaps": [
+      "world.step() runs on the owner task rather than Asupersync's blocking pool",
+      "FrankenTorch CPU bmm uses its own Rayon pool (executor boundary, plan §3.4)",
+      "DotCloud has one color per cloud: organism colors are quantized to 12 buckets",
+      "no Metal path on this Linux host; no durable command journal"
+    ]
+  },
+  "result": {
+    "stop": "completed",
+    "ticks": 384,
+    "population": 4098,
+    "births": 2,
+    "deaths": 0,
+    "ledger_cumulative_residual": 0.0000187357913739028,
+    "final_state_hash": "334ab1434e96794f",
+    "control_state_hash": "334ab1434e96794f",
+    "runtime_and_observers_are_view_neutral": true,
+    "torch_max_abs_logit_diff_vs_reference": null,
+    "torch_stats": null,
+    "torch_resident_weight_bytes": 0,
+    "epochs_published": 4,
+    "frames_rendered": 4,
+    "epochs_skipped_by_renderer": 0,
+    "last_render": "runs/m0_reference/frames/tick_00000384.png (451099 bytes)",
+    "npz_bytes": 2344904,
+    "wall_seconds": 17.393081516,
+    "owner_step_wall_seconds": 16.424540319000002,
+    "renderer_wall_seconds": 0.43111911299999994,
+    "achieved_ticks_per_wall_second": 23.379649752254352
+  }
+}

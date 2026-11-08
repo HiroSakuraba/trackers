@@ -47,7 +47,7 @@ Needs `rustup target add wasm32-unknown-unknown`.
 
 ```bash
 cd frankenlife
-cargo test --release                      # 44 unit/known-answer/world fixtures
+cargo test --release                      # 45 unit/known-answer/world fixtures
 cargo run --release -- validate           # derived capacity & cost report for the reference preset
 cargo run --release -- run --config presets/vivid-field-ecology.toml \
     --seconds 45 --frame-every 4 --size 720 --out runs/vivid
@@ -95,6 +95,7 @@ Everything below follows the plan's equations; section numbers refer to it.
 | Lifecycle (§7.4–7.6) | Hazard → `expm1` probability, one Bernoulli per eligible tick, viability checks, birth cost, cooldowns, disk-uniform child offsets; exhaustion re-checked after every budget stage; residual-energy recycling. |
 | Tick (§8) | All 10 phases in order, computed into a **candidate** state; publication only after invariant checks. A capacity pause or numerical fault leaves the committed world bit-identical. |
 | Ledger (§4.4) | Per tick and cumulative `ΔE = I − O − D + ε` with a 9-way dissipation breakdown; residual reported, never silently corrected. |
+| Backends (§10, §18.3) | `ControllerBackend` port (`World::step_with`): the scalar reference is built in; `integration/fl-torch` provides FrankenTorch. A reference run through the port reproduces the built-in state hash. |
 | Randomness (§16.2) | Counter-based Philox4x32-10 addressed by `(lane, stable id, tick, candidate, draw)` — never by slot or schedule. State hashes are identical for 1 and 4 worker threads. |
 | Capacity (§7.5) | Live-count and logical-genome-byte quotas; research `pause-before-commit` or exhibition `reject-births-stable-order`. |
 | Checkpoints (§16.3) | `FLCK` v1 container with FNV-1a checksum: effective config, field planes, all organism hot state incl. held outputs/phases/cooldowns/energy history, genome bank, source paths, ID counters, pending future commands, ledger. `save(load(x)) == x`; resume is bit-identical (C.13 test, and CLI hash check). Refuses foreign model versions and corrupt files. |
@@ -129,29 +130,29 @@ from this container only, not benchmarks.
 
 ## What is *not* done (honest gap list)
 
-The plan names a specific stack. None of it is linked here, and nothing in
-this directory should be described as using it:
+The Franken stack integration lives in [`integration/`](integration/README.md)
+(separate nightly workspace, upstream pinned by revision). Its M0 program runs
+the world under an **Asupersync** runtime, checks the field against
+**FrankenNumPy** layout descriptors and exports `.npz`, evaluates independent
+networks with **FrankenTorch** batched matmul (max |Δlogit| vs reference 4.3e-7
+at 4,096 × 9,988 params), and renders committed epochs with **FrankenManim**.
+Still missing:
 
-- **Asupersync** runtime ownership, command durability, cancellation lab tests —
-  the world is driven by a plain loop; parallel sensing/inference uses
-  `std::thread::scope` (deterministic, execution-only).
-- **FrankenTorch / FrankenNumPy** typed storage, population kernels, Metal —
-  the scalar CPU evaluator here is the "reference evaluator" role only.
-- **FrankenManim** bulk primitives, cameras, timeline and Cinema export — a
-  headless CPU rasterizer renders committed epochs to PNG, and the browser
-  Studio draws them with Canvas 2D instead.
-- **FrankenSQLite** run catalog, write-ahead command journal and durable
-  crash recovery — not implemented; metrics are JSONL and checkpoints are
-  plain files. Checkpoints store full F32 genomes (~165 MB at 4,096
-  organisms); content deduplication / incremental retention is not done.
+- Asupersync-scheduled data parallelism (the tick runs on the owner task;
+  FrankenTorch uses its own Rayon pool), a durable write-ahead command journal,
+  and lab/cancellation-injection tests.
+- FrankenTorch Metal (no macOS host here), fused population kernels, F16 genomes.
+- A FrankenManim live Studio, cameras/timeline and Cinema export; per-point
+  colors in `DotCloud` (organisms are bucketed into 12 colors).
+- **FrankenSQLite** run catalog and crash recovery; checkpoints are plain files
+  storing full F32 genomes (~165 MB at 4,096 organisms) without deduplication.
 - Scale: 25k (M2) and 400k (M4) profiles, deterministic GPU reductions,
-  F16 canonical genomes, timestep-refinement studies, ablations, seed gallery.
+  timestep-refinement studies, ablations, seed gallery.
 
 `mutation.rng` in the presets is `fl-philox-semantic-v1` (this crate's own
 address mapping) rather than Appendix A's `fnp-philox-semantic-v1`.
 `frankenlife validate` lists the declared-but-unimplemented infrastructure
 keys explicitly.
 
-The natural next step per §26.2 is step 4: put the world owner behind
-Asupersync and publish immutable render epochs to a FrankenManim bulk adapter,
-keeping `fl-core` as the authoritative model and fixture oracle.
+Next steps per §26.2: move tick computation onto Asupersync-admitted workers,
+add the FrankenSQLite catalog and journal, and profile toward the 25k profile.

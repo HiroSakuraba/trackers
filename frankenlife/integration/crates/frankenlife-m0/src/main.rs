@@ -339,7 +339,7 @@ async fn session(cx: &Cx, args: &Args, cfg: Config) -> (OwnerSummary, RendererSu
                         let rep = fl_manim::render_png(&e, &path, pixels)?;
                         r.render_wall_s += t.elapsed().as_secs_f64();
                         r.frames += 1;
-                        r.last_report = format!("{} ({} bytes)", rep.artifact.path.display(), rep.artifact.byte_count);
+                        r.last_report = format!("{} ({} bytes)", rep.artifact.path.display(), rep.artifact.bytes);
                     }
                 }
                 if epoch_rx.changed(&cx).await.is_err() {

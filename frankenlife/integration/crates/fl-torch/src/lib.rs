@@ -70,8 +70,9 @@ impl Slab {
             Some(s) => s,
             None => {
                 for (l, &(i, o)) in self.dims.iter().enumerate() {
-                    self.w[l].resize(self.w[l].len() + o * i, 0.0);
-                    self.b[l].resize(self.b[l].len() + o, 0.0);
+                    let (nw, nb) = (self.w[l].len() + o * i, self.b[l].len() + o);
+                    self.w[l].resize(nw, 0.0);
+                    self.b[l].resize(nb, 0.0);
                 }
                 self.owner.push(None);
                 self.last_used.push(0);
