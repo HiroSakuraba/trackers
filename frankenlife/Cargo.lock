@@ -290,6 +290,7 @@ dependencies = [
 name = "fl-gpu"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "fl-core",
  "pollster",
  "wgpu",

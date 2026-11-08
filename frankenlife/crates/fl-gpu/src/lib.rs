@@ -51,6 +51,10 @@ pub struct EvalTiming {
     pub gpu_roundtrip_ms: f64,
     /// Compute-pass time from GPU timestamps, when the adapter supports them.
     pub kernel_ms: Option<f64>,
+    /// Packing inputs per dispatch, scattering logits back, and slot eviction.
+    pub bookkeeping_ms: f64,
+    /// The whole `evaluate` call.
+    pub total_ms: f64,
     pub dispatches: u32,
 }
 
@@ -113,12 +117,13 @@ pub struct GpuBackend {
     io: Option<Io>,
     call: u64,
     timestamps: Option<Timestamps>,
+    input_scratch: Vec<f32>,
     pub info: GpuInfo,
     pub stats: GpuStats,
 }
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+fn f32_bytes(v: &[f32]) -> &[u8] {
+    bytemuck::cast_slice(v)
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -199,7 +204,7 @@ impl GpuBackend {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
             max_buffer_bytes: limits.max_buffer_size,
         };
-        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, info, stats: GpuStats::default() })
+        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, input_scratch: Vec::new(), info, stats: GpuStats::default() })
     }
 
     pub fn capability(&self) -> String {
@@ -278,7 +283,7 @@ impl GpuBackend {
             tw[i * o..].copy_from_slice(&params[off + i * o..off + i * o + o]);
             off += i * o + o;
             let (page, local) = (slot / slab.page_slots, slot % slab.page_slots);
-            self.queue.write_buffer(&slab.pages[page][l], (local * slab.stride[l] * 4) as u64, &f32_bytes(&tw));
+            self.queue.write_buffer(&slab.pages[page][l], (local * slab.stride[l] * 4) as u64, f32_bytes(&tw));
         }
     }
 
@@ -316,8 +321,8 @@ impl GpuBackend {
         d[6] = grid_x;
         let ub: Vec<u8> = d.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.queue.write_buffer(&self.uniform, 0, &ub);
-        self.queue.write_buffer(&io.slots, 0, &slots.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
-        self.queue.write_buffer(&io.inputs, 0, &f32_bytes(inputs));
+        self.queue.write_buffer(&io.slots, 0, bytemuck::cast_slice(slots));
+        self.queue.write_buffer(&io.inputs, 0, f32_bytes(inputs));
         let w = |l: usize| slab.pages[page].get(l).unwrap_or(&self.dummy).as_entire_binding();
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mlp"),
@@ -379,7 +384,10 @@ impl GpuBackend {
         }
         let out: Vec<f32> = {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
-            view.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            match bytemuck::try_cast_slice::<u8, f32>(&view) {
+                Ok(f) => f.to_vec(),
+                Err(_) => view.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            }
         };
         io.staging.unmap();
         self.stats.last.gpu_roundtrip_ms += round.elapsed().as_secs_f64() * 1e3;
@@ -412,6 +420,7 @@ impl ControllerBackend for GpuBackend {
         self.stats.calls += 1;
         self.stats.evaluations += jobs.len() as u64;
         self.stats.last = EvalTiming::default();
+        let total = std::time::Instant::now();
         let prep = std::time::Instant::now();
         let mut placed = Vec::with_capacity(jobs.len());
         for j in jobs {
@@ -443,16 +452,27 @@ impl ControllerBackend for GpuBackend {
             let ps = self.slabs[t].page_slots;
             let mine: Vec<usize> = (0..jobs.len()).filter(|&k| placed[k].0 == t && placed[k].1 / ps == page).collect();
             let slots: Vec<u32> = mine.iter().map(|&k| (placed[k].1 % ps) as u32).collect();
-            let mut inputs = Vec::with_capacity(mine.len() * INPUT_WIDTH);
+            let bk = std::time::Instant::now();
+            let mut inputs = std::mem::take(&mut self.input_scratch);
+            inputs.clear();
+            inputs.reserve(mine.len() * INPUT_WIDTH);
             for &k in &mine {
                 inputs.extend_from_slice(jobs[k].input);
             }
-            let res = self.run_topology(t, page, &slots, &inputs)?;
+            self.stats.last.bookkeeping_ms += bk.elapsed().as_secs_f64() * 1e3;
+            let res = self.run_topology(t, page, &slots, &inputs);
+            self.input_scratch = inputs;
+            let res = res?;
+            let bk = std::time::Instant::now();
             for (r, &k) in mine.iter().enumerate() {
                 out[k].copy_from_slice(&res[r * OUTPUT_WIDTH..(r + 1) * OUTPUT_WIDTH]);
             }
+            self.stats.last.bookkeeping_ms += bk.elapsed().as_secs_f64() * 1e3;
         }
+        let bk = std::time::Instant::now();
         self.evict_stale();
+        self.stats.last.bookkeeping_ms += bk.elapsed().as_secs_f64() * 1e3;
+        self.stats.last.total_ms = total.elapsed().as_secs_f64() * 1e3;
         Ok(())
     }
 }

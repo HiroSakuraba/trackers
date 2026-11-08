@@ -430,6 +430,15 @@ fn run(a: RunArgs) -> i32 {
         };
         phases.add(&r.timing);
         run_phases.add(&r.timing);
+        #[cfg(feature = "gpu")]
+        if let Some(g) = gpu.as_ref() {
+            let l = g.stats.last;
+            let v = [l.host_prep_ms, l.gpu_roundtrip_ms, l.kernel_ms.unwrap_or(0.0), l.bookkeeping_ms, l.total_ms];
+            for k in 0..5 {
+                phases.gpu[k] += v[k];
+                run_phases.gpu[k] += v[k];
+            }
+        }
         interval.0 += r.counts.births;
         interval.1 += r.counts.deaths_exhaustion + r.counts.deaths_user;
         interval_ticks += 1;
@@ -450,6 +459,13 @@ fn run(a: RunArgs) -> i32 {
                 world.tick, world.simulation_seconds(), world.orgs.len(), interval.0, interval.1, l.residual, steps_per_s,
                 phases.step_ms / n, phases.transport_ms / n, phases.sense_and_infer_ms / n, phases.backend_inference_ms / n, phases.exchange_ms / n, phases.lifecycle_ms / n
             );
+            if phases.gpu[4] > 0.0 {
+                eprintln!(
+                    "             gpu backend {:.2} ms = host prep {:.2} + round trip {:.2} (kernel {:.2}) + bookkeeping {:.2}; outside evaluate {:.2}",
+                    phases.gpu[4] / n, phases.gpu[0] / n, phases.gpu[1] / n, phases.gpu[2] / n, phases.gpu[3] / n,
+                    (phases.backend_inference_ms - phases.gpu[4]) / n
+                );
+            }
             phases = Phases::default();
             interval = (0, 0);
             interval_ticks = 0;
@@ -552,6 +568,8 @@ struct Phases {
     frame_ms: f64,
     frames: u64,
     checkpoint_ms: f64,
+    /// GPU backend breakdown (summed over ticks): host prep, round trip, kernel, bookkeeping, evaluate total.
+    gpu: [f64; 5],
 }
 
 impl Phases {
@@ -583,6 +601,13 @@ impl Phases {
             "mean_frame_ms": if self.frames > 0 { self.frame_ms / self.frames as f64 } else { 0.0 },
             "checkpoint_ms": self.checkpoint_ms,
             "budget_ms_at_128_steps_per_second": 1000.0 / 128.0,
+            "gpu_backend_mean_ms": {
+                "host_prep": self.gpu[0] / n,
+                "round_trip_including_kernel": self.gpu[1] / n,
+                "kernel_gpu_timestamps": self.gpu[2] / n,
+                "bookkeeping": self.gpu[3] / n,
+                "evaluate_total": self.gpu[4] / n,
+            },
         })
     }
 }
