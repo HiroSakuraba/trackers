@@ -189,6 +189,56 @@ pub fn proportion(wall_ns: u64, weight_a: u64, weight_b: u64) -> (u64, u64) {
     (a, wall_ns - a)
 }
 
+/// Pieces of [`CpuStage::Other`]. They are already included in that stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OtherPart {
+    /// Candidate clone, command application.
+    Setup = 0,
+    /// Copy fused sense results into the per-organism table.
+    SenseScatter = 1,
+    /// Store held controller outputs.
+    HeldStore = 2,
+    /// Copy resident uptake rows into settlements.
+    UptakeScatter = 3,
+    /// Motion, emission, and reproduction proposals.
+    LifecycleMotion = 4,
+    /// Births, deaths, retain, and child append.
+    LifecycleCommit = 5,
+    /// Invariant checks and publication of the candidate.
+    Publish = 6,
+}
+
+pub const OTHER_PART_COUNT: usize = 7;
+
+impl OtherPart {
+    pub const ALL: [OtherPart; OTHER_PART_COUNT] = [
+        OtherPart::Setup,
+        OtherPart::SenseScatter,
+        OtherPart::HeldStore,
+        OtherPart::UptakeScatter,
+        OtherPart::LifecycleMotion,
+        OtherPart::LifecycleCommit,
+        OtherPart::Publish,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            OtherPart::Setup => "setup",
+            OtherPart::SenseScatter => "sense_scatter",
+            OtherPart::HeldStore => "held_store",
+            OtherPart::UptakeScatter => "uptake_scatter",
+            OtherPart::LifecycleMotion => "lifecycle_motion",
+            OtherPart::LifecycleCommit => "lifecycle_commit",
+            OtherPart::Publish => "publish",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as u8 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProfileTotals {
     pub ticks: u64,
@@ -196,6 +246,7 @@ pub struct ProfileTotals {
     pub entries: [u64; CPU_STAGE_COUNT],
     pub sensing_thread_ns: u64,
     pub networks_thread_ns: u64,
+    pub other_part_ns: [u64; OTHER_PART_COUNT],
 }
 
 impl ProfileTotals {
@@ -216,6 +267,13 @@ impl ProfileTotals {
             networks_thread_ns: self
                 .networks_thread_ns
                 .saturating_sub(earlier.networks_thread_ns),
+            other_part_ns: {
+                let mut p = [0u64; OTHER_PART_COUNT];
+                for i in 0..OTHER_PART_COUNT {
+                    p[i] = self.other_part_ns[i].saturating_sub(earlier.other_part_ns[i]);
+                }
+                p
+            },
         }
     }
 }
@@ -232,6 +290,8 @@ pub struct StageProfiler {
     sensing_thread_ns: u64,
     /// Sum of per-thread `forward` samples. Same caveat as `sensing_thread_ns`.
     networks_thread_ns: u64,
+    /// Breakdown of [`CpuStage::Other`]. Sum of these is that stage, not an extra cost.
+    other_part_ns: [u64; OTHER_PART_COUNT],
 }
 
 impl Default for StageProfiler {
@@ -249,6 +309,7 @@ impl StageProfiler {
             entries: [0; CPU_STAGE_COUNT],
             sensing_thread_ns: 0,
             networks_thread_ns: 0,
+            other_part_ns: [0; OTHER_PART_COUNT],
         }
     }
 
@@ -288,7 +349,12 @@ impl StageProfiler {
             entries: self.entries,
             sensing_thread_ns: self.sensing_thread_ns,
             networks_thread_ns: self.networks_thread_ns,
+            other_part_ns: self.other_part_ns,
         }
+    }
+
+    pub fn other_part_ns(&self, part: OtherPart) -> u64 {
+        self.other_part_ns[part.index()]
     }
 
     /// Rebuild a profiler from a totals snapshot (interval deltas).
@@ -300,6 +366,7 @@ impl StageProfiler {
             entries: totals.entries,
             sensing_thread_ns: totals.sensing_thread_ns,
             networks_thread_ns: totals.networks_thread_ns,
+            other_part_ns: totals.other_part_ns,
         }
     }
 
@@ -314,6 +381,18 @@ impl StageProfiler {
             return;
         }
         self.add_sample(stage, stamp.elapsed_ns());
+    }
+
+    /// Record one piece of [`CpuStage::Other`]. The time is included in `Other`
+    /// and also in the named part. Disabled profilers do not read the stamp.
+    pub fn stop_other(&mut self, part: OtherPart, stamp: Stamp) {
+        if !self.enabled {
+            return;
+        }
+        let ns = stamp.elapsed_ns();
+        self.add_sample(CpuStage::Other, ns);
+        let i = part.index();
+        self.other_part_ns[i] = self.other_part_ns[i].saturating_add(ns);
     }
 
     pub fn add_sample(&mut self, stage: CpuStage, ns: u64) {
@@ -354,6 +433,9 @@ impl StageProfiler {
         self.networks_thread_ns = self
             .networks_thread_ns
             .saturating_add(other.networks_thread_ns);
+        for i in 0..OTHER_PART_COUNT {
+            self.other_part_ns[i] = self.other_part_ns[i].saturating_add(other.other_part_ns[i]);
+        }
     }
 
     /// Rolled-up CPU wall totals in nanoseconds: sensing, chemistry/field,
@@ -466,6 +548,13 @@ impl StageProfiler {
         let accounted_ns = self.in_step_ns();
         let accounted_ms = ms_from_ns(accounted_ns);
         let unaccounted_ms = meta.step_wall_ms - accounted_ms;
+        let mut other_parts = serde_json::Map::new();
+        let mut other_part_sum = 0u64;
+        for part in OtherPart::ALL {
+            let ns = self.other_part_ns(part);
+            other_part_sum = other_part_sum.saturating_add(ns);
+            other_parts.insert(part.id().to_string(), stage_obj(ns, 0, ticks));
+        }
         let mut stages = serde_json::Map::new();
         for stage in CpuStage::ALL {
             stages.insert(
@@ -519,6 +608,13 @@ impl StageProfiler {
                 "total_ms": unaccounted_ms,
                 "per_tick_ms": per_tick_ms(unaccounted_ms, ticks),
                 "note": "step_wall_ms minus in-step CPU stages. Gaps between timers, and the cost of the timer calls themselves. A small negative value is overlap or rounding, not a second clock.",
+            },
+            "other_breakdown": {
+                "additive_with_cpu_wall": false,
+                "included_in": "cpu_wall_ms.other",
+                "sum_total_ns": other_part_sum,
+                "note": "Parts of the other CPU wall. They sum to that stage; do not add them again. setup is the candidate clone and commands. lifecycle_motion is per-organism motion, emission, and reproduction. lifecycle_commit is births, deaths, and retain.",
+                "parts": other_parts,
             },
             "cpu_thread_sum_ms": {
                 "additive": false,
@@ -595,7 +691,15 @@ impl StageProfiler {
              unaccounted step ms/tick: {u:.3} (gaps between timers; Instant samples sit inside the open stage or this gap)\n\
              gpu (not added to cpu wall): {gpu_text}\n\
              transfers/sync and blocked-on-gpu clocks are submit and wait, not GPU kernel time. A gpu_timestamp_query span is the optional TIMESTAMP_QUERY delta for passes that already waited; it is not kernel-exclusive and is not a GTX 1080 measurement unless this process is that GPU.\n\
-             thread-sum ms/tick (summed across workers, not wall, not added): sensing {tsum:.3} | networks {nsum:.3}",
+             thread-sum ms/tick (summed across workers, not wall, not added): sensing {tsum:.3} | networks {nsum:.3}\n\
+             other parts ms/tick (already inside other): setup {os} | sense scatter {ss} | held {hs} | uptake scatter {us} | lifecycle motion {lm} | lifecycle commit {lc} | publish {pb}",
+            os = line(self.other_part_ns(OtherPart::Setup)),
+            ss = line(self.other_part_ns(OtherPart::SenseScatter)),
+            hs = line(self.other_part_ns(OtherPart::HeldStore)),
+            us = line(self.other_part_ns(OtherPart::UptakeScatter)),
+            lm = line(self.other_part_ns(OtherPart::LifecycleMotion)),
+            lc = line(self.other_part_ns(OtherPart::LifecycleCommit)),
+            pb = line(self.other_part_ns(OtherPart::Publish)),
             ticks = self.ticks,
             s = line(b.sensing),
             c = line(b.chemistry_field),

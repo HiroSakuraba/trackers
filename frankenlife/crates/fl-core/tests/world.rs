@@ -57,6 +57,45 @@ fn ledger_closes_and_ecology_turns_over() {
 }
 
 #[test]
+fn other_cpu_parts_at_resident_population() {
+    let mut c = small();
+    c.population.initial_count = 20_000;
+    c.population.maximum_count = 24_000;
+    c.world.grid_width = 64;
+    c.world.grid_height = 64;
+    c.world.width = 64.0;
+    c.world.height = 64.0;
+    c.sensors.maximum_scale_world_units = 8.0;
+    c.sources.sigma_world_units = 4.0;
+    let ticks = 4u64;
+    for workers in [1usize, 4] {
+        let mut w = World::new(c.clone()).expect("valid");
+        w.workers = workers;
+        w.set_profiling(true);
+        let mut be = fl_core::ReferenceResident::default();
+        for _ in 0..ticks {
+            w.step_inference(fl_core::Inference::Resident(&mut be)).unwrap();
+        }
+        let p = w.stage_profile();
+        let ms = |ns: u64| ns as f64 / 1e6 / ticks as f64;
+        eprintln!(
+            "resident-parts workers {workers} pop {} | setup {:.3} scatter {:.3} held {:.3} uptake {:.3} motion {:.3} commit {:.3} publish {:.3} | other {:.3}",
+            w.orgs.len(),
+            ms(p.other_part_ns(fl_core::profile::OtherPart::Setup)),
+            ms(p.other_part_ns(fl_core::profile::OtherPart::SenseScatter)),
+            ms(p.other_part_ns(fl_core::profile::OtherPart::HeldStore)),
+            ms(p.other_part_ns(fl_core::profile::OtherPart::UptakeScatter)),
+            ms(p.other_part_ns(fl_core::profile::OtherPart::LifecycleMotion)),
+            ms(p.other_part_ns(fl_core::profile::OtherPart::LifecycleCommit)),
+            ms(p.other_part_ns(fl_core::profile::OtherPart::Publish)),
+            ms(p.stage_ns(fl_core::CpuStage::Other)),
+        );
+        let parts = fl_core::profile::OtherPart::ALL.into_iter().map(|part| p.other_part_ns(part)).sum::<u64>();
+        assert_eq!(parts, p.stage_ns(fl_core::CpuStage::Other), "other parts must sum to the other stage");
+    }
+}
+
+#[test]
 fn profiling_does_not_change_results() {
     let mut plain = World::new(small()).unwrap();
     let mut profiled = World::new(small()).unwrap();
@@ -103,6 +142,8 @@ fn deterministic_and_worker_count_neutral() {
     let c = run(small(), 120, 4);
     assert_eq!(a.state_hash(), b.state_hash());
     assert_eq!(a.state_hash(), c.state_hash(), "executor partitioning must not change science");
+    assert_eq!(a.ledger, c.ledger, "worker split must not change the ledger");
+    assert_eq!(a.orgs, c.orgs, "worker split must not change organisms");
     let mut other = small();
     other.seed = 7;
     assert_ne!(a.state_hash(), run(other, 120, 1).state_hash());

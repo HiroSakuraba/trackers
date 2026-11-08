@@ -9,7 +9,7 @@ use crate::config::{CapacityPolicy, Config};
 use crate::field::{min_image, wrap, Field, Stencil};
 use crate::genome::{founder, mutate, Genome, MutationRecord};
 use crate::nn::{forward, sigmoid, INPUT_WIDTH, MAX_HIDDEN, OUTPUT_WIDTH};
-use crate::profile::{proportion, CpuStage, StageProfiler, Stamp};
+use crate::profile::{proportion, CpuStage, OtherPart, StageProfiler, Stamp};
 use crate::rng::{Lane, SemanticRng};
 use crate::sensors::{intrinsic, observe, Pyramid, PLANES};
 use crate::sources::{init_sources, inject, isotropic_unit, Source};
@@ -87,6 +87,20 @@ impl Organisms {
             )*};
         }
         r!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid, genome);
+    }
+
+    /// Copy `src` into `self`, keeping allocated capacity. Arc genomes are cloned
+    /// (shallow). Used so a tick does not allocate a fresh organism table.
+    fn copy_from(&mut self, src: &Organisms) {
+        macro_rules! c {
+            ($($f:ident),*) => {$(
+                self.$f.clear();
+                self.$f.extend_from_slice(&src.$f);
+            )*};
+        }
+        c!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid);
+        self.genome.clear();
+        self.genome.extend(src.genome.iter().cloned());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -255,7 +269,7 @@ impl std::fmt::Display for TickError {
 
 /// Per-organism sensing/controller result for one tick.
 /// What later phases need from sensing: kept small (it exists for every organism every tick).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Sense {
     density0: f64,
     out: [f32; OUTPUT_WIDTH],
@@ -279,6 +293,7 @@ struct BirthProposal {
     parent_energy: f64,
 }
 
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct World {
     pub cfg: Config,
@@ -301,9 +316,31 @@ pub struct World {
     /// The authoritative field lives on a resident device backend; `field` may be stale
     /// until `sync_field` is called.
     pub(crate) device_field: bool,
-    /// Execution telemetry. Off by default. Not part of the scientific state
-    /// (`state_hash` ignores it) and not written into checkpoints.
-    profile: StageProfiler,
+/// Execution telemetry. Off by default. Not part of the scientific state
+/// (`state_hash` ignores it) and not written into checkpoints.
+profile: StageProfiler,
+/// Reused candidate organism storage. Not scientific state.
+org_scratch: Reused<Organisms>,
+    /// Reused `e_start` buffer for the per-tick energy delta.
+    energy_scratch: Reused<Vec<f64>>,
+    /// Reused per-organism sense table.
+    sense_scratch: Reused<Vec<Sense>>,
+}
+
+/// Execution cache. `PartialEq` ignores it so a reused buffer cannot change world equality.
+#[derive(Clone, Debug)]
+struct Reused<T>(T);
+
+impl<T> PartialEq for Reused<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl<T: Default> Default for Reused<T> {
+    fn default() -> Self {
+        Reused(T::default())
+    }
 }
 
 impl World {
@@ -345,6 +382,9 @@ impl World {
             pyramid_extra_levels: lv,
             device_field: false,
             profile: StageProfiler::disabled(),
+            org_scratch: Reused::default(),
+            energy_scratch: Reused::default(),
+            sense_scratch: Reused::default(),
         })
     }
 
@@ -493,9 +533,12 @@ impl World {
         } else {
             self.field.clone()
         };
-        let mut orgs = self.orgs.clone();
+        let mut orgs = std::mem::take(&mut self.org_scratch.0);
+        orgs.copy_from(&self.orgs);
         let mut sources = self.sources.clone();
-        let e_start = orgs.energy.clone();
+        self.energy_scratch.0.clear();
+        self.energy_scratch.0.extend_from_slice(&orgs.energy);
+        let e_start = std::mem::take(&mut self.energy_scratch.0);
         let mut dead = vec![false; orgs.len()];
         let mut deposits = if is_resident { Field { gx: field.gx, gy: field.gy, hx: field.hx, hy: field.hy, e: Vec::new(), m: Vec::new() } } else { Field::new(field.gx, field.gy, field.width(), field.height()) };
         let mut ops: Vec<FieldDeposit> = Vec::new();
@@ -562,7 +605,7 @@ impl World {
             }
         }
 
-        prof.stop(CpuStage::Other, ps);
+        prof.stop_other(OtherPart::Setup, ps);
         if let Some(r) = resident.as_mut() {
             let ps = prof.start();
             r.begin_tick(&ops).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident begin: {detail}") })?;
@@ -636,6 +679,10 @@ impl World {
                 })
                 .collect();
             prof.stop(CpuStage::Sensing, ps);
+            let mut senses_buf = std::mem::take(&mut self.sense_scratch.0);
+            if senses_buf.len() != orgs.len() {
+                senses_buf.resize(orgs.len(), Sense::blank());
+            }
             let mut outs = vec![SenseOutput::default(); jobs.len()];
             let tb = Stopwatch::start();
             let ps = prof.start();
@@ -646,20 +693,20 @@ impl World {
             timing.backend_inference_ms = tb.ms();
             res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", fb.name()) })?;
             let ps = prof.start();
-            let mut senses = vec![Sense::blank(); orgs.len()];
             for (k, &i) in idx.iter().enumerate() {
                 let o = &outs[k];
                 let finite = o.motion_drive.iter().all(|v| v.is_finite()) && o.density0.is_finite() && (!jobs[k].due || o.logits.iter().all(|v| v.is_finite()));
                 if !finite {
                     return Err(TickError::NumericalFault { tick: event, detail: format!("backend {} produced non-finite results for organism {}", fb.name(), orgs.id[i]) });
                 }
-                senses[i].density0 = o.density0.max(0.0);
-                senses[i].motion_drive = o.motion_drive;
-                senses[i].evaluated = jobs[k].due;
-                senses[i].out = if jobs[k].due { o.logits } else { orgs.held[i] };
+                senses_buf[i].density0 = o.density0.max(0.0);
+                senses_buf[i].motion_drive = o.motion_drive;
+                senses_buf[i].evaluated = jobs[k].due;
+                senses_buf[i].input = None;
+                senses_buf[i].out = if jobs[k].due { o.logits } else { orgs.held[i] };
             }
-            prof.stop(CpuStage::Other, ps);
-            senses
+            prof.stop_other(OtherPart::SenseScatter, ps);
+            senses_buf
         } else {
             let ps = prof.start();
             let pyr = Pyramid::build(&field, self.pyramid_extra_levels);
@@ -687,7 +734,7 @@ impl World {
             let jobs: Vec<InferenceJob<'_>> =
                 due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &orgs.genome[i], input: senses[i].input.as_deref().expect("controller path keeps due inputs") }).collect();
             let mut outs = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
-            prof.stop(CpuStage::Other, ps);
+            prof.stop_other(OtherPart::SenseScatter, ps);
             let tb = Stopwatch::start();
             let ps = prof.start();
             let res = be.evaluate(&jobs, &mut outs);
@@ -702,7 +749,7 @@ impl World {
                 }
                 senses[i].out = outs[k];
             }
-            prof.stop(CpuStage::Other, ps);
+            prof.stop_other(OtherPart::SenseScatter, ps);
         }
         let ps = prof.start();
         for (i, s) in senses.iter().enumerate() {
@@ -714,7 +761,7 @@ impl World {
                 counts.parameter_evaluations += orgs.genome[i].param_count() as u64;
             }
         }
-        prof.stop(CpuStage::Other, ps);
+        prof.stop_other(OtherPart::HeldStore, ps);
         timing.sense_and_infer_ms = t.ms();
 
         // ── Phase 5: uptake requests and cell grants ──────────────────────
@@ -754,7 +801,7 @@ impl World {
                 };
                 uptake_total[i] = o.absorbed;
             }
-            prof.stop(CpuStage::Other, ps);
+            prof.stop_other(OtherPart::UptakeScatter, ps);
         } else {
         let ps = prof.start();
         let stencils: Vec<Stencil> = (0..orgs.len()).map(|i| field.stencil(orgs.x[i], orgs.y[i])).collect();
@@ -867,7 +914,8 @@ impl World {
                 continue;
             }
             // Motion (field-mediated chemotaxis; no pairwise forces).
-            let g = orgs.genome[i].clone();
+            // Genome bytes are immutable here; a shared reference avoids an Arc clone per organism.
+            let g = &*orgs.genome[i];
             let s = &senses[i];
             let gu = if umax > 0.0 { (uptake_total[i] / (dt * umax)).clamp(0.0, 1.0) } else { 0.0 };
             let (mut fx, mut fy) = (s.motion_drive[0], s.motion_drive[1]);
@@ -942,7 +990,7 @@ impl World {
                     let beta = rp.minimum_child_fraction + (rp.maximum_child_fraction - rp.minimum_child_fraction) * sigmoid(o[out::SHARE] as f64);
                     let (ce, pe) = split_energy(orgs.energy[i], co.birth_energy, beta);
                     if ce >= rp.minimum_child_energy && pe >= rp.minimum_parent_energy_after_split {
-                        match mutate(cfg, &self.rng, &g, orgs.id[i], event, 0) {
+                        match mutate(cfg, &self.rng, g, orgs.id[i], event, 0) {
                             Ok(genome) => proposals.push(BirthProposal { parent: i, genome, child_energy: ce, parent_energy: pe }),
                             Err(_) => counts.rejected_births_mutation += 1,
                         }
@@ -952,6 +1000,8 @@ impl World {
                 }
             }
         }
+        prof.stop_other(OtherPart::LifecycleMotion, ps);
+        let ps = prof.start();
 
         // ── Phase 8: capacities, births, deaths ───────────────────────────
         let survivors: Vec<usize> = (0..orgs.len()).filter(|&i| !dead[i]).collect();
@@ -1034,6 +1084,7 @@ impl World {
                 orgs.energy_change_rate[i] = (orgs.energy[i] - e_start[i]) / dt;
             }
         }
+        self.energy_scratch.0 = e_start;
         let keep: Vec<bool> = dead.iter().map(|d| !d).collect();
         orgs.retain(&keep);
         for (id, lin, gen, x, y, e, g) in children {
@@ -1041,7 +1092,7 @@ impl World {
             orgs.push(id, lin, gen, x, y, e, event, deadline, (id % k_eval) as u32, g);
         }
 
-        prof.stop(CpuStage::Other, ps);
+        prof.stop_other(OtherPart::LifecycleCommit, ps);
         // ── Phase 9: paid deposits and recycling enter the next field ─────
         if let Some(r) = resident.as_mut() {
             let ps = prof.start();
@@ -1097,7 +1148,7 @@ impl World {
         led.organism_energy_after = orgs.energy.iter().sum();
         led.energy_after = led.field_energy_after + led.organism_energy_after;
         led.residual = led.energy_after - led.energy_before - (led.injected_sources + led.injected_commands - led.removed - dis.total());
-        prof.stop(CpuStage::Other, ps);
+        prof.stop_other(OtherPart::Publish, ps);
 
         if let Some(r) = resident.as_mut() {
             let ps = prof.start();
@@ -1107,10 +1158,10 @@ impl World {
         } else {
             let ps = prof.start();
             self.field = field;
-            prof.stop(CpuStage::Other, ps);
+            prof.stop_other(OtherPart::Publish, ps);
         }
         let ps = prof.start();
-        self.orgs = orgs;
+        self.org_scratch.0 = std::mem::replace(&mut self.orgs, orgs);
         self.sources = sources;
         self.tick = event;
         self.next_org_id = next_org;
@@ -1136,9 +1187,10 @@ impl World {
         tt.parameter_evaluations += counts.parameter_evaluations;
         tt.emitting += counts.emitting;
         tt.cone_projections += counts.cone_projections;
-        prof.stop(CpuStage::Other, ps);
+        prof.stop_other(OtherPart::Publish, ps);
         prof.mark_tick();
         self.profile.absorb(&prof);
+        self.sense_scratch.0 = senses;
         timing.validate_publish_ms = t_validate.ms();
         timing.total_ms = t_start.ms();
         let report = TickReport { tick: event, simulation_seconds: event as f64 * dt, population: self.orgs.len(), counts, ledger: led, timing };
@@ -1643,6 +1695,7 @@ impl ControllerBackend for ReferenceBackend {
         Ok(())
     }
 }
+
 
 fn sense_one<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, scratch: &mut [f32], infer: bool, sense_ns: &mut u64, net_ns: &mut u64) -> Sense {
     let t_sense = Stamp::capture::<PROFILE>();
