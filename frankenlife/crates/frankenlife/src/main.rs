@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use fl_core::world::{Command, Disposal};
-use fl_core::{Config, TickError, World, MODEL_VERSION};
+use fl_core::{checkpoint, Config, TickError, World, MODEL_VERSION};
 use serde_json::json;
 
 use render::{render, write_png, RenderOpts, View};
@@ -32,6 +32,17 @@ enum Cmd {
     },
     /// Run a world headlessly, writing metrics, frames and inspections.
     Run(RunArgs),
+    /// Inspect organisms in a saved checkpoint.
+    Inspect {
+        /// Checkpoint file (`.flck`).
+        checkpoint: PathBuf,
+        /// Stable organism IDs to inspect (default: the most derived ones).
+        #[arg(long)]
+        id: Vec<u64>,
+        /// How many organisms to show when no ID is given.
+        #[arg(long, default_value_t = 3)]
+        top: usize,
+    },
 }
 
 #[derive(Parser)]
@@ -68,6 +79,13 @@ struct RunArgs {
     /// Number of organisms to dump into inspection.json at the end.
     #[arg(long, default_value_t = 5)]
     inspect: usize,
+    /// Resume from a checkpoint instead of a fresh world (`--config`/`--seed` are then ignored);
+    /// `--seconds` counts additional simulated time.
+    #[arg(long)]
+    resume: Option<PathBuf>,
+    /// Write an exact checkpoint every S simulated seconds (plus one at the end).
+    #[arg(long)]
+    checkpoint_every: Option<f64>,
 }
 
 fn parse_erase(s: &str) -> Result<(u64, f64, f64, f64), String> {
@@ -91,6 +109,7 @@ fn main() {
     let code = match cli.cmd {
         Cmd::Validate { config } => validate(&config),
         Cmd::Run(a) => run(a),
+        Cmd::Inspect { checkpoint, id, top } => inspect_checkpoint(&checkpoint, &id, top),
     };
     std::process::exit(code);
 }
@@ -117,30 +136,96 @@ fn validate(path: &Option<PathBuf>) -> i32 {
     }
 }
 
-fn run(a: RunArgs) -> i32 {
-    let mut cfg = match load(&a.config) {
-        Ok(c) => c,
+fn most_derived(world: &World, k: usize) -> Vec<u64> {
+    let mut idx: Vec<usize> = (0..world.orgs.len()).collect();
+    idx.sort_by(|&i, &j| world.orgs.generation[j].cmp(&world.orgs.generation[i]).then(world.orgs.energy[j].total_cmp(&world.orgs.energy[i])));
+    idx.into_iter().take(k).map(|i| world.orgs.id[i]).collect()
+}
+
+fn inspect_checkpoint(path: &Path, ids: &[u64], top: usize) -> i32 {
+    let world = match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| checkpoint::load(&b)) {
+        Ok(w) => w,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}: {e}", path.display());
             return 2;
         }
     };
-    if let Some(s) = a.seed {
-        cfg.seed = s;
+    let ids: Vec<u64> = if ids.is_empty() { most_derived(&world, top) } else { ids.to_vec() };
+    let mut out = Vec::new();
+    for id in ids {
+        match world.inspect(id) {
+            Some(i) => out.push(serde_json::to_value(i).unwrap()),
+            None => out.push(json!({"id": id, "error": "not alive at this tick"})),
+        }
     }
-    if a.exhibition {
-        cfg.population.capacity_policy = "reject-births-stable-order".into();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "checkpoint": path.display().to_string(),
+            "tick": world.tick,
+            "simulation_seconds": world.simulation_seconds(),
+            "population": world.orgs.len(),
+            "state_hash": format!("{:016x}", world.state_hash()),
+            "organisms": out,
+        }))
+        .unwrap()
+    );
+    0
+}
+
+fn write_checkpoint(world: &World, dir: &Path, retain: usize) {
+    let path = dir.join(format!("tick_{:010}.flck", world.tick));
+    if let Err(e) = std::fs::write(&path, checkpoint::save(world)) {
+        eprintln!("checkpoint {}: {e}", path.display());
+        return;
     }
-    let report = match cfg.validate() {
-        Ok(r) => r,
-        Err(errs) => {
-            for e in errs {
-                eprintln!("invalid: {e}");
+    // Retain only the most recent `retain` checkpoints written by this run.
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let mut all: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "flck")).collect();
+        all.sort();
+        let n = all.len();
+        for p in all.into_iter().take(n.saturating_sub(retain.max(1))) {
+            std::fs::remove_file(p).ok();
+        }
+    }
+}
+
+fn run(a: RunArgs) -> i32 {
+    let mut world = if let Some(path) = &a.resume {
+        match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| checkpoint::load(&b)) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("{}: {e}", path.display());
+                return 2;
             }
-            return 1;
+        }
+    } else {
+        let mut cfg = match load(&a.config) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        };
+        if let Some(s) = a.seed {
+            cfg.seed = s;
+        }
+        if a.exhibition {
+            cfg.population.capacity_policy = "reject-births-stable-order".into();
+        }
+        match World::new(cfg) {
+            Ok(w) => w,
+            Err(errs) => {
+                for e in errs {
+                    eprintln!("invalid: {e}");
+                }
+                return 1;
+            }
         }
     };
-    let mut world = World::new(cfg.clone()).expect("validated");
+    let cfg = world.cfg.clone();
+    let report = cfg.validate().expect("world config was validated");
+    let start_tick = world.tick;
     if let Some(w) = a.workers {
         world.workers = w.max(1);
     } else {
@@ -158,6 +243,15 @@ fn run(a: RunArgs) -> i32 {
         return 2;
     }
     let ticks = (a.seconds / world.dt()).round() as u64;
+    let ckpt_dir = a.out.join("checkpoints");
+    let ckpt_every = a.checkpoint_every.map(|s| ((s / world.dt()).round() as u64).max(1));
+    if ckpt_every.is_some() {
+        if let Err(e) = std::fs::create_dir_all(&ckpt_dir) {
+            eprintln!("{}: {e}", ckpt_dir.display());
+            return 2;
+        }
+    }
+    let retain = cfg.persistence.retain_recent_checkpoints as usize;
     let metrics_every = cfg.persistence.metrics_interval_ticks as u64;
     let mut metrics = std::io::BufWriter::new(std::fs::File::create(a.out.join("metrics.jsonl")).expect("metrics file"));
     let opts_base = RenderOpts {
@@ -218,6 +312,9 @@ fn run(a: RunArgs) -> i32 {
             interval_ticks = 0;
             interval_wall = Instant::now();
         }
+        if ckpt_every.is_some_and(|k| world.tick % k == 0) {
+            write_checkpoint(&world, &ckpt_dir, retain);
+        }
         if a.frame_every > 0 && world.tick % a.frame_every == 0 {
             save_frame(&world, &opts_base, &frames_dir, frame_no, steps_per_s);
             frame_no += 1;
@@ -225,17 +322,20 @@ fn run(a: RunArgs) -> i32 {
     }
     metrics.flush().ok();
     let wall = wall0.elapsed().as_secs_f64();
+    if ckpt_every.is_some() && !world.orgs.is_empty() {
+        write_checkpoint(&world, &ckpt_dir, retain);
+    }
 
     // Inspection of the oldest lineages' most derived descendants.
-    let mut idx: Vec<usize> = (0..world.orgs.len()).collect();
-    idx.sort_by(|&i, &j| world.orgs.generation[j].cmp(&world.orgs.generation[i]).then(world.orgs.energy[j].total_cmp(&world.orgs.energy[i])));
-    let inspections: Vec<_> = idx.iter().take(a.inspect).filter_map(|&i| world.inspect(world.orgs.id[i])).collect();
+    let inspections: Vec<_> = most_derived(&world, a.inspect).into_iter().filter_map(|id| world.inspect(id)).collect();
     std::fs::write(a.out.join("inspection.json"), serde_json::to_string_pretty(&inspections).unwrap()).ok();
 
     let manifest = json!({
         "schema": "frankenlife.run-manifest.v0",
         "model_version": MODEL_VERSION,
         "stop_reason": stop_reason,
+        "resumed_from": a.resume.as_ref().map(|p| p.display().to_string()),
+        "start_tick": start_tick,
         "committed_tick": world.tick,
         "simulation_seconds": world.simulation_seconds(),
         "wall_seconds": wall,

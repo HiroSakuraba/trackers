@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod checkpoint;
 pub mod chemistry;
 pub mod config;
 pub mod field;

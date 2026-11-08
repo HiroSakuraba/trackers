@@ -254,13 +254,13 @@ pub struct World {
     pub next_org_id: u64,
     pub next_genome_id: u64,
     pub pending: Vec<ScheduledCommand>,
-    next_command_seq: u64,
+    pub(crate) next_command_seq: u64,
     pub ledger: CumulativeLedger,
     pub totals: TickCounts,
     /// Execution parallelism for sensing/inference; never changes scientific state.
     pub workers: usize,
     pub last_report: Option<TickReport>,
-    pyramid_extra_levels: usize,
+    pub(crate) pyramid_extra_levels: usize,
 }
 
 impl World {
