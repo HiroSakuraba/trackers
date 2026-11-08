@@ -219,6 +219,10 @@ pub struct TickTiming {
     pub backend_inference_ms: f64,
     pub exchange_ms: f64,
     pub lifecycle_ms: f64,
+    /// Candidate-state setup: cloning the committed world, scratch allocation, commands.
+    pub setup_ms: f64,
+    /// Phase 10: tiny clearing, invariant checks, ledger, publication.
+    pub validate_publish_ms: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -389,6 +393,13 @@ impl World {
         let mut led = TickLedger { energy_before: self.total_energy(), ..Default::default() };
         let mut dis = Dissipation::default();
 
+        let (backend, fused, mut device) = match inference {
+            Inference::Reference => (None, None, None),
+            Inference::Controller(b) => (Some(b), None, None),
+            Inference::Fused(f) => (None, Some(f), None),
+            Inference::Device(d) => (None, None, Some(d)),
+        };
+        let t_setup = Stopwatch::start();
         let mut field = self.field.clone();
         let mut orgs = self.orgs.clone();
         let mut sources = self.sources.clone();
@@ -449,25 +460,35 @@ impl World {
             }
         }
 
+        timing.setup_ms = t_setup.ms();
+
         // ── Phase 2: transport, then scheduled sources → observation field ─
         let t = Stopwatch::start();
-        let mut scratch = Field { gx: 0, gy: 0, hx: field.hx, hy: field.hy, e: Vec::new(), m: Vec::new() };
-        let (decay, sub) = field.transport(cfg.world.diffusion, cfg.world.decay_per_second, dt, &mut scratch);
-        dis.decay += decay;
-        counts.transport_subcycles = sub;
         for s in &mut sources {
             s.advance_to(n, cfg, &self.rng);
         }
-        led.injected_sources = inject(&mut field, &sources, n, cfg).map_err(|detail| TickError::NumericalFault { tick: event, detail })?;
-        dis.tiny_reservoir += field.clear_tiny(tiny);
+        if let Some(d) = device.as_mut() {
+            let acct = d
+                .transport_and_sources(&mut field, cfg, &sources, n)
+                .map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("field backend {}: {detail}", FieldBackend::name(&**d)) })?;
+            dis.decay += acct.decay_removed;
+            counts.transport_subcycles = acct.subcycles;
+            led.injected_sources = acct.injected;
+            dis.tiny_reservoir += acct.tiny_removed;
+        } else {
+            let acct = cpu_transport_and_sources(&mut field, cfg, &sources, n).map_err(|detail| TickError::NumericalFault { tick: event, detail })?;
+            dis.decay += acct.decay_removed;
+            counts.transport_subcycles = acct.subcycles;
+            led.injected_sources = acct.injected;
+            dis.tiny_reservoir += acct.tiny_removed;
+        }
         timing.transport_ms = t.ms();
 
         // ── Phase 3–4: sensing pyramid, sample organisms, evaluate due controllers ──
         let t = Stopwatch::start();
-        let (backend, fused) = match inference {
-            Inference::Reference => (None, None),
-            Inference::Controller(b) => (Some(b), None),
-            Inference::Fused(f) => (None, Some(f)),
+        let fused: Option<&mut dyn SenseInferBackend> = match device {
+            Some(d) => Some(d),
+            None => fused,
         };
         let mut senses = if let Some(fb) = fused {
             let k_eval = cfg.controller.evaluation_interval_ticks as u64;
@@ -821,6 +842,7 @@ impl World {
         timing.lifecycle_ms = t.ms();
 
         // ── Phase 10: tiny-reservoir clearing, validate invariants, publish ─
+        let t_validate = Stopwatch::start();
         dis.tiny_reservoir += field.clear_tiny(tiny);
         let (worst, min_e) = field.cone_report();
         if !(min_e >= 0.0) || !min_e.is_finite() {
@@ -868,6 +890,7 @@ impl World {
         tt.parameter_evaluations += counts.parameter_evaluations;
         tt.emitting += counts.emitting;
         tt.cone_projections += counts.cone_projections;
+        timing.validate_publish_ms = t_validate.ms();
         timing.total_ms = t_start.ms();
         let report = TickReport { tick: event, simulation_seconds: event as f64 * dt, population: self.orgs.len(), counts, ledger: led, timing };
         self.last_report = Some(report);
@@ -1028,6 +1051,64 @@ pub enum Inference<'a> {
     Controller(&'a mut dyn ControllerBackend),
     /// Sensing pyramid, sampling and inference all done by one backend.
     Fused(&'a mut dyn SenseInferBackend),
+    /// Field transport/sources plus fused sensing and inference on one device backend.
+    Device(&'a mut dyn DeviceBackend),
+}
+
+/// Energy accounting of one field transport + source step (all in cell-integrated energy).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FieldAccounting {
+    /// Energy removed by exponential decay (dissipation).
+    pub decay_removed: f64,
+    /// Energy actually stored by source injection.
+    pub injected: f64,
+    /// Energy cleared from tiny reservoirs (dissipation).
+    pub tiny_removed: f64,
+    pub subcycles: u32,
+}
+
+/// Phase-2 backend: transport the field, inject scheduled sources, clear tiny
+/// reservoirs, producing the observation field in place (plan §4.5, §11).
+pub trait FieldBackend {
+    fn name(&self) -> &str;
+    /// `sources` are already advanced to tick `n`.
+    fn transport_and_sources(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String>;
+}
+
+/// A backend that runs both the field step and fused sensing + inference, so the
+/// observation field can stay on the device between them.
+pub trait DeviceBackend: SenseInferBackend + FieldBackend {}
+impl<T: SenseInferBackend + FieldBackend> DeviceBackend for T {}
+
+/// The CPU field step (same arithmetic as the built-in path).
+pub fn cpu_transport_and_sources(field: &mut Field, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+    let mut scratch = Field { gx: 0, gy: 0, hx: field.hx, hy: field.hy, e: Vec::new(), m: Vec::new() };
+    let (decay_removed, subcycles) = field.transport(cfg.world.diffusion, cfg.world.decay_per_second, cfg.dt(), &mut scratch);
+    let injected = inject(field, sources, n, cfg)?;
+    let tiny_removed = field.clear_tiny(cfg.world.tiny_energy_threshold);
+    Ok(FieldAccounting { decay_removed, injected, tiny_removed, subcycles })
+}
+
+/// CPU reference for the whole device port (reproduces the built-in state hash).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReferenceDevice;
+
+impl FieldBackend for ReferenceDevice {
+    fn name(&self) -> &str {
+        "cpu-reference-field"
+    }
+    fn transport_and_sources(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+        cpu_transport_and_sources(field, cfg, sources, n)
+    }
+}
+
+impl SenseInferBackend for ReferenceDevice {
+    fn name(&self) -> &str {
+        "cpu-reference-fused"
+    }
+    fn sense_and_infer(&mut self, field: &Field, sensors: &crate::config::SensorsCfg, extra_levels: usize, jobs: &[SenseJob<'_>], out: &mut [SenseOutput]) -> Result<(), String> {
+        ReferenceSenseInfer.sense_and_infer(field, sensors, extra_levels, jobs, out)
+    }
 }
 
 /// One organism's sensing (+ evaluation when `due`) request for a fused backend.

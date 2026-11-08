@@ -69,6 +69,8 @@ enum Backend {
     Gpu,
     /// Sensing pyramid, sampling and inference fused on the GPU (inputs never leave the GPU).
     GpuFused,
+    /// `gpu-fused` plus field transport, sources and tiny clearing on the GPU.
+    GpuField,
 }
 
 #[derive(Parser)]
@@ -357,7 +359,7 @@ fn run(a: RunArgs) -> i32 {
     }
     #[cfg(feature = "gpu")]
     let mut gpu = match a.backend {
-        Backend::Gpu | Backend::GpuFused => match fl_gpu::GpuBackend::new() {
+        Backend::Gpu | Backend::GpuFused | Backend::GpuField => match fl_gpu::GpuBackend::new() {
             Ok(g) => {
                 eprintln!("GPU: {}", g.capability());
                 Some(g)
@@ -427,6 +429,7 @@ fn run(a: RunArgs) -> i32 {
         #[cfg(feature = "gpu")]
         let stepped = match gpu.as_mut() {
             Some(g) if a.backend == Backend::GpuFused => world.step_inference(fl_core::Inference::Fused(g)),
+            Some(g) if a.backend == Backend::GpuField => world.step_inference(fl_core::Inference::Device(g)),
             Some(g) => world.step_with(Some(g as &mut dyn fl_core::ControllerBackend)),
             None => world.step(),
         };
@@ -448,8 +451,9 @@ fn run(a: RunArgs) -> i32 {
         #[cfg(feature = "gpu")]
         if let Some(g) = gpu.as_ref() {
             let l = g.stats.last;
-            let v = [l.host_prep_ms, l.gpu_roundtrip_ms, l.kernel_ms.unwrap_or(0.0), l.bookkeeping_ms, l.total_ms, l.pyramid_ms.unwrap_or(0.0)];
-            for k in 0..6 {
+            let fl = g.stats.field_last;
+            let v = [l.host_prep_ms, l.gpu_roundtrip_ms, l.kernel_ms.unwrap_or(0.0), l.bookkeeping_ms, l.total_ms, l.pyramid_ms.unwrap_or(0.0), fl.host_ms, fl.roundtrip_ms, fl.kernel_ms.unwrap_or(0.0)];
+            for k in 0..9 {
                 phases.gpu[k] += v[k];
                 run_phases.gpu[k] += v[k];
             }
@@ -479,6 +483,19 @@ fn run(a: RunArgs) -> i32 {
                     "             gpu backend {:.2} ms = host prep {:.2} + round trip {:.2} (kernel {:.2}, pyramid {:.2}) + bookkeeping {:.2}; outside evaluate {:.2}",
                     phases.gpu[4] / n, phases.gpu[0] / n, phases.gpu[1] / n, phases.gpu[2] / n, phases.gpu[5] / n, phases.gpu[3] / n,
                     (phases.backend_inference_ms - phases.gpu[4]) / n
+                );
+            }
+            if phases.gpu[7] > 0.0 {
+                eprintln!(
+                    "             gpu field step {:.2} ms = host {:.2} + round trip {:.2} (kernels {:.2}) | setup {:.2} + validate {:.2} | other {:.2}",
+                    phases.transport_ms / n, phases.gpu[6] / n, phases.gpu[7] / n, phases.gpu[8] / n, phases.setup_ms / n, phases.validate_ms / n,
+                    (phases.step_ms - phases.transport_ms - phases.sense_and_infer_ms - phases.exchange_ms - phases.lifecycle_ms - phases.setup_ms - phases.validate_ms) / n
+                );
+            } else {
+                eprintln!(
+                    "             setup {:.2} + validate {:.2} | other {:.2}",
+                    phases.setup_ms / n, phases.validate_ms / n,
+                    (phases.step_ms - phases.transport_ms - phases.sense_and_infer_ms - phases.exchange_ms - phases.lifecycle_ms - phases.setup_ms - phases.validate_ms) / n
                 );
             }
             phases = Phases::default();
@@ -580,11 +597,14 @@ struct Phases {
     backend_inference_ms: f64,
     exchange_ms: f64,
     lifecycle_ms: f64,
+    setup_ms: f64,
+    validate_ms: f64,
     frame_ms: f64,
     frames: u64,
     checkpoint_ms: f64,
-    /// GPU backend breakdown (summed over ticks): host prep, round trip, kernel, bookkeeping, evaluate total, pyramid.
-    gpu: [f64; 6],
+    /// GPU backend breakdown (summed over ticks): host prep, round trip, kernel, bookkeeping, evaluate total, pyramid,
+    /// field host, field round trip, field kernels.
+    gpu: [f64; 9],
 }
 
 impl Phases {
@@ -596,6 +616,8 @@ impl Phases {
         self.backend_inference_ms += t.backend_inference_ms;
         self.exchange_ms += t.exchange_ms;
         self.lifecycle_ms += t.lifecycle_ms;
+        self.setup_ms += t.setup_ms;
+        self.validate_ms += t.validate_publish_ms;
     }
     fn json(&self) -> serde_json::Value {
         let n = self.ticks.max(1) as f64;
@@ -610,7 +632,9 @@ impl Phases {
                 "of_which_backend_inference": self.backend_inference_ms / n,
                 "uptake_exchange_and_settlement": self.exchange_ms / n,
                 "motion_emission_lifecycle_deposits": self.lifecycle_ms / n,
-                "other_in_step": (self.step_ms - self.transport_ms - self.sense_and_infer_ms - self.exchange_ms - self.lifecycle_ms) / n,
+                "setup_clone_commands": self.setup_ms / n,
+                "validate_and_publish": self.validate_ms / n,
+                "other_in_step": (self.step_ms - self.transport_ms - self.sense_and_infer_ms - self.exchange_ms - self.lifecycle_ms - self.setup_ms - self.validate_ms) / n,
             },
             "frames_written": self.frames,
             "mean_frame_ms": if self.frames > 0 { self.frame_ms / self.frames as f64 } else { 0.0 },
@@ -623,6 +647,9 @@ impl Phases {
                 "bookkeeping": self.gpu[3] / n,
                 "evaluate_total": self.gpu[4] / n,
                 "pyramid_gpu_timestamps": self.gpu[5] / n,
+                "field_host": self.gpu[6] / n,
+                "field_round_trip_including_kernels": self.gpu[7] / n,
+                "field_kernels_gpu_timestamps": self.gpu[8] / n,
             },
         })
     }

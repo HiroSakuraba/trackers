@@ -26,11 +26,14 @@ use std::sync::mpsc;
 
 use fl_core::nn::{layer_dims, CATALOG, INPUT_WIDTH, OUTPUT_WIDTH};
 use fl_core::field::Field;
-use fl_core::{ControllerBackend, InferenceJob, SenseInferBackend, SenseJob, SenseOutput};
+use fl_core::sources::Source;
+use fl_core::{Config, ControllerBackend, FieldAccounting, FieldBackend, InferenceJob, SenseInferBackend, SenseJob, SenseOutput};
 
 const SHADER: &str = include_str!("mlp.wgsl");
 const SENSE_SHADER: &str = include_str!("sense.wgsl");
 const PYRAMID_SHADER: &str = include_str!("pyramid.wgsl");
+const FIELD_SHADER: &str = include_str!("field.wgsl");
+const SOURCE_STRIDE: usize = 44;
 /// Floats per slot in the resident traits buffer: 33 motion sensitivities + padding.
 const TRAITS_STRIDE: usize = 36;
 const JOB_STRIDE: usize = 12;
@@ -68,6 +71,17 @@ pub struct EvalTiming {
     pub dispatches: u32,
 }
 
+/// Where the time of the most recent field step went.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FieldTiming {
+    /// Uploading the committed field and source parameters, recording commands.
+    pub host_ms: f64,
+    /// Submit, wait, read the observation field and accounting back (includes kernels).
+    pub roundtrip_ms: f64,
+    /// Field kernels (diffusion, decay, sources, tiny clearing) from GPU timestamps.
+    pub kernel_ms: Option<f64>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GpuStats {
     pub calls: u64,
@@ -77,6 +91,7 @@ pub struct GpuStats {
     pub dispatches: u64,
     pub slab_growths: u64,
     pub last: EvalTiming,
+    pub field_last: FieldTiming,
 }
 
 struct Slab {
@@ -111,11 +126,33 @@ struct SensePipelines {
     pyr_layout: wgpu::BindGroupLayout,
 }
 
+struct FieldPipelines {
+    layout: wgpu::BindGroupLayout,
+    diffuse: wgpu::ComputePipeline,
+    decay: wgpu::ComputePipeline,
+    source_norm: wgpu::ComputePipeline,
+    inject: wgpu::ComputePipeline,
+    tiny: wgpu::ComputePipeline,
+}
+
 /// Device copies of the field and its density pyramid, sized for one field geometry.
 struct FieldGpu {
     key: (usize, usize, usize),
     fe: wgpu::Buffer,
     fm: wgpu::Buffer,
+    // Field-step resources.
+    fe2: wgpu::Buffer,
+    fm2: wgpu::Buffer,
+    funiform: wgpu::Buffer,
+    acct: wgpu::Buffer,
+    fstaging: wgpu::Buffer,
+    src: wgpu::Buffer,
+    src_cap: usize,
+    bind_ab: wgpu::BindGroup,
+    bind_ba: wgpu::BindGroup,
+    bind_inplace: wgpu::BindGroup,
+    cell_grid: (u32, u32),
+    plane_grid: (u32, u32),
     pyr: wgpu::Buffer,
     /// Per level: (gx, gy, offset cells, hx, hy).
     levels: Vec<(u32, u32, u32, f32, f32)>,
@@ -154,6 +191,11 @@ pub struct GpuBackend {
     pyramid_timestamps: Option<Timestamps>,
     input_scratch: Vec<f32>,
     sense: SensePipelines,
+    field_pipes: FieldPipelines,
+    field_timestamps: Option<Timestamps>,
+    /// True while the device copy of the field equals the observation field just
+    /// returned by `transport_and_sources` (lets fused sensing skip its upload).
+    field_resident: bool,
     field_gpu: Option<FieldGpu>,
     sense_io: Option<Io>,
     pub info: GpuInfo,
@@ -279,6 +321,24 @@ impl GpuBackend {
             period_ns: queue.get_timestamp_period() as f64,
         };
         let pyramid_timestamps = ts_ok.then(mk_ts);
+        let field_timestamps = ts_ok.then(mk_ts);
+        let field_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("field"), source: wgpu::ShaderSource::Wgsl(FIELD_SHADER.into()) });
+        let field_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("field"),
+            entries: &[uentry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false), storage_entry(4, false), storage_entry(5, false), storage_entry(6, false)],
+        });
+        let fpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("field"), bind_group_layouts: &[Some(&field_layout)], immediate_size: 0 });
+        let mkf = |entry| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&fpl),
+                module: &field_module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let field_pipes = FieldPipelines { diffuse: mkf("diffuse"), decay: mkf("decay"), source_norm: mkf("source_norm"), inject: mkf("inject"), tiny: mkf("tiny"), layout: field_layout };
         let timestamps = ts_ok.then(|| Timestamps {
             set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("kernel"), ty: wgpu::QueryType::Timestamp, count: 2 }),
             resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("ts-resolve"), size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
@@ -293,7 +353,7 @@ impl GpuBackend {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
             max_buffer_bytes: limits.max_buffer_size,
         };
-        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_gpu: None, sense_io: None, info, stats: GpuStats::default() })
+        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, field_resident: false, field_gpu: None, sense_io: None, info, stats: GpuStats::default() })
     }
 
     pub fn capability(&self) -> String {
@@ -563,11 +623,13 @@ fn read_timestamps(device: &wgpu::Device, ts: &Timestamps, rx: mpsc::Receiver<Re
 }
 
 impl GpuBackend {
-    fn ensure_field(&mut self, field: &Field, extra_levels: usize) -> Result<(), String> {
+    fn ensure_field(&mut self, field: &Field, extra_levels: usize, n_sources: usize) -> Result<(), String> {
         let key = (field.gx, field.gy, extra_levels);
-        if self.field_gpu.as_ref().is_some_and(|f| f.key == key) {
+        if self.field_gpu.as_ref().is_some_and(|f| f.key == key && f.src_cap >= n_sources) {
             return Ok(());
         }
+        self.field_resident = false;
+        let src_cap = n_sources.max(64).next_power_of_two();
         if extra_levels + 1 > MAX_LEVELS {
             return Err(format!("{} pyramid levels exceed the GPU limit of {MAX_LEVELS}", extra_levels + 1));
         }
@@ -585,8 +647,8 @@ impl GpuBackend {
         }
         use wgpu::BufferUsages as U;
         let mk = |label, size: u64, usage| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
-        let fe = mk("field-e", (cells * 4) as u64, U::STORAGE | U::COPY_DST);
-        let fm = mk("field-m", (cells * 32 * 4) as u64, U::STORAGE | U::COPY_DST);
+        let fe = mk("field-e", (cells * 4) as u64, U::STORAGE | U::COPY_DST | U::COPY_SRC);
+        let fm = mk("field-m", (cells * 32 * 4) as u64, U::STORAGE | U::COPY_DST | U::COPY_SRC);
         let pyr = mk("pyramid", pyr_bytes, U::STORAGE);
         let inv_area = (1.0 / (field.hx * field.hy)) as f32;
         let mut binds = Vec::new();
@@ -610,7 +672,54 @@ impl GpuBackend {
             }));
             grids.push((grid_x, grid_y));
         }
-        self.field_gpu = Some(FieldGpu { key, fe, fm, pyr, levels, binds, grids, s0: field.hx.max(field.hy) as f32 });
+        let fe2 = mk("field-e2", (cells * 4) as u64, U::STORAGE | U::COPY_SRC);
+        let fm2 = mk("field-m2", (cells * 32 * 4) as u64, U::STORAGE | U::COPY_SRC);
+        let acct = mk("field-acct", (cells * 3 * 4) as u64, U::STORAGE | U::COPY_SRC | U::COPY_DST);
+        let fstaging = mk("field-staging", (cells * 36 * 4) as u64, U::MAP_READ | U::COPY_DST);
+        let funiform = mk("field-uniform", 48, U::UNIFORM | U::COPY_DST);
+        let src = mk("sources", (src_cap * SOURCE_STRIDE * 4) as u64, U::STORAGE | U::COPY_DST);
+        let fbind = |se: &wgpu::Buffer, sm: &wgpu::Buffer, de: &wgpu::Buffer, dm: &wgpu::Buffer| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("field"),
+                layout: &self.field_pipes.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: funiform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: se.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: sm.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: de.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: dm.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: acct.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: src.as_entire_binding() },
+                ],
+            })
+        };
+        let bind_ab = fbind(&fe, &fm, &fe2, &fm2);
+        let bind_ba = fbind(&fe2, &fm2, &fe, &fm);
+        let bind_inplace = fbind(&self.dummy, &self.dummy, &fe, &fm);
+        let cell_grid = grid_for((cells as u32).div_ceil(64));
+        let plane_grid = grid_for((cells as u32 * 33).div_ceil(64));
+        self.field_gpu = Some(FieldGpu {
+            key,
+            fe,
+            fm,
+            fe2,
+            fm2,
+            funiform,
+            acct,
+            fstaging,
+            src,
+            src_cap,
+            bind_ab,
+            bind_ba,
+            bind_inplace,
+            cell_grid,
+            plane_grid,
+            pyr,
+            levels,
+            binds,
+            grids,
+            s0: field.hx.max(field.hy) as f32,
+        });
         Ok(())
     }
 
@@ -740,11 +849,15 @@ impl SenseInferBackend for GpuBackend {
         let total = std::time::Instant::now();
         let prep = std::time::Instant::now();
         let placed = self.place(jobs.iter().map(|j| j.genome))?;
-        self.ensure_field(field, extra_levels)?;
-        // Upload the observation field and build the density pyramid on the GPU.
+        self.ensure_field(field, extra_levels, 0)?;
+        // Upload the observation field (unless the field step left it on the device)
+        // and build the density pyramid on the GPU.
         let fg = self.field_gpu.as_ref().expect("field resources");
-        self.queue.write_buffer(&fg.fe, 0, f32_bytes(&field.e));
-        self.queue.write_buffer(&fg.fm, 0, f32_bytes(&field.m));
+        if !self.field_resident {
+            self.queue.write_buffer(&fg.fe, 0, f32_bytes(&field.e));
+            self.queue.write_buffer(&fg.fm, 0, f32_bytes(&field.m));
+        }
+        self.field_resident = false;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pyramid") });
         let nl = fg.binds.len();
         for l in 0..nl {
@@ -812,6 +925,176 @@ impl SenseInferBackend for GpuBackend {
         self.stats.last.bookkeeping_ms += bk.elapsed().as_secs_f64() * 1e3;
         self.stats.last.total_ms = total.elapsed().as_secs_f64() * 1e3;
         Ok(())
+    }
+}
+
+impl FieldBackend for GpuBackend {
+    fn name(&self) -> &str {
+        "wgpu-field-f32"
+    }
+
+    fn transport_and_sources(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+        self.field_resident = false;
+        self.stats.field_last = FieldTiming::default();
+        let host = std::time::Instant::now();
+        self.ensure_field(field, cfg.pyramid_levels(), sources.len())?;
+        let dt = cfg.dt();
+        let diffusion = cfg.world.diffusion;
+        let rx = diffusion * dt / (field.hx * field.hx);
+        let ry = diffusion * dt / (field.hy * field.hy);
+        let sub = (((rx + ry) / 0.5).ceil() as u32).max(1);
+        let lambda = cfg.world.decay_per_second;
+        let fg = self.field_gpu.as_ref().expect("field resources");
+        let (w, h) = (field.width(), field.height());
+        let words: [u32; 12] = [
+            field.gx as u32,
+            field.gy as u32,
+            sources.len() as u32,
+            0, // grid_x: patched per dispatch below
+            ((rx / sub as f64) as f32).to_bits(),
+            ((ry / sub as f64) as f32).to_bits(),
+            ((-(-lambda * dt).exp_m1()) as f32).to_bits(),
+            (cfg.world.tiny_energy_threshold as f32).to_bits(),
+            (w as f32).to_bits(),
+            (h as f32).to_bits(),
+            (field.hx as f32).to_bits(),
+            (field.hy as f32).to_bits(),
+        ];
+        // Source parameters (centers at the midpoint time of this advance).
+        let mut sp = vec![0.0f32; sources.len().max(1) * SOURCE_STRIDE];
+        for (i, s) in sources.iter().enumerate() {
+            let c = s.center_mid(n, cfg);
+            let sigma = cfg.sources.sigma_world_units;
+            let cut = cfg.sources.kernel_cutoff_sigma * sigma;
+            let (rxb, ryb) = ((cut / field.hx).ceil() as i64 + 1, (cut / field.hy).ceil() as i64 + 1);
+            let (gx, gy) = (field.gx as i64, field.gy as i64);
+            let cxi = (c[0] / field.hx - 0.5).floor() as i64;
+            let cyi = (c[1] / field.hy - 0.5).floor() as i64;
+            let (x0, bw) = if 2 * rxb + 1 >= gx { (0, gx) } else { ((cxi - rxb).rem_euclid(gx), 2 * rxb + 1) };
+            let (y0, bh) = if 2 * ryb + 1 >= gy { (0, gy) } else { ((cyi - ryb).rem_euclid(gy), 2 * ryb + 1) };
+            let b = i * SOURCE_STRIDE;
+            sp[b] = c[0] as f32;
+            sp[b + 1] = c[1] as f32;
+            sp[b + 2] = sigma as f32;
+            sp[b + 3] = cut as f32;
+            sp[b + 4] = (cfg.sources.power_per_source * dt) as f32;
+            sp[b + 6] = f32::from_bits(x0 as u32);
+            sp[b + 7] = f32::from_bits(y0 as u32);
+            sp[b + 8] = f32::from_bits(bw as u32);
+            sp[b + 9] = f32::from_bits(bh as u32);
+            sp[b + 10..b + 42].copy_from_slice(&s.chem);
+        }
+        self.queue.write_buffer(&fg.src, 0, f32_bytes(&sp));
+        self.queue.write_buffer(&fg.fe, 0, f32_bytes(&field.e));
+        self.queue.write_buffer(&fg.fm, 0, f32_bytes(&field.m));
+        let fp = &self.field_pipes;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("field") });
+        enc.clear_buffer(&fg.acct, 0, None);
+        let mut passes: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32), u32)> = Vec::new();
+        if diffusion > 0.0 {
+            for k in 0..sub {
+                passes.push((&fp.diffuse, if k % 2 == 0 { &fg.bind_ab } else { &fg.bind_ba }, fg.plane_grid, 0));
+            }
+        }
+        let odd = diffusion > 0.0 && sub % 2 == 1;
+        let mut tail: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32), u32)> = Vec::new();
+        if lambda > 0.0 {
+            tail.push((&fp.decay, &fg.bind_inplace, fg.plane_grid, 0));
+        }
+        if !sources.is_empty() {
+            tail.push((&fp.source_norm, &fg.bind_inplace, (sources.len() as u32, 1), 1));
+            tail.push((&fp.inject, &fg.bind_inplace, fg.cell_grid, 0));
+        }
+        tail.push((&fp.tiny, &fg.bind_inplace, fg.cell_grid, 0));
+        let total_passes = passes.len() + tail.len();
+        let mut k = 0usize;
+        let mut run_pass = |enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, bind: &wgpu::BindGroup, grid: (u32, u32), ts: Option<&Timestamps>| {
+            let tw = ts.filter(|_| k == 0 || k + 1 == total_passes).map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: (k == 0).then_some(0),
+                end_of_pass_write_index: (k + 1 == total_passes).then_some(1),
+            });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("field"), timestamp_writes: tw });
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, bind, &[]);
+            pass.dispatch_workgroups(grid.0, grid.1, 1);
+            k += 1;
+        };
+        // grid_x differs between the plane-wide and cell-wide kernels, so the uniform is
+        // written per phase: diffusion/decay share the plane grid, the rest the cell grid.
+        let mut wp = words;
+        wp[3] = fg.plane_grid.0;
+        self.queue.write_buffer(&fg.funiform, 0, bytemuck::cast_slice(&wp));
+        for &(pipe, bind, grid, _) in &passes {
+            run_pass(&mut enc, pipe, bind, grid, self.field_timestamps.as_ref());
+        }
+        if odd {
+            // The diffused field ended in the B buffers: copy it back to A.
+            let cells = field.cells() as u64;
+            enc.copy_buffer_to_buffer(&fg.fe2, 0, &fg.fe, 0, cells * 4);
+            enc.copy_buffer_to_buffer(&fg.fm2, 0, &fg.fm, 0, cells * 32 * 4);
+        }
+        let has_decay = lambda > 0.0;
+        if has_decay {
+            let (pipe, bind, grid, _) = tail[0];
+            run_pass(&mut enc, pipe, bind, grid, self.field_timestamps.as_ref());
+        }
+        // Switch the uniform's grid_x to the cell grid for the remaining passes: they are in a
+        // separate submission so the queue write lands in between.
+        self.queue.submit([enc.finish()]);
+        let mut wc = words;
+        wc[3] = fg.cell_grid.0;
+        self.queue.write_buffer(&fg.funiform, 0, bytemuck::cast_slice(&wc));
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("field-2") });
+        for &(pipe, bind, grid, _) in tail.iter().skip(has_decay as usize) {
+            run_pass(&mut enc, pipe, bind, grid, self.field_timestamps.as_ref());
+        }
+        let cells = field.cells() as u64;
+        enc.copy_buffer_to_buffer(&fg.fe, 0, &fg.fstaging, 0, cells * 4);
+        enc.copy_buffer_to_buffer(&fg.fm, 0, &fg.fstaging, cells * 4, cells * 32 * 4);
+        enc.copy_buffer_to_buffer(&fg.acct, 0, &fg.fstaging, cells * 33 * 4, cells * 3 * 4);
+        if let Some(ts) = &self.field_timestamps {
+            enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
+            enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
+        }
+        self.stats.field_last.host_ms = host.elapsed().as_secs_f64() * 1e3;
+        let round = std::time::Instant::now();
+        self.queue.submit([enc.finish()]);
+        let slice = fg.fstaging.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let ts_rx = self.field_timestamps.as_ref().map(|ts| {
+            let (ttx, trx) = mpsc::channel();
+            ts.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = ttx.send(r);
+            });
+            trx
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
+        rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU field readback: {e}"))?;
+        if let (Some(ts), Some(trx)) = (&self.field_timestamps, ts_rx) {
+            self.stats.field_last.kernel_ms = read_timestamps(&self.device, ts, trx);
+        }
+        let mut acct = FieldAccounting { subcycles: if diffusion > 0.0 { sub } else { 1 }, ..Default::default() };
+        {
+            let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
+            let all: &[f32] = bytemuck::try_cast_slice(&view).map_err(|e| format!("field readback alignment: {e:?}"))?;
+            let c = cells as usize;
+            field.e.copy_from_slice(&all[..c]);
+            field.m.copy_from_slice(&all[c..c * 33]);
+            let a = &all[c * 33..c * 36];
+            for cell in 0..c {
+                acct.decay_removed += a[cell * 3] as f64;
+                acct.injected += a[cell * 3 + 1] as f64;
+                acct.tiny_removed += a[cell * 3 + 2] as f64;
+            }
+        }
+        fg.fstaging.unmap();
+        self.stats.field_last.roundtrip_ms = round.elapsed().as_secs_f64() * 1e3;
+        self.field_resident = true;
+        Ok(acct)
     }
 }
 
@@ -988,6 +1271,64 @@ mod tests {
         let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
         assert!((w.total_energy() - expected).abs() / l.transferred.max(1.0) < 1e-5);
         assert!(w.totals.births > 0, "births happened on the fused path");
+        assert!(w.orgs.len() > 500);
+    }
+
+    #[test]
+    fn gpu_field_step_matches_cpu() {
+        let Ok(mut gpu) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut w = fl_core::World::new(vivid_small()).unwrap();
+        for _ in 0..120 {
+            w.step().unwrap();
+        }
+        for (label, sub_diffusion) in [("one subcycle", None), ("odd subcycles", Some(40.0))] {
+            let mut cfg = w.cfg.clone();
+            if let Some(d) = sub_diffusion {
+                cfg.world.diffusion = d; // forces several (odd) subcycles: exercises the copy-back
+            }
+            let mut srcs = w.sources.clone();
+            for s in &mut srcs {
+                s.advance_to(w.tick, &cfg, &w.rng);
+            }
+            let mut a = w.field.clone();
+            let mut b = w.field.clone();
+            let ga = gpu.transport_and_sources(&mut a, &cfg, &srcs, w.tick).unwrap();
+            let gb = fl_core::world::cpu_transport_and_sources(&mut b, &cfg, &srcs, w.tick).unwrap();
+            let emax = b.e.iter().fold(0.0f32, |m, &v| m.max(v.abs())) as f64;
+            let de = a.e.iter().zip(&b.e).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max) / emax;
+            let dm = a.m.iter().zip(&b.m).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max) / emax;
+            let rel = |x: f64, y: f64| (x - y).abs() / y.abs().max(1e-9);
+            eprintln!(
+                "{label}: subcycles {}/{}, field e {de:.2e}, m {dm:.2e}, decay {:.2e}, injected {:.2e}, tiny {} vs {}; kernels {:?} ms",
+                ga.subcycles, gb.subcycles, rel(ga.decay_removed, gb.decay_removed), rel(ga.injected, gb.injected), ga.tiny_removed, gb.tiny_removed, gpu.stats.field_last.kernel_ms
+            );
+            assert_eq!(ga.subcycles, gb.subcycles);
+            assert!(de < 1e-5 && dm < 1e-5, "{label}: field differs (e {de}, m {dm})");
+            assert!(rel(ga.decay_removed, gb.decay_removed) < 1e-4, "{label}: decay accounting");
+            assert!(rel(ga.injected, gb.injected) < 1e-5, "{label}: injection accounting");
+            assert!((ga.tiny_removed - gb.tiny_removed).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn world_runs_on_gpu_device_path() {
+        let Ok(mut gpu) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut w = fl_core::World::new(vivid_small()).unwrap();
+        for _ in 0..640 {
+            w.step_inference(fl_core::Inference::Device(&mut gpu)).unwrap();
+        }
+        let l = &w.ledger;
+        let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+        let rel = (w.total_energy() - expected).abs() / l.transferred.max(1.0);
+        eprintln!("device path: births {}, population {}, cumulative residual {:.2e} (relative to transfers {rel:.2e})", w.totals.births, w.orgs.len(), l.residual);
+        assert!(rel < 1e-5);
+        assert!(w.totals.births > 0);
         assert!(w.orgs.len() > 500);
     }
 }

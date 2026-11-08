@@ -53,6 +53,15 @@ The plan's full target (80,000 independent networks, ~3 GB of weights):
 cargo run --release -- run --config presets\vivid-field-ecology.toml --backend gpu --seconds 30 --frame-every 32 --out runs\gpu
 ```
 
+**GPU field step too** (`--backend gpu-field`): field diffusion, decay,
+sources and tiny-cell clearing also run on the GPU, and fused sensing reuses
+the field already there. Exchange and lifecycle still run on the CPU, so the
+field is copied back once per step for now.
+
+```powershell
+cargo run --release -- run --config presets\target-20k-field-ecology.toml --backend gpu-field --seconds 6 --frame-every 0 --out runs\t20g
+```
+
 **Fused GPU sensing + inference** (`--backend gpu-fused`): the field is uploaded
 once per step, the sensor pyramid is built on the GPU, and each organism's
 inputs are computed and fed to its network without leaving the GPU. Compare it
