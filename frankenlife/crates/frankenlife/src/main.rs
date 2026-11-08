@@ -54,6 +54,10 @@ enum Cmd {
         /// Timed batches per backend.
         #[arg(long, default_value_t = 20)]
         iters: usize,
+        /// Idle milliseconds between GPU batches, to imitate a run where the CPU
+        /// works between dispatches (exposes GPU power-state downclocking).
+        #[arg(long, default_value_t = 0)]
+        gap_ms: u64,
     },
 }
 
@@ -133,7 +137,7 @@ fn main() {
         Cmd::Validate { config } => validate(&config),
         Cmd::Run(a) => run(a),
         Cmd::Inspect { checkpoint, id, top } => inspect_checkpoint(&checkpoint, &id, top),
-        Cmd::GpuCheck { organisms, hidden, iters } => gpu_check(organisms, &hidden, iters),
+        Cmd::GpuCheck { organisms, hidden, iters, gap_ms } => gpu_check(organisms, &hidden, iters, gap_ms),
     };
     std::process::exit(code);
 }
@@ -161,7 +165,7 @@ fn validate(path: &Option<PathBuf>) -> i32 {
 }
 
 #[cfg(feature = "gpu")]
-fn gpu_check(organisms: usize, hidden: &str, iters: usize) -> i32 {
+fn gpu_check(organisms: usize, hidden: &str, iters: usize, gap_ms: u64) -> i32 {
     use fl_core::nn::{INPUT_WIDTH, OUTPUT_WIDTH};
     use fl_core::{ControllerBackend, InferenceJob, ReferenceBackend};
     let hidden: Vec<u32> = match hidden.split(',').map(|v| v.trim().parse::<u32>()).collect() {
@@ -203,9 +207,14 @@ fn gpu_check(organisms: usize, hidden: &str, iters: usize) -> i32 {
     let _ = ReferenceBackend.evaluate(&jobs, &mut b);
     let diff = a.iter().zip(&b).flat_map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs())).fold(0.0f32, f32::max);
     let (mut prep_ms, mut round_ms, mut kernel_ms, mut kernel_n) = (0.0, 0.0, 0.0, 0usize);
-    let t = Instant::now();
+    let mut busy_s = 0.0;
     for _ in 0..iters {
+        if gap_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+        }
+        let t = Instant::now();
         let _ = gpu.evaluate(&jobs, &mut a);
+        busy_s += t.elapsed().as_secs_f64();
         let l = gpu.stats.last;
         prep_ms += l.host_prep_ms;
         round_ms += l.gpu_roundtrip_ms;
@@ -214,8 +223,11 @@ fn gpu_check(organisms: usize, hidden: &str, iters: usize) -> i32 {
             kernel_n += 1;
         }
     }
-    let gpu_s = t.elapsed().as_secs_f64() / iters.max(1) as f64;
+    let gpu_s = busy_s / iters.max(1) as f64;
     let it = iters.max(1) as f64;
+    if gap_ms > 0 {
+        println!("idle gap     : {gap_ms} ms before each timed batch (imitating CPU work between dispatches)");
+    }
     let t = Instant::now();
     for _ in 0..iters.clamp(1, 3) {
         let _ = ReferenceBackend.evaluate(&jobs, &mut b);
@@ -241,7 +253,7 @@ fn gpu_check(organisms: usize, hidden: &str, iters: usize) -> i32 {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn gpu_check(_: usize, _: &str, _: usize) -> i32 {
+fn gpu_check(_: usize, _: &str, _: usize, _: u64) -> i32 {
     eprintln!("this build has no GPU support (rebuild with the default `gpu` feature)");
     2
 }
