@@ -1,0 +1,11 @@
+[package]
+name = "fl-gpu"
+description = "wgpu (Vulkan/DX12/Metal) population-inference backend for FrankenLife"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fl-core = { path = "../fl-core" }
+pollster = "1.0.1"
+wgpu = "30.0.1"

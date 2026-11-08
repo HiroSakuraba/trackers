@@ -8,7 +8,13 @@ license.workspace = true
 [dependencies]
 fl-core = { path = "../fl-core" }
 fl-view = { path = "../fl-view" }
+fl-gpu = { path = "../fl-gpu", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 png.workspace = true
 clap.workspace = true
+
+[features]
+default = ["gpu"]
+# GPU inference through wgpu (Vulkan / DX12 / Metal).
+gpu = ["dep:fl-gpu"]

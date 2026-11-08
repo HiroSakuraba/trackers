@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fl-core", "crates/fl-view", "crates/fl-wasm", "crates/frankenlife"]
+members = ["crates/fl-core", "crates/fl-gpu", "crates/fl-view", "crates/fl-wasm", "crates/frankenlife"]
 
 [workspace.package]
 version = "0.1.0"

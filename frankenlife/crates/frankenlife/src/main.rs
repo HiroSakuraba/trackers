@@ -43,6 +43,26 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         top: usize,
     },
+    /// Open the GPU, check it against the CPU reference, and benchmark inference.
+    GpuCheck {
+        /// Organisms (independent networks) per batch.
+        #[arg(long, default_value_t = 4096)]
+        organisms: usize,
+        /// Hidden layers: 8 | 32 | 64,32 | 96,64 | 128,96.
+        #[arg(long, default_value = "64,32")]
+        hidden: String,
+        /// Timed batches per backend.
+        #[arg(long, default_value_t = 20)]
+        iters: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Backend {
+    /// fl-core's scalar reference evaluator (multithreaded, bitwise deterministic).
+    Cpu,
+    /// wgpu compute on the GPU (tolerance-equivalent to the reference).
+    Gpu,
 }
 
 #[derive(Parser)]
@@ -86,6 +106,9 @@ struct RunArgs {
     /// Write an exact checkpoint every S simulated seconds (plus one at the end).
     #[arg(long)]
     checkpoint_every: Option<f64>,
+    /// Where controller networks are evaluated.
+    #[arg(long, value_enum, default_value_t = Backend::Cpu)]
+    backend: Backend,
 }
 
 fn parse_erase(s: &str) -> Result<(u64, f64, f64, f64), String> {
@@ -110,6 +133,7 @@ fn main() {
         Cmd::Validate { config } => validate(&config),
         Cmd::Run(a) => run(a),
         Cmd::Inspect { checkpoint, id, top } => inspect_checkpoint(&checkpoint, &id, top),
+        Cmd::GpuCheck { organisms, hidden, iters } => gpu_check(organisms, &hidden, iters),
     };
     std::process::exit(code);
 }
@@ -134,6 +158,73 @@ fn validate(path: &Option<PathBuf>) -> i32 {
             1
         }
     }
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_check(organisms: usize, hidden: &str, iters: usize) -> i32 {
+    use fl_core::nn::{INPUT_WIDTH, OUTPUT_WIDTH};
+    use fl_core::{ControllerBackend, InferenceJob, ReferenceBackend};
+    let hidden: Vec<u32> = match hidden.split(',').map(|v| v.trim().parse::<u32>()).collect() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("--hidden: {e}");
+            return 2;
+        }
+    };
+    let mut cfg = Config::reference();
+    cfg.controller.hidden_widths = hidden.clone();
+    if let Err(e) = cfg.validate() {
+        eprintln!("invalid topology {hidden:?}: {e:?}");
+        return 2;
+    }
+    let mut gpu = match fl_gpu::GpuBackend::new() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("GPU unavailable: {e}");
+            return 1;
+        }
+    };
+    println!("adapter      : {} ({}, {})", gpu.info.name, gpu.info.backend, gpu.info.device_type);
+    println!("driver       : {}", gpu.info.driver);
+    println!("binding limit: {} MiB per storage buffer", gpu.info.max_storage_binding_bytes >> 20);
+    let rng = fl_core::rng::SemanticRng::new(1);
+    let genomes: Vec<_> = (0..organisms as u64).map(|i| fl_core::genome::founder(&cfg, &rng, i, i)).collect();
+    let params = genomes[0].param_count();
+    let inputs: Vec<[f32; INPUT_WIDTH]> = (0..organisms).map(|g| std::array::from_fn(|i| ((g * 37 + i * 11) % 200) as f32 / 100.0 - 1.0)).collect();
+    let jobs: Vec<InferenceJob<'_>> = genomes.iter().zip(&inputs).map(|(g, x)| InferenceJob { organism: g.id, genome: g, input: x }).collect();
+    let mut a = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
+    let mut b = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
+    let t = Instant::now();
+    if let Err(e) = gpu.evaluate(&jobs, &mut a) {
+        eprintln!("GPU evaluation failed: {e}");
+        return 1;
+    }
+    let upload_s = t.elapsed().as_secs_f64();
+    let _ = ReferenceBackend.evaluate(&jobs, &mut b);
+    let diff = a.iter().zip(&b).flat_map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs())).fold(0.0f32, f32::max);
+    let t = Instant::now();
+    for _ in 0..iters {
+        let _ = gpu.evaluate(&jobs, &mut a);
+    }
+    let gpu_s = t.elapsed().as_secs_f64() / iters.max(1) as f64;
+    let t = Instant::now();
+    for _ in 0..iters.clamp(1, 3) {
+        let _ = ReferenceBackend.evaluate(&jobs, &mut b);
+    }
+    let cpu_s = t.elapsed().as_secs_f64() / iters.clamp(1, 3) as f64;
+    let weights_mib = (organisms * params * 4) as f64 / (1024.0 * 1024.0);
+    println!("networks     : {organisms} independent x {params} params ({weights_mib:.0} MiB of weights)");
+    println!("first batch  : {:.1} ms (includes uploading every genome)", upload_s * 1e3);
+    println!("max |dlogit| : {diff:.2e} vs CPU reference ({})", if diff < 1e-4 { "OK" } else { "TOO LARGE" });
+    println!("GPU batch    : {:.2} ms  ->  {:.0} network evals/s, {:.1} GB/s of weights", gpu_s * 1e3, organisms as f64 / gpu_s, weights_mib / 1024.0 / gpu_s);
+    println!("CPU batch    : {:.2} ms (scalar reference, one thread)  ->  GPU is {:.1}x faster", cpu_s * 1e3, cpu_s / gpu_s);
+    if diff < 1e-4 { 0 } else { 1 }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_check(_: usize, _: &str, _: usize) -> i32 {
+    eprintln!("this build has no GPU support (rebuild with the default `gpu` feature)");
+    2
 }
 
 fn most_derived(world: &World, k: usize) -> Vec<u64> {
@@ -231,6 +322,25 @@ fn run(a: RunArgs) -> i32 {
     } else {
         world.workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     }
+    #[cfg(feature = "gpu")]
+    let mut gpu = match a.backend {
+        Backend::Gpu => match fl_gpu::GpuBackend::new() {
+            Ok(g) => {
+                eprintln!("GPU: {}", g.capability());
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("cannot use the GPU backend: {e}");
+                return 2;
+            }
+        },
+        Backend::Cpu => None,
+    };
+    #[cfg(not(feature = "gpu"))]
+    if a.backend == Backend::Gpu {
+        eprintln!("this build has no GPU support (rebuild with the default `gpu` feature)");
+        return 2;
+    }
     for &(t, x, y, r) in &a.erase {
         if let Err(e) = world.schedule(t, Command::EraseDisk { x, y, radius: r, disposal: Disposal::Recycle }) {
             eprintln!("cannot schedule erase: {e}");
@@ -279,7 +389,14 @@ fn run(a: RunArgs) -> i32 {
         frame_no += 1;
     }
     for _ in 0..ticks {
-        let r = match world.step() {
+        #[cfg(feature = "gpu")]
+        let stepped = match gpu.as_mut() {
+            Some(g) => world.step_with(Some(g as &mut dyn fl_core::ControllerBackend)),
+            None => world.step(),
+        };
+        #[cfg(not(feature = "gpu"))]
+        let stepped = world.step();
+        let r = match stepped {
             Ok(r) => r,
             Err(e) => {
                 stop_reason = match &e {
@@ -340,6 +457,7 @@ fn run(a: RunArgs) -> i32 {
         "simulation_seconds": world.simulation_seconds(),
         "wall_seconds": wall,
         "workers": world.workers,
+        "inference_backend": format!("{:?}", a.backend),
         "final_state_hash": format!("{:016x}", world.state_hash()),
         "population": world.orgs.len(),
         "totals": world.totals,
