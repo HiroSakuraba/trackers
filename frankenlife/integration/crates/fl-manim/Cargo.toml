@@ -1,0 +1,12 @@
+[package]
+name = "fl-manim"
+description = "FrankenManim rendering of FrankenLife render epochs (bulk dot clouds over a field image)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fl-core.workspace = true
+fl-view.workspace = true
+fmn.workspace = true
+fmn-library.workspace = true

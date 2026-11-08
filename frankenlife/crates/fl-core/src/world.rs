@@ -252,6 +252,8 @@ struct Sense {
     density0: f64,
     out: [f32; OUTPUT_WIDTH],
     evaluated: bool,
+    /// Controller input of a due evaluation (zero otherwise).
+    input: [f32; INPUT_WIDTH],
 }
 
 struct BirthProposal {
@@ -350,6 +352,13 @@ impl World {
 
     /// Advance `n -> n+1`. On error the committed world is unchanged.
     pub fn step(&mut self) -> Result<TickReport, TickError> {
+        self.step_with(None)
+    }
+
+    /// Advance `n -> n+1`, evaluating due controllers with `backend`
+    /// (`None` = the built-in parallel scalar reference). On error the
+    /// committed world is unchanged.
+    pub fn step_with(&mut self, backend: Option<&mut dyn ControllerBackend>) -> Result<TickReport, TickError> {
         let t_start = Stopwatch::start();
         let cfg = &self.cfg;
         let dt = cfg.dt();
@@ -439,7 +448,21 @@ impl World {
         let pyr = Pyramid::build(&field, self.pyramid_extra_levels);
 
         // ── Phase 4: sample organisms, evaluate due controllers ───────────
-        let senses = sense_all(cfg, &pyr, &orgs, &dead, n, self.workers);
+        let mut senses = sense_all(cfg, &pyr, &orgs, &dead, n, self.workers, backend.is_none());
+        if let Some(be) = backend {
+            let due: Vec<usize> = (0..senses.len()).filter(|&i| senses[i].evaluated).collect();
+            let jobs: Vec<InferenceJob<'_>> =
+                due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &orgs.genome[i], input: &senses[i].input }).collect();
+            let mut outs = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
+            be.evaluate(&jobs, &mut outs).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", be.name()) })?;
+            drop(jobs);
+            for (k, &i) in due.iter().enumerate() {
+                if outs[k].iter().any(|v| !v.is_finite()) {
+                    return Err(TickError::NumericalFault { tick: event, detail: format!("backend {} produced non-finite logits for organism {}", be.name(), orgs.id[i]) });
+                }
+                senses[i].out = outs[k];
+            }
+        }
         for (i, s) in senses.iter().enumerate() {
             if s.evaluated {
                 orgs.held[i] = s.out;
@@ -918,7 +941,45 @@ pub struct Inspection {
     pub mutation: Option<MutationRecord>,
 }
 
-fn sense_one(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, scratch: &mut [f32]) -> Sense {
+/// One independent controller evaluation: this organism's own genome and input.
+pub struct InferenceJob<'a> {
+    pub organism: u64,
+    pub genome: &'a Genome,
+    pub input: &'a [f32; INPUT_WIDTH],
+}
+
+/// Pluggable population-inference backend (plan §10, §18.3 "core backend port").
+///
+/// A backend evaluates many *independent* networks; it must never share
+/// weights between organisms. Backends other than the built-in scalar
+/// reference evaluator generally differ from it in floating-point
+/// accumulation order, so a run that uses one has its own determinism class
+/// and is compared to the reference by tolerance (plan §10.3, §10.7), not by
+/// state hash.
+pub trait ControllerBackend {
+    fn name(&self) -> &str;
+    /// Fill `out[j]` with the 36 raw logits of `jobs[j]`.
+    fn evaluate(&mut self, jobs: &[InferenceJob<'_>], out: &mut [[f32; OUTPUT_WIDTH]]) -> Result<(), String>;
+}
+
+/// The scalar reference evaluator as a backend (same arithmetic as `World::step`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReferenceBackend;
+
+impl ControllerBackend for ReferenceBackend {
+    fn name(&self) -> &str {
+        "cpu-reference-scalar"
+    }
+    fn evaluate(&mut self, jobs: &[InferenceJob<'_>], out: &mut [[f32; OUTPUT_WIDTH]]) -> Result<(), String> {
+        let mut scratch = vec![0.0f32; 2 * MAX_HIDDEN];
+        for (j, o) in jobs.iter().zip(out.iter_mut()) {
+            forward(j.genome.hidden(), &j.genome.params, j.input, &mut scratch, o);
+        }
+        Ok(())
+    }
+}
+
+fn sense_one(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, scratch: &mut [f32], infer: bool) -> Sense {
     let g = &orgs.genome[i];
     let raw = pyr.sample(orgs.x[i], orgs.y[i], g.scale());
     let obs = observe(&raw, &cfg.sensors);
@@ -932,22 +993,26 @@ fn sense_one(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, sc
         let mut input = [0.0f32; INPUT_WIDTH];
         input[..99].copy_from_slice(&obs.field_inputs);
         input[99..].copy_from_slice(&intr);
-        forward(g.hidden(), &g.params, &input, scratch, &mut out);
+        if infer {
+            forward(g.hidden(), &g.params, &input, scratch, &mut out);
+        }
+        return Sense { obs, density0, out, evaluated: true, input };
     }
-    Sense { obs, density0, out, evaluated: due }
+    Sense { obs, density0, out, evaluated: false, input: [0.0; INPUT_WIDTH] }
 }
 
-fn sense_all(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, dead: &[bool], n: u64, workers: usize) -> Vec<Sense> {
+fn sense_all(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, dead: &[bool], n: u64, workers: usize, infer: bool) -> Vec<Sense> {
     let len = orgs.len();
     let blank = Sense {
         obs: Observation { field_inputs: [0.0; 99], grad_x: [0.0; PLANES], grad_y: [0.0; PLANES] },
         density0: 0.0,
         out: [0.0; OUTPUT_WIDTH],
         evaluated: false,
+        input: [0.0; INPUT_WIDTH],
     };
     let run = |range: std::ops::Range<usize>| -> Vec<Sense> {
         let mut scratch = vec![0.0f32; 2 * MAX_HIDDEN];
-        range.map(|i| if dead[i] { blank } else { sense_one(cfg, pyr, orgs, i, n, &mut scratch) }).collect()
+        range.map(|i| if dead[i] { blank } else { sense_one(cfg, pyr, orgs, i, n, &mut scratch, infer) }).collect()
     };
     let workers = workers.max(1).min(len.max(1));
     if workers == 1 || len < 256 {

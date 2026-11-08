@@ -1,0 +1,12 @@
+[package]
+name = "fl-fnp"
+description = "FrankenNumPy typed storage, layout descriptors and .npz interchange for FrankenLife state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fl-core.workspace = true
+fnp-dtype.workspace = true
+fnp-ndarray.workspace = true
+fnp-io.workspace = true

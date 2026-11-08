@@ -264,3 +264,15 @@ fn shipped_presets_validate() {
         c.validate().unwrap_or_else(|e| panic!("{p}: {e:?}"));
     }
 }
+
+#[test]
+fn reference_backend_through_the_port_matches_built_in_path() {
+    let mut a = World::new(small()).unwrap();
+    let mut b = World::new(small()).unwrap();
+    let mut be = fl_core::ReferenceBackend;
+    for _ in 0..80 {
+        a.step().unwrap();
+        b.step_with(Some(&mut be)).unwrap();
+    }
+    assert_eq!(a.state_hash(), b.state_hash(), "same arithmetic, same science");
+}

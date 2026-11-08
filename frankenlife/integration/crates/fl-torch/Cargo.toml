@@ -1,0 +1,11 @@
+[package]
+name = "fl-torch"
+description = "FrankenTorch population-inference backend for FrankenLife (independent weights per organism)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fl-core.workspace = true
+ft-core.workspace = true
+ft-kernel-cpu.workspace = true

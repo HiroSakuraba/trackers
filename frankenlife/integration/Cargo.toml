@@ -1,0 +1,31 @@
+# FrankenLife integration workspace: the Franken stack adapters.
+#
+# Kept separate from the core workspace because the stack pins a nightly
+# toolchain (see rust-toolchain.toml) while fl-core builds on stable.
+# Every upstream dependency is pinned to the exact revision that was
+# compiled and probed; adopt newer revisions only after `frankenlife-m0`
+# and the adapter tests pass against them (plan §3.2).
+[workspace]
+resolver = "2"
+members = ["crates/fl-torch", "crates/fl-fnp", "crates/fl-manim", "crates/frankenlife-m0"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+fl-core = { path = "../crates/fl-core" }
+fl-view = { path = "../crates/fl-view" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "460306de2aa4169510873716018ade44fdb01534" }
+ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "287e14d335dd79d4e0e704c0e9d4231e1d64fcc5" }
+ft-kernel-cpu = { package = "frankentorch-kernel-cpu", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "287e14d335dd79d4e0e704c0e9d4231e1d64fcc5" }
+fnp-dtype = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "20159e89c4ba2d6822b395eeff538f8c47ed8b6f" }
+fnp-ndarray = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "20159e89c4ba2d6822b395eeff538f8c47ed8b6f" }
+fnp-io = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "20159e89c4ba2d6822b395eeff538f8c47ed8b6f" }
+fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "a12661bc59cef63526538afb7bd885bd5bf5ca04" }
+fmn-library = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "a12661bc59cef63526538afb7bd885bd5bf5ca04" }
+serde_json = "1.0.154"
+
+[profile.release]
+codegen-units = 16
