@@ -1,0 +1,200 @@
+# FrankenLife reference starter profile (design plan, Appendix A).
+#
+# Deviation from Appendix A: `mutation.rng` names this crate's own
+# semantic-address Philox4x32-10 mapping ("fl-philox-semantic-v1"), because
+# the FrankenNumPy mapping ("fnp-philox-semantic-v1") is not linked into this
+# slice. Infrastructure sections (presentation, recording, persistence,
+# parts of execution) are parsed and validated but reported as
+# "declared, not implemented" by `frankenlife validate`.
+schema = "frankenlife.config.v1"
+name = "reference-field-ecology"
+model = "field-ecology-v1"
+seed = 42
+
+[world]
+width = 128.0
+height = 128.0
+grid_width = 128
+grid_height = 128
+boundary = "periodic"
+moment_channels = 32
+field_dtype = "f32"
+tick_numerator = 1
+tick_denominator = 128
+transport_scheme = "positive-five-point-v1"
+diffusion = 0.15
+decay_per_second = 0.01
+stability_policy = "subcycle"
+exchange_kernel = "grid-cic-v1"
+tiny_energy_policy = "dissipate-and-record"
+tiny_energy_threshold = 1.0e-12
+
+[population]
+initial_count = 4096
+maximum_count = 16384
+initial_energy = 2.0
+initial_velocity = "zero"
+initial_positions = "uniform"
+capacity_policy = "pause-before-commit"
+automatic_reseed = false
+
+[field_initialization]
+energy_per_cell = 0.0
+composition = "zero"
+
+[sources]
+count = 8
+power_per_source = 80.0
+sigma_world_units = 10.0
+spatial_normalization = "fixed-total-power"
+kernel = "normalized-truncated-minimum-image-gaussian-v1"
+kernel_cutoff_sigma = 4.0
+chemical_directions = "seeded-unit-vectors"
+chemical_direction_policy = "fixed-per-source"
+path = "seeded-smooth-torus-v1"
+path_speed = 1.0
+path_direction_interval_seconds = 30.0
+
+[chemistry]
+family = "bounded-affinity-v1"
+heritable_traits = ["affinity_direction", "motion_response", "sensing_scale"]
+maximum_efficiency = 0.8
+affinity_norm_limit = 1.0
+affinity_gain = 4.0
+discrimination_threshold = 0.15
+uptake_capacity_per_second = 0.4
+uptake_half_saturation_density = 0.1
+toxicity_sensitivity = 0.2
+chemistry_evaluation = "per-granted-cell-packet"
+motion_response_norm_limit = 1.0
+maximum_acceleration = 4.0
+drag_per_second = 2.0
+maximum_speed = 4.0
+
+[sensors]
+schema = "energy-moment-gradient-104-v1"
+normalization = "fixed-local-scales-v1"
+energy_density_scale = 1.0
+gradient_length_scale_world_units = 1.0
+composition_energy_floor_density = 1.0e-6
+internal_energy_scale = 4.0
+age_scale_seconds = 60.0
+velocity_scale = 4.0
+energy_change_scale_per_second = 1.0
+initial_scale_world_units = 1.0
+minimum_scale_world_units = 1.0
+maximum_scale_world_units = 16.0
+pyramid_filter = "positive-box-v1"
+pyramid_scale_blend = "log-linear-v1"
+
+[controller]
+family = "independent-dense-mlp-v1"
+input_width = 104
+hidden_widths = [64, 32]
+output_width = 36
+hidden_activation = "tanh"
+output_activation = "linear"
+canonical_weight_dtype = "f32"
+accumulation_dtype = "f32"
+evaluation_interval_ticks = 1
+phase_policy = "stable-identity"
+autograd = false
+initializer = "fan-in-scaled-symmetric-v1"
+maximum_absolute_parameter = 4.0
+
+[architecture_mutation]
+enabled = true
+catalog = "dense-104-36-catalog-v1"
+maximum_parameters = 30000
+probability_per_birth = 0.01
+inheritance_map = "overlap-plus-zero-output-v1"
+depth_change_map = "prefix-and-identity-bridge-v1"
+target_selection = "uniform-other-catalog-member"
+
+[mutation]
+rng = "fl-philox-semantic-v1"
+weight_probability = 0.002
+weight_standard_deviation = 0.02
+replacement_probability = 0.0001
+chemistry_standard_deviation = 0.01
+sensing_log_scale_standard_deviation = 0.02
+reject_effective_noop = true
+maximum_candidate_proposals_per_birth = 8
+exhausted_proposals_policy = "reject-birth-no-charge"
+meta_evolution = false
+
+[costs]
+basal_energy_per_second = 0.005
+sensor_energy_per_second_at_unit_scale = 0.001
+sensor_unit_scale_world_units = 1.0
+sensor_scale_cost_exponent = 1.0
+neural_energy_per_parameter_evaluation = 2.0e-9
+motion_energy_per_speed_squared_second = 0.002
+birth_energy = 0.05
+
+[emission]
+gate_threshold = 0.5
+maximum_fractional_rate_per_second = 0.25
+transfer_efficiency = 0.9
+direction_zero_threshold = 1.0e-8
+zero_direction_policy = "no-emission-no-charge"
+position = "post-motion"
+visibility = "next-tick"
+
+[reproduction]
+maximum_attempt_rate_per_second = 1.0
+minimum_parent_energy_before_attempt = 4.0
+minimum_child_energy = 0.3
+minimum_parent_energy_after_split = 0.3
+minimum_child_fraction = 0.1
+maximum_child_fraction = 0.9
+cooldown_seconds = 1.0
+child_position_offset_radius = 0.25
+newborn_activation = "next-tick"
+
+[death]
+residual_energy_recycle_fraction = 0.5
+corpse_direction = "genetic-affinity"
+numerical_fault_policy = "stop-and-preserve"
+
+[execution]
+backend = "cpu-reference"
+determinism = "qualified-reference"
+math_mode = "specified"
+cpu_workers = 1
+command_queue_capacity = 256
+control_queue_capacity = 16
+command_durability = "write-ahead-before-apply"
+render_queue_capacity = 3
+maximum_logical_genome_bytes = 1073741824
+maximum_allocated_genome_bytes = 1207959552
+maximum_total_bytes = 2147483648
+checkpoint_retained_bytes = 134217728
+observer_pressure_policy = "drop-observer-or-pause-unchanged-world"
+
+[presentation]
+engine = "franken-manim"
+width = 1920
+height = 1080
+frames_per_second = 30
+color_mapping = "founder-lineage-v1"
+background = "#020308"
+point_radius_pixels = 0.8
+bloom_enabled = true
+bloom_strength = 0.15
+trails_enabled = false
+interpolation = "committed-states-one-epoch-late"
+show_clock_telemetry = true
+
+[recording]
+enabled = false
+clock = "simulation-time"
+include_provenance = true
+
+[persistence]
+catalog = "frankensqlite"
+checkpoint_mode = "pause-and-stream"
+checkpoint_interval_simulation_seconds = 30.0
+retain_recent_checkpoints = 4
+preserve_pinned_discoveries = true
+metrics_interval_ticks = 128
