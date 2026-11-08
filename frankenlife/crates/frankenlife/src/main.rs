@@ -67,6 +67,8 @@ enum Backend {
     Cpu,
     /// wgpu compute on the GPU (tolerance-equivalent to the reference).
     Gpu,
+    /// Sensing pyramid, sampling and inference fused on the GPU (inputs never leave the GPU).
+    GpuFused,
 }
 
 #[derive(Parser)]
@@ -355,7 +357,7 @@ fn run(a: RunArgs) -> i32 {
     }
     #[cfg(feature = "gpu")]
     let mut gpu = match a.backend {
-        Backend::Gpu => match fl_gpu::GpuBackend::new() {
+        Backend::Gpu | Backend::GpuFused => match fl_gpu::GpuBackend::new() {
             Ok(g) => {
                 eprintln!("GPU: {}", g.capability());
                 Some(g)
@@ -368,7 +370,7 @@ fn run(a: RunArgs) -> i32 {
         Backend::Cpu => None,
     };
     #[cfg(not(feature = "gpu"))]
-    if a.backend == Backend::Gpu {
+    if a.backend != Backend::Cpu {
         eprintln!("this build has no GPU support (rebuild with the default `gpu` feature)");
         return 2;
     }
@@ -424,6 +426,7 @@ fn run(a: RunArgs) -> i32 {
     for _ in 0..ticks {
         #[cfg(feature = "gpu")]
         let stepped = match gpu.as_mut() {
+            Some(g) if a.backend == Backend::GpuFused => world.step_inference(fl_core::Inference::Fused(g)),
             Some(g) => world.step_with(Some(g as &mut dyn fl_core::ControllerBackend)),
             None => world.step(),
         };
@@ -445,8 +448,8 @@ fn run(a: RunArgs) -> i32 {
         #[cfg(feature = "gpu")]
         if let Some(g) = gpu.as_ref() {
             let l = g.stats.last;
-            let v = [l.host_prep_ms, l.gpu_roundtrip_ms, l.kernel_ms.unwrap_or(0.0), l.bookkeeping_ms, l.total_ms];
-            for k in 0..5 {
+            let v = [l.host_prep_ms, l.gpu_roundtrip_ms, l.kernel_ms.unwrap_or(0.0), l.bookkeeping_ms, l.total_ms, l.pyramid_ms.unwrap_or(0.0)];
+            for k in 0..6 {
                 phases.gpu[k] += v[k];
                 run_phases.gpu[k] += v[k];
             }
@@ -473,8 +476,8 @@ fn run(a: RunArgs) -> i32 {
             );
             if phases.gpu[4] > 0.0 {
                 eprintln!(
-                    "             gpu backend {:.2} ms = host prep {:.2} + round trip {:.2} (kernel {:.2}) + bookkeeping {:.2}; outside evaluate {:.2}",
-                    phases.gpu[4] / n, phases.gpu[0] / n, phases.gpu[1] / n, phases.gpu[2] / n, phases.gpu[3] / n,
+                    "             gpu backend {:.2} ms = host prep {:.2} + round trip {:.2} (kernel {:.2}, pyramid {:.2}) + bookkeeping {:.2}; outside evaluate {:.2}",
+                    phases.gpu[4] / n, phases.gpu[0] / n, phases.gpu[1] / n, phases.gpu[2] / n, phases.gpu[5] / n, phases.gpu[3] / n,
                     (phases.backend_inference_ms - phases.gpu[4]) / n
                 );
             }
@@ -580,8 +583,8 @@ struct Phases {
     frame_ms: f64,
     frames: u64,
     checkpoint_ms: f64,
-    /// GPU backend breakdown (summed over ticks): host prep, round trip, kernel, bookkeeping, evaluate total.
-    gpu: [f64; 5],
+    /// GPU backend breakdown (summed over ticks): host prep, round trip, kernel, bookkeeping, evaluate total, pyramid.
+    gpu: [f64; 6],
 }
 
 impl Phases {
@@ -619,6 +622,7 @@ impl Phases {
                 "kernel_gpu_timestamps": self.gpu[2] / n,
                 "bookkeeping": self.gpu[3] / n,
                 "evaluate_total": self.gpu[4] / n,
+                "pyramid_gpu_timestamps": self.gpu[5] / n,
             },
         })
     }

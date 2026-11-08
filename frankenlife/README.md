@@ -66,7 +66,12 @@ GPU inference (wgpu: DX12 / Vulkan / Metal) — see [WINDOWS-GPU.md](WINDOWS-GPU
 ```bash
 cargo run --release -- gpu-check                     # open the GPU, verify against the CPU, benchmark
 cargo run --release -- run --config presets/vivid-field-ecology.toml --backend gpu --seconds 30
+cargo run --release -- run --config presets/target-20k-field-ecology.toml --backend gpu-fused --frame-every 0
 ```
+
+`--backend gpu-fused` also moves the sensor pyramid and per-organism sensing to
+the GPU (inputs never leave it); it agrees with CPU sensing to ~1e-5 on logits
+and ~6e-5 relative on the motion drive and density.
 
 Performance targets from the revised plan: **20,000 organisms first**
 (`presets/target-20k-field-ecology.toml`, 256² field), 80,000 as the stretch goal.

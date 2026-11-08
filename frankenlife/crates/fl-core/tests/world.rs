@@ -276,3 +276,16 @@ fn reference_backend_through_the_port_matches_built_in_path() {
     }
     assert_eq!(a.state_hash(), b.state_hash(), "same arithmetic, same science");
 }
+
+#[test]
+fn reference_fused_port_matches_built_in_path() {
+    let mut a = World::new(small()).unwrap();
+    let mut b = World::new(small()).unwrap();
+    let mut be = fl_core::ReferenceSenseInfer;
+    for _ in 0..80 {
+        a.step().unwrap();
+        b.step_inference(fl_core::Inference::Fused(&mut be)).unwrap();
+    }
+    assert!(a.totals.births > 0);
+    assert_eq!(a.state_hash(), b.state_hash(), "fused port with reference arithmetic reproduces the built-in path");
+}

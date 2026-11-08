@@ -10,7 +10,7 @@ use crate::field::{min_image, wrap, Field, Stencil};
 use crate::genome::{founder, mutate, Genome, MutationRecord};
 use crate::nn::{forward, sigmoid, INPUT_WIDTH, MAX_HIDDEN, OUTPUT_WIDTH};
 use crate::rng::{Lane, SemanticRng};
-use crate::sensors::{intrinsic, observe, Observation, Pyramid, PLANES};
+use crate::sensors::{intrinsic, observe, Pyramid, PLANES};
 use crate::sources::{init_sources, inject, isotropic_unit, Source};
 use crate::CHANNELS;
 
@@ -249,14 +249,22 @@ impl std::fmt::Display for TickError {
 }
 
 /// Per-organism sensing/controller result for one tick.
-#[derive(Clone, Copy)]
+/// What later phases need from sensing: kept small (it exists for every organism every tick).
+#[derive(Clone)]
 struct Sense {
-    obs: Observation,
     density0: f64,
     out: [f32; OUTPUT_WIDTH],
     evaluated: bool,
-    /// Controller input of a due evaluation (zero otherwise).
-    input: [f32; INPUT_WIDTH],
+    /// `Σ_k motion_k · ∂_k` (x, y) over the sensed physical gradients of `[q, Z_0..Z_31]`.
+    motion_drive: [f64; 2],
+    /// Controller input of a due evaluation, kept only for an external controller backend.
+    input: Option<Box<[f32; INPUT_WIDTH]>>,
+}
+
+impl Sense {
+    fn blank() -> Sense {
+        Sense { density0: 0.0, out: [0.0; OUTPUT_WIDTH], evaluated: false, motion_drive: [0.0; 2], input: None }
+    }
 }
 
 struct BirthProposal {
@@ -362,6 +370,14 @@ impl World {
     /// (`None` = the built-in parallel scalar reference). On error the
     /// committed world is unchanged.
     pub fn step_with(&mut self, backend: Option<&mut dyn ControllerBackend>) -> Result<TickReport, TickError> {
+        match backend {
+            Some(b) => self.step_inference(Inference::Controller(b)),
+            None => self.step_inference(Inference::Reference),
+        }
+    }
+
+    /// Advance `n -> n+1` with an explicit inference route. On error the committed world is unchanged.
+    pub fn step_inference(&mut self, inference: Inference<'_>) -> Result<TickReport, TickError> {
         let t_start = Stopwatch::start();
         let cfg = &self.cfg;
         let dt = cfg.dt();
@@ -446,16 +462,56 @@ impl World {
         dis.tiny_reservoir += field.clear_tiny(tiny);
         timing.transport_ms = t.ms();
 
-        // ── Phase 3: sensing pyramid ──────────────────────────────────────
+        // ── Phase 3–4: sensing pyramid, sample organisms, evaluate due controllers ──
         let t = Stopwatch::start();
-        let pyr = Pyramid::build(&field, self.pyramid_extra_levels);
-
-        // ── Phase 4: sample organisms, evaluate due controllers ───────────
-        let mut senses = sense_all(cfg, &pyr, &orgs, &dead, n, self.workers, backend.is_none());
+        let (backend, fused) = match inference {
+            Inference::Reference => (None, None),
+            Inference::Controller(b) => (Some(b), None),
+            Inference::Fused(f) => (None, Some(f)),
+        };
+        let mut senses = if let Some(fb) = fused {
+            let k_eval = cfg.controller.evaluation_interval_ticks as u64;
+            let idx: Vec<usize> = (0..orgs.len()).filter(|&i| !dead[i]).collect();
+            let jobs: Vec<SenseJob<'_>> = idx
+                .iter()
+                .map(|&i| {
+                    let age = (n - orgs.birth_tick[i]) as f64 * dt;
+                    SenseJob {
+                        organism: orgs.id[i],
+                        genome: &orgs.genome[i],
+                        x: orgs.x[i],
+                        y: orgs.y[i],
+                        intrinsic: intrinsic(&cfg.sensors, orgs.energy[i], age, orgs.vx[i], orgs.vy[i], orgs.energy_change_rate[i]),
+                        due: !orgs.held_valid[i] || (n + 1) % k_eval == orgs.phase[i] as u64,
+                    }
+                })
+                .collect();
+            let mut outs = vec![SenseOutput::default(); jobs.len()];
+            let tb = Stopwatch::start();
+            let res = fb.sense_and_infer(&field, &cfg.sensors, self.pyramid_extra_levels, &jobs, &mut outs);
+            timing.backend_inference_ms = tb.ms();
+            res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", fb.name()) })?;
+            let mut senses = vec![Sense::blank(); orgs.len()];
+            for (k, &i) in idx.iter().enumerate() {
+                let o = &outs[k];
+                let finite = o.motion_drive.iter().all(|v| v.is_finite()) && o.density0.is_finite() && (!jobs[k].due || o.logits.iter().all(|v| v.is_finite()));
+                if !finite {
+                    return Err(TickError::NumericalFault { tick: event, detail: format!("backend {} produced non-finite results for organism {}", fb.name(), orgs.id[i]) });
+                }
+                senses[i].density0 = o.density0.max(0.0);
+                senses[i].motion_drive = o.motion_drive;
+                senses[i].evaluated = jobs[k].due;
+                senses[i].out = if jobs[k].due { o.logits } else { orgs.held[i] };
+            }
+            senses
+        } else {
+            let pyr = Pyramid::build(&field, self.pyramid_extra_levels);
+            sense_all(cfg, &pyr, &orgs, &dead, n, self.workers, backend.is_none())
+        };
         if let Some(be) = backend {
             let due: Vec<usize> = (0..senses.len()).filter(|&i| senses[i].evaluated).collect();
             let jobs: Vec<InferenceJob<'_>> =
-                due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &orgs.genome[i], input: &senses[i].input }).collect();
+                due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &orgs.genome[i], input: senses[i].input.as_deref().expect("controller path keeps due inputs") }).collect();
             let mut outs = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
             let tb = Stopwatch::start();
             let res = be.evaluate(&jobs, &mut outs);
@@ -597,11 +653,7 @@ impl World {
             let g = orgs.genome[i].clone();
             let s = &senses[i];
             let gu = if umax > 0.0 { (uptake_total[i] / (dt * umax)).clamp(0.0, 1.0) } else { 0.0 };
-            let (mut fx, mut fy) = (0.0, 0.0);
-            for k in 0..PLANES {
-                fx += g.motion[k] as f64 * s.obs.grad_x[k];
-                fy += g.motion[k] as f64 * s.obs.grad_y[k];
-            }
+            let (mut fx, mut fy) = (s.motion_drive[0], s.motion_drive[1]);
             fx *= gu;
             fy *= gu;
             let fn_ = (fx * fx + fy * fy).sqrt();
@@ -968,6 +1020,91 @@ pub trait ControllerBackend {
     fn evaluate(&mut self, jobs: &[InferenceJob<'_>], out: &mut [[f32; OUTPUT_WIDTH]]) -> Result<(), String>;
 }
 
+/// How a tick evaluates sensing and controllers.
+pub enum Inference<'a> {
+    /// Built-in CPU sensing and scalar reference inference (bitwise reference).
+    Reference,
+    /// CPU sensing; controllers evaluated by an external backend.
+    Controller(&'a mut dyn ControllerBackend),
+    /// Sensing pyramid, sampling and inference all done by one backend.
+    Fused(&'a mut dyn SenseInferBackend),
+}
+
+/// One organism's sensing (+ evaluation when `due`) request for a fused backend.
+pub struct SenseJob<'a> {
+    pub organism: u64,
+    pub genome: &'a Genome,
+    pub x: f64,
+    pub y: f64,
+    /// The five intrinsic inputs (energy, age, vx, vy, energy change), already normalized.
+    pub intrinsic: [f32; 5],
+    /// Whether the controller must be evaluated this tick.
+    pub due: bool,
+}
+
+/// What a fused backend returns per organism.
+#[derive(Debug, Clone, Copy)]
+pub struct SenseOutput {
+    /// 36 raw logits (meaningful only when the job was `due`).
+    pub logits: [f32; OUTPUT_WIDTH],
+    /// `Σ_k motion_k · ∂q/∂x_k` style drive: the genome's 33 motion sensitivities
+    /// dotted with the sensed physical gradients of `[q, Z_0..Z_31]` (x, y).
+    pub motion_drive: [f64; 2],
+    /// Local level-0 energy density (uptake request input).
+    pub density0: f64,
+}
+
+impl Default for SenseOutput {
+    fn default() -> Self {
+        SenseOutput { logits: [0.0; OUTPUT_WIDTH], motion_drive: [0.0; 2], density0: 0.0 }
+    }
+}
+
+/// Fused sensing + inference backend (plan §10, §11: device-resident sensing).
+/// Implementations other than [`ReferenceSenseInfer`] are tolerance-equivalent,
+/// not bitwise, and form their own determinism class.
+pub trait SenseInferBackend {
+    fn name(&self) -> &str;
+    fn sense_and_infer(&mut self, field: &Field, sensors: &crate::config::SensorsCfg, extra_levels: usize, jobs: &[SenseJob<'_>], out: &mut [SenseOutput]) -> Result<(), String>;
+}
+
+/// The motion drive as fl-core computes it (fixed summation order).
+pub fn motion_drive(motion: &[f32; PLANES], gx: &[f64; PLANES], gy: &[f64; PLANES]) -> (f64, f64) {
+    let (mut fx, mut fy) = (0.0, 0.0);
+    for k in 0..PLANES {
+        fx += motion[k] as f64 * gx[k];
+        fy += motion[k] as f64 * gy[k];
+    }
+    (fx, fy)
+}
+
+/// CPU reference implementation of the fused port (same arithmetic as the built-in path).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReferenceSenseInfer;
+
+impl SenseInferBackend for ReferenceSenseInfer {
+    fn name(&self) -> &str {
+        "cpu-reference-fused"
+    }
+    fn sense_and_infer(&mut self, field: &Field, sensors: &crate::config::SensorsCfg, extra_levels: usize, jobs: &[SenseJob<'_>], out: &mut [SenseOutput]) -> Result<(), String> {
+        let pyr = Pyramid::build(field, extra_levels);
+        let mut scratch = vec![0.0f32; 2 * MAX_HIDDEN];
+        for (j, o) in jobs.iter().zip(out.iter_mut()) {
+            let obs = observe(&pyr.sample(j.x, j.y, j.genome.scale()), sensors);
+            let (dx, dy) = motion_drive(&j.genome.motion, &obs.grad_x, &obs.grad_y);
+            o.motion_drive = [dx, dy];
+            o.density0 = pyr.density0(j.x, j.y);
+            if j.due {
+                let mut input = [0.0f32; INPUT_WIDTH];
+                input[..99].copy_from_slice(&obs.field_inputs);
+                input[99..].copy_from_slice(&j.intrinsic);
+                forward(j.genome.hidden(), &j.genome.params, &input, &mut scratch, &mut o.logits);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The scalar reference evaluator as a backend (same arithmetic as `World::step`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReferenceBackend;
@@ -999,26 +1136,22 @@ fn sense_one(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, sc
         let mut input = [0.0f32; INPUT_WIDTH];
         input[..99].copy_from_slice(&obs.field_inputs);
         input[99..].copy_from_slice(&intr);
+        let (dx, dy) = motion_drive(&g.motion, &obs.grad_x, &obs.grad_y);
         if infer {
             forward(g.hidden(), &g.params, &input, scratch, &mut out);
+            return Sense { density0, out, evaluated: true, motion_drive: [dx, dy], input: None };
         }
-        return Sense { obs, density0, out, evaluated: true, input };
+        return Sense { density0, out, evaluated: true, motion_drive: [dx, dy], input: Some(Box::new(input)) };
     }
-    Sense { obs, density0, out, evaluated: false, input: [0.0; INPUT_WIDTH] }
+    let (dx, dy) = motion_drive(&g.motion, &obs.grad_x, &obs.grad_y);
+    Sense { density0, out, evaluated: false, motion_drive: [dx, dy], input: None }
 }
 
 fn sense_all(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, dead: &[bool], n: u64, workers: usize, infer: bool) -> Vec<Sense> {
     let len = orgs.len();
-    let blank = Sense {
-        obs: Observation { field_inputs: [0.0; 99], grad_x: [0.0; PLANES], grad_y: [0.0; PLANES] },
-        density0: 0.0,
-        out: [0.0; OUTPUT_WIDTH],
-        evaluated: false,
-        input: [0.0; INPUT_WIDTH],
-    };
     let run = |range: std::ops::Range<usize>| -> Vec<Sense> {
         let mut scratch = vec![0.0f32; 2 * MAX_HIDDEN];
-        range.map(|i| if dead[i] { blank } else { sense_one(cfg, pyr, orgs, i, n, &mut scratch, infer) }).collect()
+        range.map(|i| if dead[i] { Sense::blank() } else { sense_one(cfg, pyr, orgs, i, n, &mut scratch, infer) }).collect()
     };
     let workers = workers.max(1).min(len.max(1));
     if workers == 1 || len < 256 {

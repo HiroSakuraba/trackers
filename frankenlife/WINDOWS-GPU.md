@@ -53,6 +53,15 @@ The plan's full target (80,000 independent networks, ~3 GB of weights):
 cargo run --release -- run --config presets\vivid-field-ecology.toml --backend gpu --seconds 30 --frame-every 32 --out runs\gpu
 ```
 
+**Fused GPU sensing + inference** (`--backend gpu-fused`): the field is uploaded
+once per step, the sensor pyramid is built on the GPU, and each organism's
+inputs are computed and fed to its network without leaving the GPU. Compare it
+with `--backend gpu` (CPU sensing, GPU inference):
+
+```powershell
+cargo run --release -- run --config presets\target-20k-field-ecology.toml --backend gpu-fused --seconds 6 --frame-every 0 --out runs\t20f
+```
+
 **Performance measurement at the first target (20,000 organisms)**, no images, so
 only simulation time is counted:
 

@@ -32,4 +32,4 @@ pub const CHANNELS: usize = 32;
 pub const MODEL_VERSION: &str = "field-ecology-v1/fl-core-0.1";
 
 pub use config::Config;
-pub use world::{Command, ControllerBackend, Disposal, InferenceJob, ReferenceBackend, TickError, TickReport, World};
+pub use world::{Command, ControllerBackend, Disposal, Inference, InferenceJob, ReferenceBackend, ReferenceSenseInfer, SenseInferBackend, SenseJob, SenseOutput, TickError, TickReport, World};
