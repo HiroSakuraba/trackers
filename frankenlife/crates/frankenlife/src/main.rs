@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod profile_cli;
 mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -10,8 +11,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use fl_core::profile::CpuStage;
 use fl_core::world::{Command, Disposal};
-use fl_core::{checkpoint, Config, TickError, World, MODEL_VERSION};
+use fl_core::{checkpoint, Config, ProfileMeta, TickError, World, MODEL_VERSION};
+
+use profile_cli::GpuRollup;
 use serde_json::json;
 
 use render::{render, write_png, RenderOpts, View};
@@ -119,6 +123,11 @@ struct RunArgs {
     /// Where controller networks are evaluated.
     #[arg(long, value_enum, default_value_t = Backend::Cpu)]
     backend: Backend,
+    /// Opt-in per-stage profile. Off by default (no extra stage timers, no extra
+    /// GPU synchronization). Writes `profile.json` and a short summary.
+    /// GPU submit/wait figures are not GPU kernel time.
+    #[arg(long)]
+    profile: bool,
 }
 
 fn parse_erase(s: &str) -> Result<(u64, f64, f64, f64), String> {
@@ -359,11 +368,19 @@ fn run(a: RunArgs) -> i32 {
     } else {
         world.workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     }
+    world.set_profiling(a.profile);
     #[cfg(feature = "gpu")]
     let mut gpu = match a.backend {
         Backend::Gpu | Backend::GpuFused | Backend::GpuField | Backend::GpuResident => match fl_gpu::GpuBackend::new() {
-            Ok(g) => {
+            Ok(mut g) => {
+                g.set_profiling(a.profile);
                 eprintln!("GPU: {}", g.capability());
+                if a.profile {
+                    eprintln!(
+                        "stage profile: on | TIMESTAMP_QUERY {} | resident timestamp spans only on uptake/finish, which already wait",
+                        if g.timestamps_supported() { "supported" } else { "not supported; spans omitted" }
+                    );
+                }
                 Some(g)
             }
             Err(e) => {
@@ -373,6 +390,10 @@ fn run(a: RunArgs) -> i32 {
         },
         Backend::Cpu => None,
     };
+    #[cfg(feature = "gpu")]
+    let ts_supported = gpu.as_ref().map(|g| g.timestamps_supported());
+    #[cfg(not(feature = "gpu"))]
+    let ts_supported: Option<bool> = None;
     #[cfg(not(feature = "gpu"))]
     if a.backend != Backend::Cpu {
         eprintln!("this build has no GPU support (rebuild with the default `gpu` feature)");
@@ -423,8 +444,13 @@ fn run(a: RunArgs) -> i32 {
     let mut steps_per_s = 0.0;
     let mut phases = Phases::default();
     let mut run_phases = Phases::default();
+    let mut gpu_rollup = GpuRollup::default();
+    let mut gpu_mark = GpuRollup::default();
+    let mut profile_mark = world.stage_profile().totals();
     if a.frame_every > 0 {
+        let stamp = world.stage_profile().start();
         save_frame(&world, &opts_base, &frames_dir, frame_no, steps_per_s);
+        world.stage_profile_mut().stop(CpuStage::Render, stamp);
         frame_no += 1;
     }
     for _ in 0..ticks {
@@ -465,6 +491,9 @@ fn run(a: RunArgs) -> i32 {
                 phases.gpu[k] += v[k];
                 run_phases.gpu[k] += v[k];
             }
+            if a.profile {
+                gpu_rollup.add_backend(g);
+            }
         }
         interval.0 += r.counts.births;
         interval.1 += r.counts.deaths_exhaustion + r.counts.deaths_user;
@@ -472,13 +501,14 @@ fn run(a: RunArgs) -> i32 {
         if r.population == 0 {
             stop_reason = format!("extinction at tick {}", r.tick);
             eprintln!("{stop_reason}");
-            write_metrics(&mut metrics, &world, interval, steps_per_s, &phases);
+            write_metrics(&mut metrics, &world, interval, steps_per_s, &phases, interval_profile(&world, &a, &profile_mark, &gpu_mark, &gpu_rollup, phases.step_ms).as_ref().map(|p| &p.1));
             break;
         }
         if world.tick % metrics_every == 0 {
             let el = interval_wall.elapsed().as_secs_f64();
             steps_per_s = interval_ticks as f64 / el.max(1e-9);
-            write_metrics(&mut metrics, &world, interval, steps_per_s, &phases);
+            let stage_line = interval_profile(&world, &a, &profile_mark, &gpu_mark, &gpu_rollup, phases.step_ms);
+            write_metrics(&mut metrics, &world, interval, steps_per_s, &phases, stage_line.as_ref().map(|p| &p.1));
             let l = &world.ledger;
             let n = phases.ticks.max(1) as f64;
             eprintln!(
@@ -488,7 +518,7 @@ fn run(a: RunArgs) -> i32 {
             );
             if phases.gpu[4] > 0.0 {
                 eprintln!(
-                    "             gpu backend {:.2} ms = host prep {:.2} + round trip {:.2} (kernel {:.2}, pyramid {:.2}) + bookkeeping {:.2}; outside evaluate {:.2}",
+                    "             gpu backend {:.2} ms = host prep {:.2} + submit/wait {:.2} (timestamp span {:.2}, pyramid span {:.2}) + bookkeeping {:.2}; outside evaluate {:.2}",
                     phases.gpu[4] / n, phases.gpu[0] / n, phases.gpu[1] / n, phases.gpu[2] / n, phases.gpu[5] / n, phases.gpu[3] / n,
                     (phases.backend_inference_ms - phases.gpu[4]) / n
                 );
@@ -501,7 +531,7 @@ fn run(a: RunArgs) -> i32 {
             }
             if phases.gpu[7] > 0.0 {
                 eprintln!(
-                    "             gpu field step {:.2} ms = host {:.2} + round trip {:.2} (kernels {:.2}) | setup {:.2} + validate {:.2} | other {:.2}",
+                    "             gpu field step {:.2} ms = host {:.2} + submit/wait {:.2} (timestamp span {:.2}, not kernel-exclusive) | setup {:.2} + validate {:.2} | other {:.2}",
                     phases.transport_ms / n, phases.gpu[6] / n, phases.gpu[7] / n, phases.gpu[8] / n, phases.setup_ms / n, phases.validate_ms / n,
                     (phases.step_ms - phases.transport_ms - phases.sense_and_infer_ms - phases.exchange_ms - phases.lifecycle_ms - phases.setup_ms - phases.validate_ms) / n
                 );
@@ -512,27 +542,31 @@ fn run(a: RunArgs) -> i32 {
                     (phases.step_ms - phases.transport_ms - phases.sense_and_infer_ms - phases.exchange_ms - phases.lifecycle_ms - phases.setup_ms - phases.validate_ms) / n
                 );
             }
+            if let Some((line, _)) = stage_line {
+                eprintln!("             {line}");
+            }
             phases = Phases::default();
             interval = (0, 0);
             interval_ticks = 0;
             interval_wall = Instant::now();
+            profile_mark = world.stage_profile().totals();
+            gpu_mark = gpu_rollup;
         }
         let wants_ckpt = ckpt_every.is_some_and(|k| world.tick % k == 0);
         let wants_frame = a.frame_every > 0 && world.tick % a.frame_every == 0;
         if wants_ckpt || wants_frame {
             #[cfg(feature = "gpu")]
             if let Some(g) = gpu.as_mut() {
-                if world.field_on_device() {
-                        if let Err(e) = world.sync_field(g) {
-                            eprintln!("cannot copy the field back from the GPU: {e}");
-                        }
-                }
+                download_field(&mut world, g);
             }
         }
         if wants_ckpt {
             let t = Instant::now();
             write_checkpoint(&world, &ckpt_dir, retain);
             let ms = t.elapsed().as_secs_f64() * 1e3;
+            if a.profile {
+                world.stage_profile_mut().add_sample(CpuStage::Checkpoint, (ms * 1e6).round() as u64);
+            }
             phases.checkpoint_ms += ms;
             run_phases.checkpoint_ms += ms;
         }
@@ -540,6 +574,9 @@ fn run(a: RunArgs) -> i32 {
             let t = Instant::now();
             save_frame(&world, &opts_base, &frames_dir, frame_no, steps_per_s);
             let ms = t.elapsed().as_secs_f64() * 1e3;
+            if a.profile {
+                world.stage_profile_mut().add_sample(CpuStage::Render, (ms * 1e6).round() as u64);
+            }
             phases.frame_ms += ms;
             phases.frames += 1;
             run_phases.frame_ms += ms;
@@ -551,21 +588,21 @@ fn run(a: RunArgs) -> i32 {
     let wall = wall0.elapsed().as_secs_f64();
     #[cfg(feature = "gpu")]
     if let Some(g) = gpu.as_mut() {
-        if world.field_on_device() {
-            if let Err(e) = world.sync_field(g) {
-                eprintln!("cannot copy the field back from the GPU: {e}");
-            }
-        }
+        download_field(&mut world, g);
     }
     if ckpt_every.is_some() && !world.orgs.is_empty() {
+        let t = Instant::now();
         write_checkpoint(&world, &ckpt_dir, retain);
+        if a.profile {
+            world.stage_profile_mut().add_sample(CpuStage::Checkpoint, t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        }
     }
 
     // Inspection of the oldest lineages' most derived descendants.
     let inspections: Vec<_> = most_derived(&world, a.inspect).into_iter().filter_map(|id| world.inspect(id)).collect();
     std::fs::write(a.out.join("inspection.json"), serde_json::to_string_pretty(&inspections).unwrap()).ok();
 
-    let manifest = json!({
+    let mut manifest = json!({
         "schema": "frankenlife.run-manifest.v0",
         "model_version": MODEL_VERSION,
         "stop_reason": stop_reason,
@@ -587,6 +624,14 @@ fn run(a: RunArgs) -> i32 {
         "view": format!("{:?}", a.view),
         "config": cfg,
     });
+    if a.profile {
+        let doc = stage_document(&world, &a, &gpu_rollup, run_phases.step_ms, wall, ts_supported);
+        let path = a.out.join("profile.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).ok();
+        eprintln!("{}", stage_summary(&world, &a, &gpu_rollup, run_phases.step_ms, wall, ts_supported));
+        eprintln!("stage profile written to {}", path.display());
+        manifest["stage_profile"] = doc;
+    }
     std::fs::write(a.out.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).ok();
     eprintln!(
         "{stop_reason}: tick {} ({:.1} sim s) in {:.1} wall s; population {}; births {}; deaths {}; frames {} -> {}",
@@ -694,7 +739,85 @@ impl Phases {
     }
 }
 
-fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_per_s: f64, phases: &Phases) {
+fn device_call(backend: Backend) -> bool {
+    !matches!(backend, Backend::Cpu)
+}
+
+fn profile_meta(world: &World, backend: Backend, step_wall_ms: f64, wall_seconds: f64, ts_supported: Option<bool>) -> ProfileMeta {
+    ProfileMeta {
+        backend: format!("{backend:?}"),
+        workers: world.workers,
+        simulation_seconds: world.simulation_seconds(),
+        wall_seconds,
+        step_wall_ms,
+        population_final: world.orgs.len(),
+        controller_evaluations: world.totals.controller_evaluations as u64,
+        timestamp_queries_supported: ts_supported,
+        external_evaluate_is_device_call: device_call(backend),
+    }
+}
+
+fn stage_document(world: &World, a: &RunArgs, gpu: &GpuRollup, step_wall_ms: f64, wall_seconds: f64, ts_supported: Option<bool>) -> serde_json::Value {
+    let meta = profile_meta(world, a.backend, step_wall_ms, wall_seconds, ts_supported);
+    world.stage_profile().document(&meta, &gpu.counters())
+}
+
+fn stage_summary(world: &World, a: &RunArgs, gpu: &GpuRollup, step_wall_ms: f64, wall_seconds: f64, ts_supported: Option<bool>) -> String {
+    let meta = profile_meta(world, a.backend, step_wall_ms, wall_seconds, ts_supported);
+    world.stage_profile().summary(&meta, &gpu.counters())
+}
+
+fn interval_profile(world: &World, a: &RunArgs, profile_mark: &fl_core::profile::ProfileTotals, gpu_mark: &GpuRollup, gpu_rollup: &GpuRollup, step_ms: f64) -> Option<(String, serde_json::Value)> {
+    if !a.profile {
+        return None;
+    }
+    let delta = fl_core::StageProfiler::from_totals(true, world.stage_profile().totals().delta(*profile_mark));
+    let ticks = delta.ticks().max(1) as f64;
+    let buckets = delta.buckets_ns(device_call(a.backend));
+    let ms = |ns: u64| ns as f64 / 1e6 / ticks;
+    let unaccounted = step_ms / ticks - (delta.in_step_ns() as f64 / 1e6) / ticks;
+    let value = json!({
+        "time_unit": "milliseconds",
+        "ticks": delta.ticks(),
+        "sensing": ms(buckets.sensing),
+        "chemistry_field": ms(buckets.chemistry_field),
+        "networks": ms(buckets.networks),
+        "transfers_sync": ms(buckets.transfers_sync),
+        "other": ms(buckets.other),
+        "unaccounted_step": unaccounted,
+        "note": "Per-tick CPU wall for this metrics interval. transfers_sync is submit/wait and copies, not GPU kernel time. unaccounted_step is the gap inside the step wall.",
+        "gpu_clocks_not_added_to_cpu_wall": gpu_rollup.delta(*gpu_mark).counters().iter().map(|c| json!({
+            "id": c.id,
+            "clock": c.clock,
+            "total_ms": c.total_ms,
+            "samples": c.samples,
+        })).collect::<Vec<_>>(),
+    });
+    let line = format!(
+        "profile cpu ms/tick: sensing {:.2} | chemistry/field {:.2} | networks {:.2} | transfers/sync {:.2} | other {:.2} | unaccounted {:.2}",
+        ms(buckets.sensing),
+        ms(buckets.chemistry_field),
+        ms(buckets.networks),
+        ms(buckets.transfers_sync),
+        ms(buckets.other),
+        unaccounted
+    );
+    Some((line, value))
+}
+
+#[cfg(feature = "gpu")]
+fn download_field(world: &mut World, gpu: &mut fl_gpu::GpuBackend) {
+    if !world.field_on_device() {
+        return;
+    }
+    let stamp = world.stage_profile().start();
+    if let Err(e) = world.sync_field(gpu) {
+        eprintln!("cannot copy the field back from the GPU: {e}");
+    }
+    world.stage_profile_mut().stop(CpuStage::FieldDownload, stamp);
+}
+
+fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_per_s: f64, phases: &Phases, stage_profile: Option<&serde_json::Value>) {
     let o = &w.orgs;
     let n = o.len().max(1) as f64;
     let mut topo: BTreeMap<String, usize> = BTreeMap::new();
@@ -703,7 +826,7 @@ fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_pe
     }
     let lineages: BTreeSet<u64> = o.lineage.iter().copied().collect();
     let mean = |v: &dyn Fn(usize) -> f64| (0..o.len()).map(v).sum::<f64>() / n;
-    let rec = json!({
+    let mut rec = json!({
         "tick": w.tick,
         "simulation_seconds": w.simulation_seconds(),
         "population": o.len(),
@@ -723,5 +846,51 @@ fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_pe
         "achieved_steps_per_wall_second": steps_per_s,
         "timing": phases.json(),
     });
+    if let Some(stage) = stage_profile {
+        rec["stage_profile_ms_per_tick"] = stage.clone();
+    }
     writeln!(out, "{rec}").ok();
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn profile_flag_defaults_off_and_parses_the_hardware_command() {
+        let cli = Cli::try_parse_from(["frankenlife", "run", "--seconds", "6", "--frame-every", "0"]).unwrap();
+        match cli.cmd {
+            Cmd::Run(a) => {
+                assert!(!a.profile);
+                assert_eq!(a.backend, Backend::Cpu);
+            }
+            _ => panic!("expected run"),
+        }
+        let cli = Cli::try_parse_from([
+            "frankenlife",
+            "run",
+            "--config",
+            r"presets\target-20k-field-ecology.toml",
+            "--backend",
+            "gpu-resident",
+            "--seconds",
+            "6",
+            "--frame-every",
+            "0",
+            "--profile",
+            "--out",
+            r"runs\t20r-profile",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Run(a) => {
+                assert!(a.profile);
+                assert_eq!(a.backend, Backend::GpuResident);
+                assert_eq!(a.seconds, 6.0);
+                assert_eq!(a.frame_every, 0);
+                assert!(a.out.to_string_lossy().contains("t20r-profile"));
+            }
+            _ => panic!("expected run"),
+        }
+    }
 }

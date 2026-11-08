@@ -82,7 +82,16 @@ Performance targets from the revised plan: **20,000 organisms first**
 (`presets/target-20k-field-ecology.toml`, 256² field), 80,000 as the stretch goal.
 Measure with `--frame-every 0`; every run reports per-phase step timings
 (console, `metrics.jsonl`, `manifest.json` → `"timing"`), and `gpu-check`
-reports host prep / GPU round trip / kernel time separately.
+reports host prep, GPU submit/wait, and an optional timestamp span separately.
+Submit/wait is not GPU kernel time.
+
+`--profile` is off by default. It adds CPU stage timers (sensing, chemistry/field,
+networks, transfers/sync, other, render, checkpoint) and writes `profile.json`
+next to the run. It does not change the tick. On a GPU that already supports
+`TIMESTAMP_QUERY`, resident uptake and finish also record a timestamp span in
+the wait those calls already perform. The Windows command for the 20k
+gpu-resident profile is in [WINDOWS-GPU.md](WINDOWS-GPU.md). A cloud or software
+GPU timing is not a GTX 1080 measurement.
 
 The stretch workload (80,000 organisms, 1024² field):
 `presets/target-80k-field-ecology.toml` (a workload definition, not a qualified

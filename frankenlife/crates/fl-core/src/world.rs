@@ -9,6 +9,7 @@ use crate::config::{CapacityPolicy, Config};
 use crate::field::{min_image, wrap, Field, Stencil};
 use crate::genome::{founder, mutate, Genome, MutationRecord};
 use crate::nn::{forward, sigmoid, INPUT_WIDTH, MAX_HIDDEN, OUTPUT_WIDTH};
+use crate::profile::{proportion, CpuStage, StageProfiler, Stamp};
 use crate::rng::{Lane, SemanticRng};
 use crate::sensors::{intrinsic, observe, Pyramid, PLANES};
 use crate::sources::{init_sources, inject, isotropic_unit, Source};
@@ -300,6 +301,9 @@ pub struct World {
     /// The authoritative field lives on a resident device backend; `field` may be stale
     /// until `sync_field` is called.
     pub(crate) device_field: bool,
+    /// Execution telemetry. Off by default. Not part of the scientific state
+    /// (`state_hash` ignores it) and not written into checkpoints.
+    profile: StageProfiler,
 }
 
 impl World {
@@ -340,7 +344,22 @@ impl World {
             last_report: None,
             pyramid_extra_levels: lv,
             device_field: false,
+            profile: StageProfiler::disabled(),
         })
+    }
+
+    /// Turn per-stage timing on or off. Off (the default) does not sample the clock
+    /// for these stages. Either setting leaves the tick's scientific results unchanged.
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profile.set_enabled(enabled);
+    }
+
+    pub fn stage_profile(&self) -> &StageProfiler {
+        &self.profile
+    }
+
+    pub fn stage_profile_mut(&mut self) -> &mut StageProfiler {
+        &mut self.profile
     }
 
     pub fn dt(&self) -> f64 {
@@ -438,6 +457,14 @@ impl World {
         let mut timing = TickTiming::default();
         let mut counts = TickCounts::default();
         let mut dis = Dissipation::default();
+        // Local accumulator so a rejected candidate (capacity pause, numerical
+        // fault) does not land in the run profile. Disabled: `start` does not
+        // read the clock.
+        let profiling = self.profile.is_enabled();
+        let mut prof = StageProfiler::disabled();
+        if profiling {
+            prof.set_enabled(true);
+        }
 
         let (backend, fused, mut device, mut resident) = match inference {
             Inference::Reference => (None, None, None, None),
@@ -459,6 +486,7 @@ impl World {
         };
         let mut led = TickLedger { energy_before: field_energy_before + self.orgs.energy.iter().sum::<f64>(), ..Default::default() };
         let t_setup = Stopwatch::start();
+        let ps = prof.start();
         // Resident ticks work on a geometry-only descriptor: the planes live on the device.
         let mut field = if is_resident {
             Field { gx: self.field.gx, gy: self.field.gy, hx: self.field.hx, hy: self.field.hy, e: Vec::new(), m: Vec::new() }
@@ -534,32 +562,47 @@ impl World {
             }
         }
 
+        prof.stop(CpuStage::Other, ps);
         if let Some(r) = resident.as_mut() {
+            let ps = prof.start();
             r.begin_tick(&ops).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident begin: {detail}") })?;
+            // Submit only: begin_tick does not wait. Not GPU kernel time.
+            prof.stop(CpuStage::TransfersSync, ps);
         }
         timing.setup_ms = t_setup.ms();
 
         // ── Phase 2: transport, then scheduled sources → observation field ─
         let t = Stopwatch::start();
+        let ps = prof.start();
         for s in &mut sources {
             s.advance_to(n, cfg, &self.rng);
         }
+        prof.stop(CpuStage::ChemistryField, ps);
         if let Some(r) = resident.as_mut() {
+            let ps = prof.start();
             let acct = r.transport_resident(cfg, &sources, n).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident transport: {detail}") })?;
+            // Device field step: host record plus the wait the step already uses
+            // for accounting readback. The GPU timestamp span, if any, is reported
+            // by the backend and is not this CPU span.
+            prof.stop(CpuStage::TransfersSync, ps);
             dis.decay += acct.decay_removed;
             counts.transport_subcycles = acct.subcycles;
             led.injected_sources = acct.injected;
             dis.tiny_reservoir += acct.tiny_removed;
         } else if let Some(d) = device.as_mut() {
+            let ps = prof.start();
             let acct = d
                 .transport_and_sources(&mut field, cfg, &sources, n)
                 .map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("field backend {}: {detail}", FieldBackend::name(&**d)) })?;
+            prof.stop(CpuStage::TransfersSync, ps);
             dis.decay += acct.decay_removed;
             counts.transport_subcycles = acct.subcycles;
             led.injected_sources = acct.injected;
             dis.tiny_reservoir += acct.tiny_removed;
         } else {
+            let ps = prof.start();
             let acct = cpu_transport_and_sources(&mut field, cfg, &sources, n).map_err(|detail| TickError::NumericalFault { tick: event, detail })?;
+            prof.stop(CpuStage::ChemistryField, ps);
             dis.decay += acct.decay_removed;
             counts.transport_subcycles = acct.subcycles;
             led.injected_sources = acct.injected;
@@ -575,6 +618,7 @@ impl World {
             (None, None) => fused,
         };
         let mut senses = if let Some(fb) = fused {
+            let ps = prof.start();
             let k_eval = cfg.controller.evaluation_interval_ticks as u64;
             let idx: Vec<usize> = (0..orgs.len()).filter(|&i| !dead[i]).collect();
             let jobs: Vec<SenseJob<'_>> = idx
@@ -591,11 +635,17 @@ impl World {
                     }
                 })
                 .collect();
+            prof.stop(CpuStage::Sensing, ps);
             let mut outs = vec![SenseOutput::default(); jobs.len()];
             let tb = Stopwatch::start();
+            let ps = prof.start();
             let res = fb.sense_and_infer(&field, &cfg.sensors, self.pyramid_extra_levels, &jobs, &mut outs);
+            // Whole backend call. A GPU implementation's submit/wait is not kernel time;
+            // that split is reported by the backend, on its own clocks.
+            prof.stop(CpuStage::ExternalEvaluate, ps);
             timing.backend_inference_ms = tb.ms();
             res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", fb.name()) })?;
+            let ps = prof.start();
             let mut senses = vec![Sense::blank(); orgs.len()];
             for (k, &i) in idx.iter().enumerate() {
                 let o = &outs[k];
@@ -608,28 +658,53 @@ impl World {
                 senses[i].evaluated = jobs[k].due;
                 senses[i].out = if jobs[k].due { o.logits } else { orgs.held[i] };
             }
+            prof.stop(CpuStage::Other, ps);
             senses
         } else {
+            let ps = prof.start();
             let pyr = Pyramid::build(&field, self.pyramid_extra_levels);
-            sense_all(cfg, &pyr, &orgs, &dead, n, self.workers, backend.is_none())
+            prof.stop(CpuStage::Sensing, ps);
+            let wall = prof.start();
+            let infer = backend.is_none();
+            let (senses, sense_thread, net_thread) = if profiling {
+                sense_all::<true>(cfg, &pyr, &orgs, &dead, n, self.workers, infer)
+            } else {
+                sense_all::<false>(cfg, &pyr, &orgs, &dead, n, self.workers, infer)
+            };
+            if profiling {
+                let (sense_part, net_part) = proportion(wall.elapsed_ns(), sense_thread, net_thread);
+                prof.add_sample(CpuStage::Sensing, sense_part);
+                if net_part > 0 || net_thread > 0 {
+                    prof.add_sample(CpuStage::Networks, net_part);
+                }
+                prof.add_thread_ns(sense_thread, net_thread);
+            }
+            senses
         };
         if let Some(be) = backend {
+            let ps = prof.start();
             let due: Vec<usize> = (0..senses.len()).filter(|&i| senses[i].evaluated).collect();
             let jobs: Vec<InferenceJob<'_>> =
                 due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &orgs.genome[i], input: senses[i].input.as_deref().expect("controller path keeps due inputs") }).collect();
             let mut outs = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
+            prof.stop(CpuStage::Other, ps);
             let tb = Stopwatch::start();
+            let ps = prof.start();
             let res = be.evaluate(&jobs, &mut outs);
+            prof.stop(CpuStage::ExternalEvaluate, ps);
             timing.backend_inference_ms = tb.ms();
             res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", be.name()) })?;
             drop(jobs);
+            let ps = prof.start();
             for (k, &i) in due.iter().enumerate() {
                 if outs[k].iter().any(|v| !v.is_finite()) {
                     return Err(TickError::NumericalFault { tick: event, detail: format!("backend {} produced non-finite logits for organism {}", be.name(), orgs.id[i]) });
                 }
                 senses[i].out = outs[k];
             }
+            prof.stop(CpuStage::Other, ps);
         }
+        let ps = prof.start();
         for (i, s) in senses.iter().enumerate() {
             if s.evaluated {
                 orgs.held[i] = s.out;
@@ -639,23 +714,32 @@ impl World {
                 counts.parameter_evaluations += orgs.genome[i].param_count() as u64;
             }
         }
+        prof.stop(CpuStage::Other, ps);
         timing.sense_and_infer_ms = t.ms();
 
         // ── Phase 5: uptake requests and cell grants ──────────────────────
         let t = Stopwatch::start();
         let ch = &cfg.chemistry;
         let umax = ch.uptake_capacity_per_second;
+        let ps = prof.start();
         let demand: Vec<f64> = (0..orgs.len())
             .map(|i| if dead[i] { 0.0 } else { let r = senses[i].density0; dt * umax * r / (ch.uptake_half_saturation_density + r) })
             .collect();
+        prof.stop(CpuStage::ChemistryField, ps);
         let mut uptake_total = vec![0.0f64; orgs.len()];
         let mut settlements: Vec<crate::chemistry::Settlement> = Vec::with_capacity(orgs.len());
         if let Some(r) = resident.as_mut() {
+            let ps = prof.start();
             let idx: Vec<usize> = (0..orgs.len()).filter(|&i| demand[i] > 0.0).collect();
             let jobs: Vec<UptakeJob<'_>> = idx.iter().map(|&i| UptakeJob { x: orgs.x[i], y: orgs.y[i], demand: demand[i], genome: &orgs.genome[i] }).collect();
+            prof.stop(CpuStage::ChemistryField, ps);
             let mut outs = vec![UptakeOut::default(); jobs.len()];
+            let ps = prof.start();
             let granted = r.uptake(ch, &jobs, &mut outs).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident uptake: {detail}") })?;
+            // Includes the readback wait uptake already performs. Not kernel time.
+            prof.stop(CpuStage::TransfersSync, ps);
             led.transferred += granted;
+            let ps = prof.start();
             settlements = vec![Default::default(); orgs.len()];
             for (k, &i) in idx.iter().enumerate() {
                 let o = outs[k];
@@ -670,7 +754,9 @@ impl World {
                 };
                 uptake_total[i] = o.absorbed;
             }
+            prof.stop(CpuStage::Other, ps);
         } else {
+        let ps = prof.start();
         let stencils: Vec<Stencil> = (0..orgs.len()).map(|i| field.stencil(orgs.x[i], orgs.y[i])).collect();
         let mut cell_demand = vec![0.0f64; field.cells()];
         for i in 0..orgs.len() {
@@ -721,10 +807,12 @@ impl World {
                 led.transferred += g;
             }
         }
+        prof.stop(CpuStage::ChemistryField, ps);
         }
 
         // ── Phase 6: settle gain, toxicity, maintenance ───────────────────
         let co = &cfg.costs;
+        let ps = prof.start();
         let exhaust = |e: &mut f64, dead: &mut bool, dis: &mut Dissipation, counts: &mut TickCounts| {
             if *e <= tiny {
                 dis.tiny_reservoir += e.max(0.0);
@@ -762,10 +850,12 @@ impl World {
             }
             exhaust(&mut orgs.energy[i], &mut dead[i], &mut dis, &mut counts);
         }
+        prof.stop(CpuStage::ChemistryField, ps);
         timing.exchange_ms = t.ms();
 
         // ── Phase 7: motion → emission → reproduction proposals ──────────
         let t = Stopwatch::start();
+        let ps = prof.start();
         let drag_keep = (-ch.drag_per_second * dt).exp();
         let drag_coef = drag_force_coefficient(ch.drag_per_second, dt);
         let em = &cfg.emission;
@@ -951,11 +1041,17 @@ impl World {
             orgs.push(id, lin, gen, x, y, e, event, deadline, (id % k_eval) as u32, g);
         }
 
+        prof.stop(CpuStage::Other, ps);
         // ── Phase 9: paid deposits and recycling enter the next field ─────
         if let Some(r) = resident.as_mut() {
+            let ps = prof.start();
             r.deposit(&dep_list).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident deposit: {detail}") })?;
+            // Submit only: deposit does not wait. Not GPU kernel time.
+            prof.stop(CpuStage::TransfersSync, ps);
         } else {
+            let ps = prof.start();
             field.add_assign(&deposits);
+            prof.stop(CpuStage::ChemistryField, ps);
         }
         timing.lifecycle_ms = t.ms();
 
@@ -963,7 +1059,10 @@ impl World {
         let t_validate = Stopwatch::start();
         let field_energy_after;
         if let Some(r) = resident.as_mut() {
+            let ps = prof.start();
             let fin = r.finish(tiny).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident finish: {detail}") })?;
+            // Includes the readback wait finish already performs. Not kernel time.
+            prof.stop(CpuStage::TransfersSync, ps);
             dis.tiny_reservoir += fin.tiny_removed;
             if !(fin.min_energy >= 0.0) || !fin.min_energy.is_finite() {
                 return Err(TickError::NumericalFault { tick: event, detail: format!("negative or non-finite field energy {}", fin.min_energy) });
@@ -974,6 +1073,7 @@ impl World {
             counts.cone_projections = fin.cone_projections;
             field_energy_after = fin.field_energy;
         } else {
+            let ps = prof.start();
             dis.tiny_reservoir += field.clear_tiny(tiny);
             let (worst, min_e) = field.cone_report();
             if !(min_e >= 0.0) || !min_e.is_finite() {
@@ -986,7 +1086,9 @@ impl World {
                 counts.cone_projections = field.project_cone() as u32;
             }
             field_energy_after = field.total_energy();
+            prof.stop(CpuStage::ChemistryField, ps);
         }
+        let ps = prof.start();
         if let Some(i) = (0..orgs.len()).find(|&i| !(orgs.energy[i] > 0.0) || !orgs.energy[i].is_finite() || !orgs.x[i].is_finite() || !orgs.y[i].is_finite()) {
             return Err(TickError::NumericalFault { tick: event, detail: format!("organism {} published with energy {}", orgs.id[i], orgs.energy[i]) });
         }
@@ -995,12 +1097,19 @@ impl World {
         led.organism_energy_after = orgs.energy.iter().sum();
         led.energy_after = led.field_energy_after + led.organism_energy_after;
         led.residual = led.energy_after - led.energy_before - (led.injected_sources + led.injected_commands - led.removed - dis.total());
+        prof.stop(CpuStage::Other, ps);
 
         if let Some(r) = resident.as_mut() {
+            let ps = prof.start();
             r.commit().map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident commit: {detail}") })?;
+            // Submit only: commit does not wait. Not GPU kernel time.
+            prof.stop(CpuStage::TransfersSync, ps);
         } else {
+            let ps = prof.start();
             self.field = field;
+            prof.stop(CpuStage::Other, ps);
         }
+        let ps = prof.start();
         self.orgs = orgs;
         self.sources = sources;
         self.tick = event;
@@ -1027,6 +1136,9 @@ impl World {
         tt.parameter_evaluations += counts.parameter_evaluations;
         tt.emitting += counts.emitting;
         tt.cone_projections += counts.cone_projections;
+        prof.stop(CpuStage::Other, ps);
+        prof.mark_tick();
+        self.profile.absorb(&prof);
         timing.validate_publish_ms = t_validate.ms();
         timing.total_ms = t_start.ms();
         let report = TickReport { tick: event, simulation_seconds: event as f64 * dt, population: self.orgs.len(), counts, ledger: led, timing };
@@ -1532,7 +1644,8 @@ impl ControllerBackend for ReferenceBackend {
     }
 }
 
-fn sense_one(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, scratch: &mut [f32], infer: bool) -> Sense {
+fn sense_one<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, scratch: &mut [f32], infer: bool, sense_ns: &mut u64, net_ns: &mut u64) -> Sense {
+    let t_sense = Stamp::capture::<PROFILE>();
     let g = &orgs.genome[i];
     let raw = pyr.sample(orgs.x[i], orgs.y[i], g.scale());
     let obs = observe(&raw, &cfg.sensors);
@@ -1547,21 +1660,43 @@ fn sense_one(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, sc
         input[..99].copy_from_slice(&obs.field_inputs);
         input[99..].copy_from_slice(&intr);
         let (dx, dy) = motion_drive(&g.motion, &obs.grad_x, &obs.grad_y);
+        charge::<PROFILE>(t_sense, sense_ns);
         if infer {
+            let t_net = Stamp::capture::<PROFILE>();
             forward(g.hidden(), &g.params, &input, scratch, &mut out);
+            charge::<PROFILE>(t_net, net_ns);
             return Sense { density0, out, evaluated: true, motion_drive: [dx, dy], input: None };
         }
         return Sense { density0, out, evaluated: true, motion_drive: [dx, dy], input: Some(Box::new(input)) };
     }
     let (dx, dy) = motion_drive(&g.motion, &obs.grad_x, &obs.grad_y);
+    charge::<PROFILE>(t_sense, sense_ns);
     Sense { density0, out, evaluated: false, motion_drive: [dx, dy], input: None }
 }
 
-fn sense_all(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, dead: &[bool], n: u64, workers: usize, infer: bool) -> Vec<Sense> {
+#[inline(always)]
+fn charge<const PROFILE: bool>(stamp: Stamp, acc: &mut u64) {
+    if PROFILE {
+        *acc += stamp.elapsed_ns();
+    }
+}
+
+fn sense_all<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, dead: &[bool], n: u64, workers: usize, infer: bool) -> (Vec<Sense>, u64, u64) {
     let len = orgs.len();
-    let run = |range: std::ops::Range<usize>| -> Vec<Sense> {
+    let run = |range: std::ops::Range<usize>| -> (Vec<Sense>, u64, u64) {
         let mut scratch = vec![0.0f32; 2 * MAX_HIDDEN];
-        range.map(|i| if dead[i] { Sense::blank() } else { sense_one(cfg, pyr, orgs, i, n, &mut scratch, infer) }).collect()
+        let mut sense_ns = 0u64;
+        let mut net_ns = 0u64;
+        let v = range
+            .map(|i| {
+                if dead[i] {
+                    Sense::blank()
+                } else {
+                    sense_one::<PROFILE>(cfg, pyr, orgs, i, n, &mut scratch, infer, &mut sense_ns, &mut net_ns)
+                }
+            })
+            .collect();
+        (v, sense_ns, net_ns)
     };
     let workers = workers.max(1).min(len.max(1));
     if workers == 1 || len < 256 {
@@ -1569,14 +1704,21 @@ fn sense_all(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, dead: &[bool], n: u6
     }
     let chunk = len.div_ceil(workers);
     std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers).map(|wi| {
-            let r = (wi * chunk).min(len)..((wi + 1) * chunk).min(len);
-            s.spawn(move || run(r))
-        }).collect();
+        let handles: Vec<_> = (0..workers)
+            .map(|wi| {
+                let r = (wi * chunk).min(len)..((wi + 1) * chunk).min(len);
+                s.spawn(move || run(r))
+            })
+            .collect();
         let mut all = Vec::with_capacity(len);
+        let mut sense_ns = 0u64;
+        let mut net_ns = 0u64;
         for h in handles {
-            all.extend(h.join().expect("sensing worker panicked"));
+            let (part, s_ns, n_ns) = h.join().expect("sensing worker panicked");
+            all.extend(part);
+            sense_ns += s_ns;
+            net_ns += n_ns;
         }
-        all
+        (all, sense_ns, net_ns)
     })
 }

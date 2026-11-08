@@ -57,6 +57,46 @@ fn ledger_closes_and_ecology_turns_over() {
 }
 
 #[test]
+fn profiling_does_not_change_results() {
+    let mut plain = World::new(small()).unwrap();
+    let mut profiled = World::new(small()).unwrap();
+    let mut profiled_workers = World::new(small()).unwrap();
+    profiled.set_profiling(true);
+    profiled_workers.set_profiling(true);
+    profiled_workers.workers = 4;
+    let mut resident = World::new(small()).unwrap();
+    resident.set_profiling(true);
+    let mut be = fl_core::ReferenceResident::default();
+    for _ in 0..40 {
+        plain.step().unwrap();
+        profiled.step().unwrap();
+        profiled_workers.step().unwrap();
+        resident.step_inference(fl_core::Inference::Resident(&mut be)).unwrap();
+    }
+    resident.sync_field(&mut be).unwrap();
+    assert_eq!(plain.state_hash(), profiled.state_hash());
+    assert_eq!(plain.state_hash(), profiled_workers.state_hash());
+    assert_eq!(plain.state_hash(), resident.state_hash());
+    assert_eq!(plain.ledger, profiled.ledger);
+    assert_eq!(plain.ledger, resident.ledger);
+    assert_eq!(plain.orgs, profiled.orgs);
+    assert_eq!(plain.orgs, resident.orgs);
+    assert!(!plain.stage_profile().is_enabled());
+    assert_eq!(plain.stage_profile().stage_ns(fl_core::CpuStage::Sensing), 0);
+    assert_eq!(plain.stage_profile().ticks(), 0);
+    let p = profiled.stage_profile();
+    assert!(p.is_enabled());
+    assert_eq!(p.ticks(), 40);
+    assert!(p.stage_ns(fl_core::CpuStage::Sensing) > 0, "sensing wall");
+    assert!(p.stage_ns(fl_core::CpuStage::ChemistryField) > 0, "chemistry/field wall");
+    assert!(p.stage_ns(fl_core::CpuStage::Networks) > 0, "cpu network forward");
+    let r = resident.stage_profile();
+    assert!(r.stage_ns(fl_core::CpuStage::TransfersSync) > 0, "resident copies and submits");
+    assert!(r.stage_ns(fl_core::CpuStage::ExternalEvaluate) > 0, "fused backend wall");
+    assert_eq!(r.ticks(), 40);
+}
+
+#[test]
 fn deterministic_and_worker_count_neutral() {
     let a = run(small(), 120, 1);
     let b = run(small(), 120, 1);

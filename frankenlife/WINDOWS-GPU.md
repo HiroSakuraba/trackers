@@ -92,10 +92,36 @@ cargo run --release -- gpu-check --organisms 20000
 
 Each run prints, every simulated second, the mean step time split into field,
 sensing/inference (and the GPU backend's share), exchange and lifecycle, against
-the 7.8 ms budget for 128 steps/s; the same numbers are in `metrics.jsonl` and
-`manifest.json` under `"timing"`. `gpu-check` now also splits each batch into
-host preparation, GPU round trip and kernel time (GPU timestamps). Please send
-the console output of all three.
+the 7.8125 ms budget for 128 steps/s; the same numbers are in `metrics.jsonl` and
+`manifest.json` under `"timing"`. `gpu-check` splits each batch into host
+preparation, GPU submit/wait, and an optional `TIMESTAMP_QUERY` span. The
+submit/wait number is CPU time blocked on the GPU, not GPU kernel time.
+
+## 5. Stage profile on the GTX 1080 (one command)
+
+From `trackers\frankenlife`, the same 20k preset, 6 simulated seconds, no frames.
+`--profile` does not change the preset, the tick, or the science. It writes
+`runs\t20r-profile\profile.json` (milliseconds, with `total_ns`) and prints a
+short summary. Omit `--profile` for a wall-clock run whose GPU command stream
+matches the unprofiled path.
+
+```powershell
+cargo run --release -- run --config presets\target-20k-field-ecology.toml --backend gpu-resident --seconds 6 --frame-every 0 --profile --out runs\t20r-profile
+```
+
+Read `cpu_wall_ms` as CPU `Instant` time (sensing, chemistry/field, networks,
+transfers/sync, other, render, checkpoint). `transfers_sync` and any
+`cpu_wall_blocked_on_gpu` counter include submit and the waits the step already
+used; they are not kernel time. `gpu_timestamp_query` spans are optional and
+are omitted when the adapter has no `TIMESTAMP_QUERY`. This build does not
+require `TIMESTAMP_QUERY_INSIDE_ENCODERS` or `TIMESTAMP_QUERY_INSIDE_PASSES`.
+Resident begin, deposit, and commit stay submit-without-wait. A software
+Vulkan driver or a cloud GPU is not a measurement of this GTX 1080. A prior
+single run on this machine (about 54 s wall for gpu-resident, exit 0, final
+population near 19809) is one observation, not a diagnosis. Real time at 128 Hz
+is 7.8125 ms per step.
+
+## Other runs
 
 The full 80,000-organism target world:
 

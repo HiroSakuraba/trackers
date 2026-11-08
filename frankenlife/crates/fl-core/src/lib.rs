@@ -20,6 +20,7 @@ pub mod config;
 pub mod field;
 pub mod genome;
 pub mod nn;
+pub mod profile;
 pub mod rng;
 pub mod sensors;
 pub mod sources;
@@ -32,4 +33,5 @@ pub const CHANNELS: usize = 32;
 pub const MODEL_VERSION: &str = "field-ecology-v1/fl-core-0.1";
 
 pub use config::Config;
+pub use profile::{CpuStage, GpuCounter, ProfileMeta, StageProfiler};
 pub use world::{Command, ControllerBackend, DeviceBackend, Disposal, FieldAccounting, FieldBackend, FieldDeposit, FinishReport, Inference, ReferenceDevice, ReferenceResident, ResidentBackend, UptakeJob, UptakeOut, InferenceJob, ReferenceBackend, ReferenceSenseInfer, SenseInferBackend, SenseJob, SenseOutput, TickError, TickReport, World};

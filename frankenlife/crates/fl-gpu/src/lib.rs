@@ -164,6 +164,12 @@ struct ResidentState {
 }
 
 /// Where the time of the most recent resident exchange step went.
+///
+/// The `*_ms` fields are CPU wall time. `begin_ms`, `deposit_ms` and `commit_ms`
+/// stop at `queue.submit` and do not wait for the GPU. `uptake_ms` and `finish_ms`
+/// include the wait those calls already use to read results back; that wait is not
+/// GPU kernel time. The timestamp spans are optional `TIMESTAMP_QUERY` deltas for
+/// the passes inside a call that already waited, and only when profiling is on.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ResidentTiming {
     pub begin_ms: f64,
@@ -171,6 +177,11 @@ pub struct ResidentTiming {
     pub deposit_ms: f64,
     pub finish_ms: f64,
     pub commit_ms: f64,
+    /// GPU timestamp-query span for the uptake submission. `None` when profiling
+    /// is off, the adapter lacks `TIMESTAMP_QUERY`, or this call did not wait.
+    pub uptake_timestamp_span_ms: Option<f64>,
+    /// GPU timestamp-query span for the finish submission. Same caveat as uptake.
+    pub finish_timestamp_span_ms: Option<f64>,
 }
 
 struct FieldPipelines {
@@ -240,6 +251,11 @@ pub struct GpuBackend {
     sense: SensePipelines,
     field_pipes: FieldPipelines,
     field_timestamps: Option<Timestamps>,
+    /// Timestamp queries for resident uptake/finish. Used only while profiling,
+    /// and only on submissions that already wait for readback.
+    resident_timestamps: Option<Timestamps>,
+    /// Opt-in. Does not change dispatch results. Default false.
+    profiling: bool,
     /// True while the device copy of the field equals the observation field just
     /// returned by `transport_and_sources` (lets fused sensing skip its upload).
     field_resident: bool,
@@ -371,8 +387,9 @@ impl GpuBackend {
             readback: device.create_buffer(&wgpu::BufferDescriptor { label: Some("ts-read"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
             period_ns: queue.get_timestamp_period() as f64,
         };
-        let pyramid_timestamps = ts_ok.then(mk_ts);
-        let field_timestamps = ts_ok.then(mk_ts);
+        let pyramid_timestamps = ts_ok.then(&mk_ts);
+        let field_timestamps = ts_ok.then(&mk_ts);
+        let resident_timestamps = ts_ok.then(&mk_ts);
         let field_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("field"), source: wgpu::ShaderSource::Wgsl(FIELD_SHADER.into()) });
         let field_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("field"),
@@ -442,7 +459,24 @@ impl GpuBackend {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
             max_buffer_bytes: limits.max_buffer_size,
         };
-        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, field_resident: false, field_gpu: None, field_gen: 0, res_pipes, resident: None, sense_io: None, info, stats: GpuStats::default() })
+        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, resident_timestamps, profiling: false, field_resident: false, field_gpu: None, field_gen: 0, res_pipes, resident: None, sense_io: None, info, stats: GpuStats::default() })
+    }
+
+    /// Record resident uptake/finish timestamp spans. Off by default, so the
+    /// unprofiled command stream does not write those queries. Does not add a
+    /// wait to begin, deposit, or commit, and does not request timestamp
+    /// features beyond `TIMESTAMP_QUERY` (already optional at device open).
+    pub fn set_profiling(&mut self, enabled: bool) {
+        self.profiling = enabled;
+    }
+
+    pub fn profiling(&self) -> bool {
+        self.profiling
+    }
+
+    /// `TIMESTAMP_QUERY` was available on this device. False when spans cannot be read.
+    pub fn timestamps_supported(&self) -> bool {
+        self.timestamps.is_some()
     }
 
     pub fn capability(&self) -> String {
@@ -1302,42 +1336,64 @@ impl GpuBackend {
         self.queue.write_buffer(&st.uniform, 0, bytemuck::cast_slice(&w));
     }
 
-    fn res_pass(&self, enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, grid: (u32, u32)) {
-        let st = self.resident.as_ref().expect("resident");
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("resident"), timestamp_writes: None });
-        pass.set_pipeline(pipe);
-        pass.set_bind_group(0, &st.bind.as_ref().expect("bind").1, &[]);
-        pass.dispatch_workgroups(grid.0, grid.1, 1);
-    }
-
-    /// Record the deterministic binning of `n` items (already uploaded) by base cell.
-    fn encode_binning(&self, enc: &mut wgpu::CommandEncoder, n: usize) {
+    /// `stamp_begin` writes a TIMESTAMP_QUERY at the start of the first binning
+    /// pass. The matching end stamp is written by the caller on its last pass.
+    /// Both stay off unless profiling is enabled, so the default command stream
+    /// is unchanged. This does not insert a wait.
+    fn encode_binning(&self, enc: &mut wgpu::CommandEncoder, n: usize, stamp_begin: bool) {
         let st = self.resident.as_ref().expect("resident");
         let p = &self.res_pipes;
         let items_grid = grid_for((n.max(1) as u32).div_ceil(64));
         let cells_grid = grid_for((st.cells as u32).div_ceil(64));
         enc.clear_buffer(&st.counts, 0, None);
-        self.res_pass(enc, &p.bin_count, items_grid);
-        self.res_pass(enc, &p.bin_scan, (1, 1));
-        self.res_pass(enc, &p.bin_scatter, items_grid);
-        self.res_pass(enc, &p.bin_sort, cells_grid);
+        let begin = if stamp_begin {
+            self.resident_timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: None,
+            })
+        } else {
+            None
+        };
+        dispatch_resident(st, enc, &p.bin_count, items_grid, begin);
+        dispatch_resident(st, enc, &p.bin_scan, (1, 1), None);
+        dispatch_resident(st, enc, &p.bin_scatter, items_grid, None);
+        dispatch_resident(st, enc, &p.bin_sort, cells_grid, None);
     }
 
-    fn read_res_out(&self, floats: usize) -> Result<Vec<f32>, String> {
+    /// Read the resident staging buffer. When `with_timestamp` is set, the
+    /// timestamp readback is mapped before the same `poll` the data already
+    /// waits on — no second synchronization.
+    fn read_res_out(&self, floats: usize, with_timestamp: bool) -> Result<(Vec<f32>, Option<f64>), String> {
         let st = self.resident.as_ref().expect("resident");
         let slice = st.staging.slice(0..(floats * 4) as u64);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        let ts_rx = if with_timestamp {
+            self.resident_timestamps.as_ref().map(|ts| {
+                let (ttx, trx) = mpsc::channel();
+                ts.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = ttx.send(r);
+                });
+                trx
+            })
+        } else {
+            None
+        };
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
         rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU readback: {e}"))?;
+        let span = match (self.resident_timestamps.as_ref(), ts_rx) {
+            (Some(ts), Some(trx)) => read_timestamps(&self.device, ts, trx),
+            _ => None,
+        };
         let out = {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             bytemuck::try_cast_slice::<u8, f32>(&view).map_err(|e| format!("readback alignment: {e:?}"))?.to_vec()
         };
         st.staging.unmap();
-        Ok(out)
+        Ok((out, span))
     }
 
     /// Apply deposit items to the working field (no readback).
@@ -1351,11 +1407,19 @@ impl GpuBackend {
         let st = self.resident.as_ref().expect("resident");
         self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
         self.write_res_uniform(deps.len(), None, 0.0);
-        self.encode_binning(enc, deps.len());
+        self.encode_binning(enc, deps.len(), false);
         let cells_grid = grid_for((st.cells as u32).div_ceil(64));
-        self.res_pass(enc, &self.res_pipes.deposit_gather, cells_grid);
+        let pipe = &self.res_pipes.deposit_gather;
+        dispatch_resident(st, enc, pipe, cells_grid, None);
         Ok(())
     }
+}
+
+fn dispatch_resident(st: &ResidentState, enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, grid: (u32, u32), tw: Option<wgpu::ComputePassTimestampWrites<'_>>) {
+    let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("resident"), timestamp_writes: tw });
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &st.bind.as_ref().expect("bind").1, &[]);
+    pass.dispatch_workgroups(grid.0, grid.1, 1);
 }
 
 impl ResidentBackend for GpuBackend {
@@ -1464,17 +1528,36 @@ impl ResidentBackend for GpuBackend {
         let st = self.resident.as_ref().expect("resident");
         self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
         self.write_res_uniform(jobs.len(), Some(ch), 0.0);
+        let stamp = self.profiling && self.resident_timestamps.is_some();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("uptake") });
-        self.encode_binning(&mut enc, jobs.len());
+        self.encode_binning(&mut enc, jobs.len(), stamp);
+        let st = self.resident.as_ref().expect("resident");
         let p = &self.res_pipes;
         let items_grid = grid_for((jobs.len() as u32).div_ceil(64));
         let cells_grid = grid_for((st.cells as u32).div_ceil(64));
-        self.res_pass(&mut enc, &p.uptake_demand, cells_grid);
-        self.res_pass(&mut enc, &p.uptake_org, items_grid);
-        self.res_pass(&mut enc, &p.uptake_debit, cells_grid);
+        dispatch_resident(st, &mut enc, &p.uptake_demand, cells_grid, None);
+        dispatch_resident(st, &mut enc, &p.uptake_org, items_grid, None);
+        let end = if stamp {
+            self.resident_timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(1),
+            })
+        } else {
+            None
+        };
+        dispatch_resident(st, &mut enc, &p.uptake_debit, cells_grid, end);
         enc.copy_buffer_to_buffer(&st.outv, 0, &st.staging, 0, (jobs.len() * 16) as u64);
+        if stamp {
+            let ts = self.resident_timestamps.as_ref().expect("timestamp query set");
+            enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
+            enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
+        }
         self.queue.submit([enc.finish()]);
-        let res = self.read_res_out(jobs.len() * 4)?;
+        let (res, span) = self.read_res_out(jobs.len() * 4, stamp)?;
+        if stamp {
+            self.stats.resident_last.uptake_timestamp_span_ms = span;
+        }
         let mut granted = 0.0;
         for (k, o) in out.iter_mut().enumerate() {
             *o = UptakeOut { absorbed: res[k * 4] as f64, useful_gain: res[k * 4 + 1] as f64, toxicity_requested: res[k * 4 + 2] as f64 };
@@ -1499,11 +1582,30 @@ impl ResidentBackend for GpuBackend {
         self.write_res_uniform(0, None, tiny);
         let st = self.resident.as_ref().expect("resident");
         let cells = st.cells;
+        let stamp = self.profiling && self.resident_timestamps.is_some();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("finish") });
-        self.res_pass(&mut enc, &self.res_pipes.finish, grid_for((cells as u32).div_ceil(64)));
+        let pipe = &self.res_pipes.finish;
+        let tw = if stamp {
+            self.resident_timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            })
+        } else {
+            None
+        };
+        dispatch_resident(st, &mut enc, pipe, grid_for((cells as u32).div_ceil(64)), tw);
         enc.copy_buffer_to_buffer(&st.outv, 0, &st.staging, 0, (cells * 16) as u64);
+        if stamp {
+            let ts = self.resident_timestamps.as_ref().expect("timestamp query set");
+            enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
+            enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
+        }
         self.queue.submit([enc.finish()]);
-        let rows = self.read_res_out(cells * 4)?;
+        let (rows, span) = self.read_res_out(cells * 4, stamp)?;
+        if stamp {
+            self.stats.resident_last.finish_timestamp_span_ms = span;
+        }
         let mut rep = FinishReport { worst_cone: f64::NEG_INFINITY, min_energy: f64::INFINITY, ..Default::default() };
         for c in 0..cells {
             let e = rows[c * 4] as f64;
@@ -1868,5 +1970,58 @@ mod tests {
         assert!(rel < 1e-5);
         assert!(a.totals.births > 0 && a.totals.deaths_user > 0);
         assert!(a.orgs.len() > 500);
+    }
+
+    fn tiny_world() -> Config {
+        let mut c = Config::reference();
+        c.world.width = 16.0;
+        c.world.height = 16.0;
+        c.world.grid_width = 16;
+        c.world.grid_height = 16;
+        c.population.initial_count = 24;
+        c.population.maximum_count = 64;
+        c.population.initial_energy = 4.0;
+        c.sources.count = 1;
+        c.sources.power_per_source = 8.0;
+        c.sources.sigma_world_units = 2.0;
+        c.sensors.maximum_scale_world_units = 4.0;
+        c.controller.hidden_widths = vec![8];
+        c
+    }
+
+    #[test]
+    fn profiling_does_not_change_resident_results() {
+        let Ok(mut off) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let Ok(mut on) = GpuBackend::new() else {
+            eprintln!("second GPU device unavailable; skipping");
+            return;
+        };
+        assert!(!off.profiling(), "profiling is off unless requested");
+        on.set_profiling(true);
+        let cfg = tiny_world();
+        let mut a = fl_core::World::new(cfg.clone()).unwrap();
+        let mut b = fl_core::World::new(cfg).unwrap();
+        b.set_profiling(true);
+        for _ in 0..6 {
+            a.step_inference(fl_core::Inference::Resident(&mut off)).unwrap();
+            b.step_inference(fl_core::Inference::Resident(&mut on)).unwrap();
+        }
+        a.sync_field(&mut off).unwrap();
+        b.sync_field(&mut on).unwrap();
+        assert_eq!(a.state_hash(), b.state_hash(), "timestamp queries must not change field or organism bits");
+        assert_eq!(a.ledger, b.ledger);
+        assert_eq!(a.orgs, b.orgs);
+        if on.timestamps_supported() {
+            assert!(
+                on.stats.resident_last.finish_timestamp_span_ms.is_some(),
+                "finish already waits for readback; the timestamp span is read in that same wait"
+            );
+        } else {
+            assert!(on.stats.resident_last.finish_timestamp_span_ms.is_none());
+            assert!(on.stats.resident_last.uptake_timestamp_span_ms.is_none());
+        }
     }
 }
