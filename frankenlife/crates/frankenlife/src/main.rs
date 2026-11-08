@@ -71,6 +71,8 @@ enum Backend {
     GpuFused,
     /// `gpu-fused` plus field transport, sources and tiny clearing on the GPU.
     GpuField,
+    /// The field stays on the GPU across steps; uptake exchange and deposits run there too.
+    GpuResident,
 }
 
 #[derive(Parser)]
@@ -359,7 +361,7 @@ fn run(a: RunArgs) -> i32 {
     }
     #[cfg(feature = "gpu")]
     let mut gpu = match a.backend {
-        Backend::Gpu | Backend::GpuFused | Backend::GpuField => match fl_gpu::GpuBackend::new() {
+        Backend::Gpu | Backend::GpuFused | Backend::GpuField | Backend::GpuResident => match fl_gpu::GpuBackend::new() {
             Ok(g) => {
                 eprintln!("GPU: {}", g.capability());
                 Some(g)
@@ -430,6 +432,7 @@ fn run(a: RunArgs) -> i32 {
         let stepped = match gpu.as_mut() {
             Some(g) if a.backend == Backend::GpuFused => world.step_inference(fl_core::Inference::Fused(g)),
             Some(g) if a.backend == Backend::GpuField => world.step_inference(fl_core::Inference::Device(g)),
+            Some(g) if a.backend == Backend::GpuResident => world.step_inference(fl_core::Inference::Resident(g)),
             Some(g) => world.step_with(Some(g as &mut dyn fl_core::ControllerBackend)),
             None => world.step(),
         };
@@ -452,8 +455,13 @@ fn run(a: RunArgs) -> i32 {
         if let Some(g) = gpu.as_ref() {
             let l = g.stats.last;
             let fl = g.stats.field_last;
-            let v = [l.host_prep_ms, l.gpu_roundtrip_ms, l.kernel_ms.unwrap_or(0.0), l.bookkeeping_ms, l.total_ms, l.pyramid_ms.unwrap_or(0.0), fl.host_ms, fl.roundtrip_ms, fl.kernel_ms.unwrap_or(0.0)];
-            for k in 0..9 {
+            let rl = g.stats.resident_last;
+            let v = [
+                l.host_prep_ms, l.gpu_roundtrip_ms, l.kernel_ms.unwrap_or(0.0), l.bookkeeping_ms, l.total_ms, l.pyramid_ms.unwrap_or(0.0),
+                fl.host_ms, fl.roundtrip_ms, fl.kernel_ms.unwrap_or(0.0),
+                rl.begin_ms, rl.uptake_ms, rl.deposit_ms, rl.finish_ms, rl.commit_ms,
+            ];
+            for k in 0..14 {
                 phases.gpu[k] += v[k];
                 run_phases.gpu[k] += v[k];
             }
@@ -485,6 +493,12 @@ fn run(a: RunArgs) -> i32 {
                     (phases.backend_inference_ms - phases.gpu[4]) / n
                 );
             }
+            if phases.gpu[10] > 0.0 {
+                eprintln!(
+                    "             resident: begin {:.2} | uptake {:.2} | deposits {:.2} | finish {:.2} | commit {:.2}",
+                    phases.gpu[9] / n, phases.gpu[10] / n, phases.gpu[11] / n, phases.gpu[12] / n, phases.gpu[13] / n
+                );
+            }
             if phases.gpu[7] > 0.0 {
                 eprintln!(
                     "             gpu field step {:.2} ms = host {:.2} + round trip {:.2} (kernels {:.2}) | setup {:.2} + validate {:.2} | other {:.2}",
@@ -503,14 +517,26 @@ fn run(a: RunArgs) -> i32 {
             interval_ticks = 0;
             interval_wall = Instant::now();
         }
-        if ckpt_every.is_some_and(|k| world.tick % k == 0) {
+        let wants_ckpt = ckpt_every.is_some_and(|k| world.tick % k == 0);
+        let wants_frame = a.frame_every > 0 && world.tick % a.frame_every == 0;
+        if wants_ckpt || wants_frame {
+            #[cfg(feature = "gpu")]
+            if let Some(g) = gpu.as_mut() {
+                if world.field_on_device() {
+                        if let Err(e) = world.sync_field(g) {
+                            eprintln!("cannot copy the field back from the GPU: {e}");
+                        }
+                }
+            }
+        }
+        if wants_ckpt {
             let t = Instant::now();
             write_checkpoint(&world, &ckpt_dir, retain);
             let ms = t.elapsed().as_secs_f64() * 1e3;
             phases.checkpoint_ms += ms;
             run_phases.checkpoint_ms += ms;
         }
-        if a.frame_every > 0 && world.tick % a.frame_every == 0 {
+        if wants_frame {
             let t = Instant::now();
             save_frame(&world, &opts_base, &frames_dir, frame_no, steps_per_s);
             let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -523,6 +549,14 @@ fn run(a: RunArgs) -> i32 {
     }
     metrics.flush().ok();
     let wall = wall0.elapsed().as_secs_f64();
+    #[cfg(feature = "gpu")]
+    if let Some(g) = gpu.as_mut() {
+        if world.field_on_device() {
+            if let Err(e) = world.sync_field(g) {
+                eprintln!("cannot copy the field back from the GPU: {e}");
+            }
+        }
+    }
     if ckpt_every.is_some() && !world.orgs.is_empty() {
         write_checkpoint(&world, &ckpt_dir, retain);
     }
@@ -603,8 +637,8 @@ struct Phases {
     frames: u64,
     checkpoint_ms: f64,
     /// GPU backend breakdown (summed over ticks): host prep, round trip, kernel, bookkeeping, evaluate total, pyramid,
-    /// field host, field round trip, field kernels.
-    gpu: [f64; 9],
+    /// field host, field round trip, field kernels, resident begin, uptake, deposit, finish, commit.
+    gpu: [f64; 14],
 }
 
 impl Phases {
@@ -650,6 +684,11 @@ impl Phases {
                 "field_host": self.gpu[6] / n,
                 "field_round_trip_including_kernels": self.gpu[7] / n,
                 "field_kernels_gpu_timestamps": self.gpu[8] / n,
+                "resident_begin": self.gpu[9] / n,
+                "resident_uptake": self.gpu[10] / n,
+                "resident_deposit": self.gpu[11] / n,
+                "resident_finish": self.gpu[12] / n,
+                "resident_commit": self.gpu[13] / n,
             },
         })
     }
@@ -678,7 +717,7 @@ fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_pe
         "mean_sensing_scale": mean(&|i| o.genome[i].scale()),
         "mean_speed": mean(&|i| (o.vx[i] * o.vx[i] + o.vy[i] * o.vy[i]).sqrt()),
         "topologies": topo,
-        "field_energy": w.field.total_energy(),
+        "field_energy": w.last_report.map_or_else(|| w.field.total_energy(), |r| r.ledger.field_energy_after),
         "organism_energy": o.energy.iter().sum::<f64>(),
         "ledger": w.ledger,
         "achieved_steps_per_wall_second": steps_per_s,

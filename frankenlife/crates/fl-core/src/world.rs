@@ -297,6 +297,9 @@ pub struct World {
     pub workers: usize,
     pub last_report: Option<TickReport>,
     pub(crate) pyramid_extra_levels: usize,
+    /// The authoritative field lives on a resident device backend; `field` may be stale
+    /// until `sync_field` is called.
+    pub(crate) device_field: bool,
 }
 
 impl World {
@@ -336,6 +339,7 @@ impl World {
             workers,
             last_report: None,
             pyramid_extra_levels: lv,
+            device_field: false,
         })
     }
 
@@ -380,8 +384,51 @@ impl World {
         }
     }
 
-    /// Advance `n -> n+1` with an explicit inference route. On error the committed world is unchanged.
+    /// Advance `n -> n+1` with an explicit inference route. On error the committed world is unchanged
+    /// (a resident device backend discards its working field).
     pub fn step_inference(&mut self, inference: Inference<'_>) -> Result<TickReport, TickError> {
+        match inference {
+            Inference::Resident(r) => {
+                let res = self.step_core(Inference::Resident(&mut *r));
+                if res.is_err() {
+                    r.abort();
+                }
+                res
+            }
+            other => {
+                if self.device_field {
+                    return Err(TickError::NumericalFault {
+                        tick: self.tick + 1,
+                        detail: "the authoritative field is on a resident device: call detach_device (or keep stepping it resident) first".into(),
+                    });
+                }
+                self.step_core(other)
+            }
+        }
+    }
+
+    /// True when the authoritative field lives on a resident device backend.
+    pub fn field_on_device(&self) -> bool {
+        self.device_field
+    }
+
+    /// Copy the device's committed field into `self.field` (for rendering, checkpoints,
+    /// inspection, hashing). The device stays authoritative.
+    pub fn sync_field(&mut self, r: &mut dyn ResidentBackend) -> Result<(), String> {
+        if self.device_field {
+            r.download_committed(&mut self.field)?;
+        }
+        Ok(())
+    }
+
+    /// Bring the field back to the CPU and stop using the resident device.
+    pub fn detach_device(&mut self, r: &mut dyn ResidentBackend) -> Result<(), String> {
+        self.sync_field(r)?;
+        self.device_field = false;
+        Ok(())
+    }
+
+    fn step_core(&mut self, inference: Inference<'_>) -> Result<TickReport, TickError> {
         let t_start = Stopwatch::start();
         let cfg = &self.cfg;
         let dt = cfg.dt();
@@ -390,22 +437,41 @@ impl World {
         let tiny = cfg.world.tiny_energy_threshold;
         let mut timing = TickTiming::default();
         let mut counts = TickCounts::default();
-        let mut led = TickLedger { energy_before: self.total_energy(), ..Default::default() };
         let mut dis = Dissipation::default();
 
-        let (backend, fused, mut device) = match inference {
-            Inference::Reference => (None, None, None),
-            Inference::Controller(b) => (Some(b), None, None),
-            Inference::Fused(f) => (None, Some(f), None),
-            Inference::Device(d) => (None, None, Some(d)),
+        let (backend, fused, mut device, mut resident) = match inference {
+            Inference::Reference => (None, None, None, None),
+            Inference::Controller(b) => (Some(b), None, None, None),
+            Inference::Fused(f) => (None, Some(f), None, None),
+            Inference::Device(d) => (None, None, Some(d), None),
+            Inference::Resident(r) => (None, None, None, Some(r)),
         };
+        if let Some(r) = resident.as_mut() {
+            if !self.device_field {
+                r.upload_committed(&self.field, cfg).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident upload: {detail}") })?;
+                self.device_field = true;
+            }
+        }
+        let is_resident = resident.is_some();
+        let field_energy_before = match resident.as_ref() {
+            Some(r) => r.committed_energy(),
+            None => self.field.total_energy(),
+        };
+        let mut led = TickLedger { energy_before: field_energy_before + self.orgs.energy.iter().sum::<f64>(), ..Default::default() };
         let t_setup = Stopwatch::start();
-        let mut field = self.field.clone();
+        // Resident ticks work on a geometry-only descriptor: the planes live on the device.
+        let mut field = if is_resident {
+            Field { gx: self.field.gx, gy: self.field.gy, hx: self.field.hx, hy: self.field.hy, e: Vec::new(), m: Vec::new() }
+        } else {
+            self.field.clone()
+        };
         let mut orgs = self.orgs.clone();
         let mut sources = self.sources.clone();
         let e_start = orgs.energy.clone();
         let mut dead = vec![false; orgs.len()];
-        let mut deposits = Field::new(field.gx, field.gy, field.width(), field.height());
+        let mut deposits = if is_resident { Field { gx: field.gx, gy: field.gy, hx: field.hx, hy: field.hy, e: Vec::new(), m: Vec::new() } } else { Field::new(field.gx, field.gy, field.width(), field.height()) };
+        let mut ops: Vec<FieldDeposit> = Vec::new();
+        let mut dep_list: Vec<FieldDeposit> = Vec::new();
 
         // ── Phase 1: admit commands recorded for this boundary ────────────
         let mut due: Vec<&ScheduledCommand> = self.pending.iter().filter(|c| c.tick == n).collect();
@@ -425,8 +491,12 @@ impl World {
                                 Disposal::Remove => led.removed += e,
                                 Disposal::Dissipate => dis.death += e,
                                 Disposal::Recycle => {
-                                    let s = field.stencil(orgs.x[i], orgs.y[i]);
-                                    field.deposit(&s, e, &orgs.genome[i].affinity);
+                                    if is_resident {
+                                        ops.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: e, dir: orgs.genome[i].affinity });
+                                    } else {
+                                        let s = field.stencil(orgs.x[i], orgs.y[i]);
+                                        field.deposit(&s, e, &orgs.genome[i].affinity);
+                                    }
                                 }
                             }
                             orgs.energy[i] = 0.0;
@@ -452,14 +522,21 @@ impl World {
                     let dir = direction.as_ref().and_then(|d| isotropic_unit(&d.map(|v| v as f64))).unwrap_or([0.0; CHANNELS]);
                     let q = amount.max(0.0) / cells.len() as f64;
                     for c in cells {
-                        let s = Stencil { n: 1, cells: [c, 0, 0, 0], w: [1.0, 0.0, 0.0, 0.0] };
-                        field.deposit(&s, q, &dir);
+                        if is_resident {
+                            ops.push(FieldDeposit::Cell { cell: c, q, dir });
+                        } else {
+                            let s = Stencil { n: 1, cells: [c, 0, 0, 0], w: [1.0, 0.0, 0.0, 0.0] };
+                            field.deposit(&s, q, &dir);
+                        }
                     }
                     led.injected_commands += amount.max(0.0);
                 }
             }
         }
 
+        if let Some(r) = resident.as_mut() {
+            r.begin_tick(&ops).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident begin: {detail}") })?;
+        }
         timing.setup_ms = t_setup.ms();
 
         // ── Phase 2: transport, then scheduled sources → observation field ─
@@ -467,7 +544,13 @@ impl World {
         for s in &mut sources {
             s.advance_to(n, cfg, &self.rng);
         }
-        if let Some(d) = device.as_mut() {
+        if let Some(r) = resident.as_mut() {
+            let acct = r.transport_resident(cfg, &sources, n).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident transport: {detail}") })?;
+            dis.decay += acct.decay_removed;
+            counts.transport_subcycles = acct.subcycles;
+            led.injected_sources = acct.injected;
+            dis.tiny_reservoir += acct.tiny_removed;
+        } else if let Some(d) = device.as_mut() {
             let acct = d
                 .transport_and_sources(&mut field, cfg, &sources, n)
                 .map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("field backend {}: {detail}", FieldBackend::name(&**d)) })?;
@@ -486,9 +569,10 @@ impl World {
 
         // ── Phase 3–4: sensing pyramid, sample organisms, evaluate due controllers ──
         let t = Stopwatch::start();
-        let fused: Option<&mut dyn SenseInferBackend> = match device {
-            Some(d) => Some(d),
-            None => fused,
+        let fused: Option<&mut dyn SenseInferBackend> = match (device, resident.as_mut()) {
+            (Some(d), _) => Some(d),
+            (None, Some(r)) => Some(&mut **r),
+            (None, None) => fused,
         };
         let mut senses = if let Some(fb) = fused {
             let k_eval = cfg.controller.evaluation_interval_ticks as u64;
@@ -561,10 +645,33 @@ impl World {
         let t = Stopwatch::start();
         let ch = &cfg.chemistry;
         let umax = ch.uptake_capacity_per_second;
-        let stencils: Vec<Stencil> = (0..orgs.len()).map(|i| field.stencil(orgs.x[i], orgs.y[i])).collect();
         let demand: Vec<f64> = (0..orgs.len())
             .map(|i| if dead[i] { 0.0 } else { let r = senses[i].density0; dt * umax * r / (ch.uptake_half_saturation_density + r) })
             .collect();
+        let mut uptake_total = vec![0.0f64; orgs.len()];
+        let mut settlements: Vec<crate::chemistry::Settlement> = Vec::with_capacity(orgs.len());
+        if let Some(r) = resident.as_mut() {
+            let idx: Vec<usize> = (0..orgs.len()).filter(|&i| demand[i] > 0.0).collect();
+            let jobs: Vec<UptakeJob<'_>> = idx.iter().map(|&i| UptakeJob { x: orgs.x[i], y: orgs.y[i], demand: demand[i], genome: &orgs.genome[i] }).collect();
+            let mut outs = vec![UptakeOut::default(); jobs.len()];
+            let granted = r.uptake(ch, &jobs, &mut outs).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident uptake: {detail}") })?;
+            led.transferred += granted;
+            settlements = vec![Default::default(); orgs.len()];
+            for (k, &i) in idx.iter().enumerate() {
+                let o = outs[k];
+                if !(o.absorbed.is_finite() && o.useful_gain.is_finite() && o.toxicity_requested.is_finite()) {
+                    return Err(TickError::NumericalFault { tick: event, detail: format!("resident uptake produced non-finite results for organism {}", orgs.id[i]) });
+                }
+                settlements[i] = crate::chemistry::Settlement {
+                    absorbed: o.absorbed,
+                    useful_gain: o.useful_gain,
+                    toxicity_requested: o.toxicity_requested,
+                    toxicity_paid: o.toxicity_requested.min(orgs.energy[i] + o.useful_gain),
+                };
+                uptake_total[i] = o.absorbed;
+            }
+        } else {
+        let stencils: Vec<Stencil> = (0..orgs.len()).map(|i| field.stencil(orgs.x[i], orgs.y[i])).collect();
         let mut cell_demand = vec![0.0f64; field.cells()];
         for i in 0..orgs.len() {
             if demand[i] > 0.0 {
@@ -575,8 +682,6 @@ impl World {
             }
         }
         let mut granted_cell = vec![0.0f64; field.cells()];
-        let mut uptake_total = vec![0.0f64; orgs.len()];
-        let mut settlements = Vec::with_capacity(orgs.len());
         for i in 0..orgs.len() {
             if demand[i] <= 0.0 {
                 settlements.push(Default::default());
@@ -615,6 +720,7 @@ impl World {
                 }
                 led.transferred += g;
             }
+        }
         }
 
         // ── Phase 6: settle gain, toxicity, maintenance ───────────────────
@@ -719,8 +825,12 @@ impl World {
                         let spend = orgs.energy[i] * frac;
                         if spend > 0.0 {
                             orgs.energy[i] -= spend;
-                            let st = field.stencil(orgs.x[i], orgs.y[i]);
-                            deposits.deposit(&st, em.transfer_efficiency * spend, &dir);
+                            if is_resident {
+                                dep_list.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: em.transfer_efficiency * spend, dir });
+                            } else {
+                                let st = field.stencil(orgs.x[i], orgs.y[i]);
+                                deposits.deposit(&st, em.transfer_efficiency * spend, &dir);
+                            }
                             dis.emission += (1.0 - em.transfer_efficiency) * spend;
                             led.transferred += spend;
                             counts.emitting += 1;
@@ -819,8 +929,12 @@ impl World {
         for i in 0..orgs.len() {
             if dead[i] && orgs.energy[i] > 0.0 {
                 let e = orgs.energy[i];
-                let st = field.stencil(orgs.x[i], orgs.y[i]);
-                deposits.deposit(&st, recycle * e, &orgs.genome[i].affinity);
+                if is_resident {
+                    dep_list.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: recycle * e, dir: orgs.genome[i].affinity });
+                } else {
+                    let st = field.stencil(orgs.x[i], orgs.y[i]);
+                    deposits.deposit(&st, recycle * e, &orgs.genome[i].affinity);
+                }
                 dis.death += (1.0 - recycle) * e;
                 orgs.energy[i] = 0.0;
             }
@@ -838,32 +952,55 @@ impl World {
         }
 
         // ── Phase 9: paid deposits and recycling enter the next field ─────
-        field.add_assign(&deposits);
+        if let Some(r) = resident.as_mut() {
+            r.deposit(&dep_list).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident deposit: {detail}") })?;
+        } else {
+            field.add_assign(&deposits);
+        }
         timing.lifecycle_ms = t.ms();
 
         // ── Phase 10: tiny-reservoir clearing, validate invariants, publish ─
         let t_validate = Stopwatch::start();
-        dis.tiny_reservoir += field.clear_tiny(tiny);
-        let (worst, min_e) = field.cone_report();
-        if !(min_e >= 0.0) || !min_e.is_finite() {
-            return Err(TickError::NumericalFault { tick: event, detail: format!("negative or non-finite field energy {min_e}") });
-        }
-        if worst > 1e-3 {
-            return Err(TickError::NumericalFault { tick: event, detail: format!("moment cone violated by {worst}") });
-        }
-        if worst > 0.0 {
-            counts.cone_projections = field.project_cone() as u32;
+        let field_energy_after;
+        if let Some(r) = resident.as_mut() {
+            let fin = r.finish(tiny).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident finish: {detail}") })?;
+            dis.tiny_reservoir += fin.tiny_removed;
+            if !(fin.min_energy >= 0.0) || !fin.min_energy.is_finite() {
+                return Err(TickError::NumericalFault { tick: event, detail: format!("negative or non-finite field energy {}", fin.min_energy) });
+            }
+            if fin.worst_cone > 1e-3 {
+                return Err(TickError::NumericalFault { tick: event, detail: format!("moment cone violated by {}", fin.worst_cone) });
+            }
+            counts.cone_projections = fin.cone_projections;
+            field_energy_after = fin.field_energy;
+        } else {
+            dis.tiny_reservoir += field.clear_tiny(tiny);
+            let (worst, min_e) = field.cone_report();
+            if !(min_e >= 0.0) || !min_e.is_finite() {
+                return Err(TickError::NumericalFault { tick: event, detail: format!("negative or non-finite field energy {min_e}") });
+            }
+            if worst > 1e-3 {
+                return Err(TickError::NumericalFault { tick: event, detail: format!("moment cone violated by {worst}") });
+            }
+            if worst > 0.0 {
+                counts.cone_projections = field.project_cone() as u32;
+            }
+            field_energy_after = field.total_energy();
         }
         if let Some(i) = (0..orgs.len()).find(|&i| !(orgs.energy[i] > 0.0) || !orgs.energy[i].is_finite() || !orgs.x[i].is_finite() || !orgs.y[i].is_finite()) {
             return Err(TickError::NumericalFault { tick: event, detail: format!("organism {} published with energy {}", orgs.id[i], orgs.energy[i]) });
         }
         led.dissipated = dis;
-        led.field_energy_after = field.total_energy();
+        led.field_energy_after = field_energy_after;
         led.organism_energy_after = orgs.energy.iter().sum();
         led.energy_after = led.field_energy_after + led.organism_energy_after;
         led.residual = led.energy_after - led.energy_before - (led.injected_sources + led.injected_commands - led.removed - dis.total());
 
-        self.field = field;
+        if let Some(r) = resident.as_mut() {
+            r.commit().map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident commit: {detail}") })?;
+        } else {
+            self.field = field;
+        }
         self.orgs = orgs;
         self.sources = sources;
         self.tick = event;
@@ -1053,6 +1190,8 @@ pub enum Inference<'a> {
     Fused(&'a mut dyn SenseInferBackend),
     /// Field transport/sources plus fused sensing and inference on one device backend.
     Device(&'a mut dyn DeviceBackend),
+    /// The field stays on the device across ticks; exchange and deposits run there too.
+    Resident(&'a mut dyn ResidentBackend),
 }
 
 /// Energy accounting of one field transport + source step (all in cell-integrated energy).
@@ -1108,6 +1247,196 @@ impl SenseInferBackend for ReferenceDevice {
     }
     fn sense_and_infer(&mut self, field: &Field, sensors: &crate::config::SensorsCfg, extra_levels: usize, jobs: &[SenseJob<'_>], out: &mut [SenseOutput]) -> Result<(), String> {
         ReferenceSenseInfer.sense_and_infer(field, sensors, extra_levels, jobs, out)
+    }
+}
+
+/// A field addition: a bilinear-stencil packet (emission, recycling) or an exact cell (energy brush).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FieldDeposit {
+    Stencil { x: f64, y: f64, q: f64, dir: [f32; CHANNELS] },
+    Cell { cell: usize, q: f64, dir: [f32; CHANNELS] },
+}
+
+/// One organism's uptake request (resident path).
+pub struct UptakeJob<'a> {
+    pub x: f64,
+    pub y: f64,
+    pub demand: f64,
+    pub genome: &'a Genome,
+}
+
+/// Packet-chemistry result for one organism before the toxicity clip (which needs its energy).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UptakeOut {
+    pub absorbed: f64,
+    pub useful_gain: f64,
+    pub toxicity_requested: f64,
+}
+
+/// Phase-10 summary of the working field.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FinishReport {
+    pub tiny_removed: f64,
+    /// Worst relative cone excess before projection (violations up to 1e-3 are projected).
+    pub worst_cone: f64,
+    pub min_energy: f64,
+    pub cone_projections: u32,
+    /// Total field energy after clearing and projection.
+    pub field_energy: f64,
+}
+
+/// A backend that keeps the authoritative field on a device across ticks (plan §9.5, §10.5).
+///
+/// Each tick: `begin_tick` copies the committed field to a working field and applies
+/// boundary commands; then `transport_resident`, `sense_and_infer`, `uptake` (which also
+/// debits granted energy), `deposit` and `finish` act on the working field; `commit`
+/// publishes it, `abort` discards it.
+pub trait ResidentBackend: SenseInferBackend {
+    fn upload_committed(&mut self, field: &Field, cfg: &Config) -> Result<(), String>;
+    fn download_committed(&mut self, field: &mut Field) -> Result<(), String>;
+    fn committed_energy(&self) -> f64;
+    fn begin_tick(&mut self, ops: &[FieldDeposit]) -> Result<(), String>;
+    fn transport_resident(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String>;
+    /// Fills `out` and debits granted energy from the working field; returns total granted energy.
+    fn uptake(&mut self, chemistry: &crate::config::ChemistryCfg, jobs: &[UptakeJob<'_>], out: &mut [UptakeOut]) -> Result<f64, String>;
+    fn deposit(&mut self, deposits: &[FieldDeposit]) -> Result<(), String>;
+    fn finish(&mut self, tiny: f64) -> Result<FinishReport, String>;
+    fn commit(&mut self) -> Result<(), String>;
+    fn abort(&mut self);
+}
+
+fn apply_deposit(field: &mut Field, d: &FieldDeposit) {
+    match *d {
+        FieldDeposit::Stencil { x, y, q, ref dir } => {
+            let s = field.stencil(x, y);
+            field.deposit(&s, q, dir);
+        }
+        FieldDeposit::Cell { cell, q, ref dir } => {
+            let s = Stencil { n: 1, cells: [cell, 0, 0, 0], w: [1.0, 0.0, 0.0, 0.0] };
+            field.deposit(&s, q, dir);
+        }
+    }
+}
+
+/// CPU reference of the resident port: the same arithmetic as the built-in path
+/// (reproduces its state hash and ledger), with the field held "on the device".
+#[derive(Debug, Default, Clone)]
+pub struct ReferenceResident {
+    committed: Option<Field>,
+    working: Option<Field>,
+    pending_energy: f64,
+    committed_energy: f64,
+}
+
+impl SenseInferBackend for ReferenceResident {
+    fn name(&self) -> &str {
+        "cpu-reference-resident"
+    }
+    fn sense_and_infer(&mut self, _field: &Field, sensors: &crate::config::SensorsCfg, extra_levels: usize, jobs: &[SenseJob<'_>], out: &mut [SenseOutput]) -> Result<(), String> {
+        let w = self.working.as_ref().ok_or("no working field")?;
+        ReferenceSenseInfer.sense_and_infer(w, sensors, extra_levels, jobs, out)
+    }
+}
+
+impl ResidentBackend for ReferenceResident {
+    fn upload_committed(&mut self, field: &Field, _cfg: &Config) -> Result<(), String> {
+        self.committed_energy = field.total_energy();
+        self.committed = Some(field.clone());
+        Ok(())
+    }
+    fn download_committed(&mut self, field: &mut Field) -> Result<(), String> {
+        *field = self.committed.clone().ok_or("nothing uploaded")?;
+        Ok(())
+    }
+    fn committed_energy(&self) -> f64 {
+        self.committed_energy
+    }
+    fn begin_tick(&mut self, ops: &[FieldDeposit]) -> Result<(), String> {
+        let mut w = self.committed.clone().ok_or("nothing uploaded")?;
+        for d in ops {
+            apply_deposit(&mut w, d);
+        }
+        self.working = Some(w);
+        Ok(())
+    }
+    fn transport_resident(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+        cpu_transport_and_sources(self.working.as_mut().ok_or("no working field")?, cfg, sources, n)
+    }
+    fn uptake(&mut self, ch: &crate::config::ChemistryCfg, jobs: &[UptakeJob<'_>], out: &mut [UptakeOut]) -> Result<f64, String> {
+        let field = self.working.as_mut().ok_or("no working field")?;
+        let stencils: Vec<Stencil> = jobs.iter().map(|j| field.stencil(j.x, j.y)).collect();
+        let mut cell_demand = vec![0.0f64; field.cells()];
+        for (j, s) in jobs.iter().zip(&stencils) {
+            for k in 0..s.n {
+                cell_demand[s.cells[k]] += j.demand * s.w[k];
+            }
+        }
+        let mut granted_cell = vec![0.0f64; field.cells()];
+        for ((j, s), o) in jobs.iter().zip(&stencils).zip(out.iter_mut()) {
+            let a = &j.genome.affinity;
+            let mut packets = [(0.0f64, 0.0f64); 4];
+            for k in 0..s.n {
+                let c = s.cells[k];
+                let ec = field.e[c] as f64;
+                let u = grant_scale(ec, cell_demand[c]) * j.demand * s.w[k];
+                granted_cell[c] += u;
+                let az = if ec > 0.0 {
+                    let m = field.moment(c);
+                    (0..CHANNELS).map(|q| a[q] as f64 * m[q] as f64).sum::<f64>() / ec
+                } else {
+                    0.0
+                };
+                packets[k] = (u, eta(ch.maximum_efficiency, ch.affinity_gain, ch.discrimination_threshold, az));
+            }
+            // The toxicity clip needs the organism's energy; the caller applies it.
+            let st = settle(f64::INFINITY, ch.toxicity_sensitivity, packets[..s.n].iter().copied());
+            *o = UptakeOut { absorbed: st.absorbed, useful_gain: st.useful_gain, toxicity_requested: st.toxicity_requested };
+        }
+        let mut transferred = 0.0;
+        for c in 0..field.cells() {
+            let g = granted_cell[c];
+            if g > 0.0 {
+                let e = field.e[c] as f64;
+                let e_new = (e - g).max(0.0);
+                let e_new32 = e_new as f32;
+                let f = if e > 0.0 { e_new32 as f64 / e } else { 0.0 };
+                field.e[c] = e_new32;
+                for v in &mut field.m[c * CHANNELS..(c + 1) * CHANNELS] {
+                    *v = (*v as f64 * f) as f32;
+                }
+                transferred += g;
+            }
+        }
+        Ok(transferred)
+    }
+    fn deposit(&mut self, deposits: &[FieldDeposit]) -> Result<(), String> {
+        let field = self.working.as_mut().ok_or("no working field")?;
+        let mut acc = Field::new(field.gx, field.gy, field.width(), field.height());
+        for d in deposits {
+            apply_deposit(&mut acc, d);
+        }
+        field.add_assign(&acc);
+        Ok(())
+    }
+    fn finish(&mut self, tiny: f64) -> Result<FinishReport, String> {
+        let field = self.working.as_mut().ok_or("no working field")?;
+        let tiny_removed = field.clear_tiny(tiny);
+        let (worst, min_e) = field.cone_report();
+        let mut proj = 0;
+        if worst > 0.0 && worst <= 1e-3 {
+            proj = field.project_cone() as u32;
+        }
+        let total = field.total_energy();
+        self.pending_energy = total;
+        Ok(FinishReport { tiny_removed, worst_cone: worst, min_energy: min_e, cone_projections: proj, field_energy: total })
+    }
+    fn commit(&mut self) -> Result<(), String> {
+        self.committed = Some(self.working.take().ok_or("no working field")?);
+        self.committed_energy = self.pending_energy;
+        Ok(())
+    }
+    fn abort(&mut self) {
+        self.working = None;
     }
 }
 

@@ -69,6 +69,11 @@ cargo run --release -- run --config presets/vivid-field-ecology.toml --backend g
 cargo run --release -- run --config presets/target-20k-field-ecology.toml --backend gpu-fused --frame-every 0
 ```
 
+`--backend gpu-resident` keeps the field on the GPU across steps: transport,
+sensing, inference, uptake exchange and deposits run there, with deterministic
+per-cell reductions (counting sort by cell, bins sorted by organism index), so
+two runs on the same GPU are bit-identical and exact checkpoint/resume still
+works. `--backend gpu-field` runs only the field step on the GPU;
 `--backend gpu-fused` also moves the sensor pyramid and per-organism sensing to
 the GPU (inputs never leave it); it agrees with CPU sensing to ~1e-5 on logits
 and ~6e-5 relative on the motion drive and density.

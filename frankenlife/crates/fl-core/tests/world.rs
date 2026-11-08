@@ -303,3 +303,55 @@ fn reference_device_port_matches_built_in_path() {
     assert_eq!(a.state_hash(), b.state_hash(), "device port with reference arithmetic reproduces the built-in path");
     assert_eq!(a.ledger, b.ledger);
 }
+
+#[test]
+fn reference_resident_port_matches_built_in_path() {
+    let mut a = World::new(small()).unwrap();
+    let mut b = World::new(small()).unwrap();
+    for w in [&mut a, &mut b] {
+        w.schedule(20, Command::EraseDisk { x: 16.0, y: 16.0, radius: 5.0, disposal: Disposal::Recycle }).unwrap();
+        w.schedule(30, Command::EnergyBrush { x: 5.0, y: 9.0, radius: 3.0, amount: 7.5, direction: None }).unwrap();
+    }
+    let mut be = fl_core::ReferenceResident::default();
+    for _ in 0..120 {
+        a.step().unwrap();
+        b.step_inference(fl_core::Inference::Resident(&mut be)).unwrap();
+    }
+    assert!(b.field_on_device());
+    assert!(b.step().is_err(), "a CPU step while the field is on the device is refused");
+    b.sync_field(&mut be).unwrap();
+    assert!(a.totals.births > 0 && a.totals.deaths_user > 0);
+    assert_eq!(a.state_hash(), b.state_hash(), "resident port with reference arithmetic reproduces the built-in path");
+    assert_eq!(a.ledger, b.ledger);
+    b.detach_device(&mut be).unwrap();
+    a.step().unwrap();
+    b.step().unwrap();
+    assert_eq!(a.state_hash(), b.state_hash(), "detached world continues on the CPU");
+}
+
+#[test]
+fn resident_capacity_pause_keeps_committed_field() {
+    let mut c = small();
+    c.population.maximum_count = 256;
+    let mut w = World::new(c).unwrap();
+    let mut be = fl_core::ReferenceResident::default();
+    loop {
+        match w.step_inference(fl_core::Inference::Resident(&mut be)) {
+            Ok(_) => continue,
+            Err(TickError::CapacityPaused { .. }) => break,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let tick = w.tick;
+    let mut f1 = w.field.clone();
+    w.sync_field(&mut be).unwrap();
+    f1.clone_from(&w.field);
+    // Retrying the same tick after the pause starts from the same committed field.
+    let mut be2 = be.clone();
+    let _ = w.step_inference(fl_core::Inference::Resident(&mut be2));
+    assert_eq!(w.tick, tick);
+    let mut f2 = f1.clone();
+    w.sync_field(&mut be2).unwrap();
+    f2.clone_from(&w.field);
+    assert_eq!(f1, f2);
+}

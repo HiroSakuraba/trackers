@@ -27,12 +27,14 @@ use std::sync::mpsc;
 use fl_core::nn::{layer_dims, CATALOG, INPUT_WIDTH, OUTPUT_WIDTH};
 use fl_core::field::Field;
 use fl_core::sources::Source;
-use fl_core::{Config, ControllerBackend, FieldAccounting, FieldBackend, InferenceJob, SenseInferBackend, SenseJob, SenseOutput};
+use fl_core::{Config, ControllerBackend, FieldAccounting, FieldBackend, FieldDeposit, FinishReport, InferenceJob, ResidentBackend, SenseInferBackend, SenseJob, SenseOutput, UptakeJob, UptakeOut};
 
 const SHADER: &str = include_str!("mlp.wgsl");
 const SENSE_SHADER: &str = include_str!("sense.wgsl");
 const PYRAMID_SHADER: &str = include_str!("pyramid.wgsl");
 const FIELD_SHADER: &str = include_str!("field.wgsl");
+const RESIDENT_SHADER: &str = include_str!("resident.wgsl");
+const ITEM_STRIDE: usize = 36;
 const SOURCE_STRIDE: usize = 44;
 /// Floats per slot in the resident traits buffer: 33 motion sensitivities + padding.
 const TRAITS_STRIDE: usize = 36;
@@ -92,6 +94,7 @@ pub struct GpuStats {
     pub slab_growths: u64,
     pub last: EvalTiming,
     pub field_last: FieldTiming,
+    pub resident_last: ResidentTiming,
 }
 
 struct Slab {
@@ -124,6 +127,50 @@ struct SensePipelines {
     pyr_level0: wgpu::ComputePipeline,
     pyr_down: wgpu::ComputePipeline,
     pyr_layout: wgpu::BindGroupLayout,
+}
+
+struct ResidentPipelines {
+    layout: wgpu::BindGroupLayout,
+    bin_count: wgpu::ComputePipeline,
+    bin_scan: wgpu::ComputePipeline,
+    bin_scatter: wgpu::ComputePipeline,
+    bin_sort: wgpu::ComputePipeline,
+    uptake_demand: wgpu::ComputePipeline,
+    uptake_org: wgpu::ComputePipeline,
+    uptake_debit: wgpu::ComputePipeline,
+    deposit_gather: wgpu::ComputePipeline,
+    finish: wgpu::ComputePipeline,
+}
+
+/// Device-resident field state: the committed field plus exchange work buffers.
+struct ResidentState {
+    key: (usize, usize),
+    cells: usize,
+    ce: wgpu::Buffer,
+    cm: wgpu::Buffer,
+    committed_energy: f64,
+    pending_energy: f64,
+    // Work buffers (grown on demand).
+    items_cap: usize,
+    items: wgpu::Buffer,
+    counts: wgpu::Buffer,
+    starts: wgpu::Buffer,
+    sorted: wgpu::Buffer,
+    cell_aux: wgpu::Buffer,
+    outv: wgpu::Buffer,
+    staging: wgpu::Buffer,
+    uniform: wgpu::Buffer,
+    bind: Option<(u64, wgpu::BindGroup)>,
+}
+
+/// Where the time of the most recent resident exchange step went.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResidentTiming {
+    pub begin_ms: f64,
+    pub uptake_ms: f64,
+    pub deposit_ms: f64,
+    pub finish_ms: f64,
+    pub commit_ms: f64,
 }
 
 struct FieldPipelines {
@@ -197,6 +244,10 @@ pub struct GpuBackend {
     /// returned by `transport_and_sources` (lets fused sensing skip its upload).
     field_resident: bool,
     field_gpu: Option<FieldGpu>,
+    /// Bumped whenever `field_gpu` is rebuilt (its buffers change identity).
+    field_gen: u64,
+    res_pipes: ResidentPipelines,
+    resident: Option<ResidentState>,
     sense_io: Option<Io>,
     pub info: GpuInfo,
     pub stats: GpuStats,
@@ -338,6 +389,44 @@ impl GpuBackend {
                 cache: None,
             })
         };
+        let res_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("resident"), source: wgpu::ShaderSource::Wgsl(RESIDENT_SHADER.into()) });
+        let res_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("resident"),
+            entries: &[
+                uentry(0),
+                storage_entry(1, false),
+                storage_entry(2, false),
+                storage_entry(3, true),
+                storage_entry(4, false),
+                storage_entry(5, false),
+                storage_entry(6, false),
+                storage_entry(7, false),
+                storage_entry(8, false),
+            ],
+        });
+        let rpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("resident"), bind_group_layouts: &[Some(&res_layout)], immediate_size: 0 });
+        let mkr = |entry| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&rpl),
+                module: &res_module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let res_pipes = ResidentPipelines {
+            bin_count: mkr("bin_count"),
+            bin_scan: mkr("bin_scan"),
+            bin_scatter: mkr("bin_scatter"),
+            bin_sort: mkr("bin_sort"),
+            uptake_demand: mkr("uptake_demand"),
+            uptake_org: mkr("uptake_org"),
+            uptake_debit: mkr("uptake_debit"),
+            deposit_gather: mkr("deposit_gather"),
+            finish: mkr("finish"),
+            layout: res_layout,
+        };
         let field_pipes = FieldPipelines { diffuse: mkf("diffuse"), decay: mkf("decay"), source_norm: mkf("source_norm"), inject: mkf("inject"), tiny: mkf("tiny"), layout: field_layout };
         let timestamps = ts_ok.then(|| Timestamps {
             set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("kernel"), ty: wgpu::QueryType::Timestamp, count: 2 }),
@@ -353,7 +442,7 @@ impl GpuBackend {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
             max_buffer_bytes: limits.max_buffer_size,
         };
-        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, field_resident: false, field_gpu: None, sense_io: None, info, stats: GpuStats::default() })
+        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, field_resident: false, field_gpu: None, field_gen: 0, res_pipes, resident: None, sense_io: None, info, stats: GpuStats::default() })
     }
 
     pub fn capability(&self) -> String {
@@ -629,6 +718,7 @@ impl GpuBackend {
             return Ok(());
         }
         self.field_resident = false;
+        self.field_gen += 1;
         let src_cap = n_sources.max(64).next_power_of_two();
         if extra_levels + 1 > MAX_LEVELS {
             return Err(format!("{} pyramid levels exceed the GPU limit of {MAX_LEVELS}", extra_levels + 1));
@@ -934,6 +1024,15 @@ impl FieldBackend for GpuBackend {
     }
 
     fn transport_and_sources(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+        self.run_field_step(field, cfg, sources, n, false)
+    }
+}
+
+impl GpuBackend {
+    /// The field step. `resident`: the working field is already on the device and stays
+    /// there (only the accounting is read back); otherwise `field` is uploaded first and
+    /// the observation field is downloaded into it.
+    fn run_field_step(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64, resident: bool) -> Result<FieldAccounting, String> {
         self.field_resident = false;
         self.stats.field_last = FieldTiming::default();
         let host = std::time::Instant::now();
@@ -985,8 +1084,10 @@ impl FieldBackend for GpuBackend {
             sp[b + 10..b + 42].copy_from_slice(&s.chem);
         }
         self.queue.write_buffer(&fg.src, 0, f32_bytes(&sp));
-        self.queue.write_buffer(&fg.fe, 0, f32_bytes(&field.e));
-        self.queue.write_buffer(&fg.fm, 0, f32_bytes(&field.m));
+        if !resident {
+            self.queue.write_buffer(&fg.fe, 0, f32_bytes(&field.e));
+            self.queue.write_buffer(&fg.fm, 0, f32_bytes(&field.m));
+        }
         let fp = &self.field_pipes;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("field") });
         enc.clear_buffer(&fg.acct, 0, None);
@@ -1050,8 +1151,10 @@ impl FieldBackend for GpuBackend {
             run_pass(&mut enc, pipe, bind, grid, self.field_timestamps.as_ref());
         }
         let cells = field.cells() as u64;
-        enc.copy_buffer_to_buffer(&fg.fe, 0, &fg.fstaging, 0, cells * 4);
-        enc.copy_buffer_to_buffer(&fg.fm, 0, &fg.fstaging, cells * 4, cells * 32 * 4);
+        if !resident {
+            enc.copy_buffer_to_buffer(&fg.fe, 0, &fg.fstaging, 0, cells * 4);
+            enc.copy_buffer_to_buffer(&fg.fm, 0, &fg.fstaging, cells * 4, cells * 32 * 4);
+        }
         enc.copy_buffer_to_buffer(&fg.acct, 0, &fg.fstaging, cells * 33 * 4, cells * 3 * 4);
         if let Some(ts) = &self.field_timestamps {
             enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
@@ -1060,7 +1163,7 @@ impl FieldBackend for GpuBackend {
         self.stats.field_last.host_ms = host.elapsed().as_secs_f64() * 1e3;
         let round = std::time::Instant::now();
         self.queue.submit([enc.finish()]);
-        let slice = fg.fstaging.slice(..);
+        let slice = if resident { fg.fstaging.slice(cells * 33 * 4..cells * 36 * 4) } else { fg.fstaging.slice(..) };
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -1082,9 +1185,13 @@ impl FieldBackend for GpuBackend {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             let all: &[f32] = bytemuck::try_cast_slice(&view).map_err(|e| format!("field readback alignment: {e:?}"))?;
             let c = cells as usize;
-            field.e.copy_from_slice(&all[..c]);
-            field.m.copy_from_slice(&all[c..c * 33]);
-            let a = &all[c * 33..c * 36];
+            let a = if resident {
+                &all[..c * 3]
+            } else {
+                field.e.copy_from_slice(&all[..c]);
+                field.m.copy_from_slice(&all[c..c * 33]);
+                &all[c * 33..c * 36]
+            };
             for cell in 0..c {
                 acct.decay_removed += a[cell * 3] as f64;
                 acct.injected += a[cell * 3 + 1] as f64;
@@ -1095,6 +1202,343 @@ impl FieldBackend for GpuBackend {
         self.stats.field_last.roundtrip_ms = round.elapsed().as_secs_f64() * 1e3;
         self.field_resident = true;
         Ok(acct)
+    }
+}
+
+/// Bilinear stencil base cell and fractions (`grid-cic-v1`), as the CPU computes them.
+fn stencil_base(field_gx: usize, field_gy: usize, hx: f64, hy: f64, x: f64, y: f64) -> (u32, f32, f32) {
+    let fx = x / hx - 0.5;
+    let fy = y / hy - 0.5;
+    let ix = fx.floor();
+    let iy = fy.floor();
+    let x0 = (ix as i64).rem_euclid(field_gx as i64) as usize;
+    let y0 = (iy as i64).rem_euclid(field_gy as i64) as usize;
+    ((y0 * field_gx + x0) as u32, (fx - ix) as f32, (fy - iy) as f32)
+}
+
+impl GpuBackend {
+    fn res_geom(&self) -> Result<(usize, usize, f64, f64), String> {
+        let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
+        let (gx, gy) = (fg.key.0, fg.key.1);
+        let (hx, hy) = (fg.levels[0].3 as f64, fg.levels[0].4 as f64);
+        Ok((gx, gy, hx, hy))
+    }
+
+    fn deposit_items(&self, deps: &[FieldDeposit], hx: f64, hy: f64) -> Vec<f32> {
+        let (gx, gy, _, _) = self.res_geom().expect("geometry");
+        let mut v = Vec::with_capacity(deps.len() * ITEM_STRIDE);
+        for d in deps {
+            let (key, tx, ty, q, dir) = match *d {
+                FieldDeposit::Stencil { x, y, q, ref dir } => {
+                    let (k, tx, ty) = stencil_base(gx, gy, hx, hy, x, y);
+                    (k, tx, ty, q, dir)
+                }
+                FieldDeposit::Cell { cell, q, ref dir } => (cell as u32, 0.0, 0.0, q, dir),
+            };
+            v.extend_from_slice(&[f32::from_bits(key), tx, ty, q as f32]);
+            v.extend_from_slice(dir);
+        }
+        v
+    }
+
+    /// Make sure work buffers hold `n` items and the bind group matches the current field buffers.
+    fn ensure_res_work(&mut self, n: usize) -> Result<(), String> {
+        let gen = self.field_gen;
+        let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
+        let st = self.resident.as_mut().ok_or("resident state not initialized")?;
+        if n > st.items_cap {
+            let cap = n.next_power_of_two().max(1024);
+            use wgpu::BufferUsages as U;
+            let mk = |label, size: usize, usage| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size as u64, usage, mapped_at_creation: false });
+            let out_floats = (cap * 4).max(st.cells * 4);
+            st.items = mk("items", cap * ITEM_STRIDE * 4, U::STORAGE | U::COPY_DST);
+            st.sorted = mk("sorted", cap * 4, U::STORAGE);
+            st.outv = mk("res-out", out_floats * 4, U::STORAGE | U::COPY_SRC);
+            st.staging = mk("res-staging", out_floats * 4, U::MAP_READ | U::COPY_DST);
+            st.items_cap = cap;
+            st.bind = None;
+        }
+        if st.bind.as_ref().is_none_or(|(g, _)| *g != gen) {
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("resident"),
+                layout: &self.res_pipes.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: st.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: fg.fe.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: fg.fm.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: st.items.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: st.counts.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: st.starts.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: st.sorted.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: st.cell_aux.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: st.outv.as_entire_binding() },
+                ],
+            });
+            st.bind = Some((gen, bg));
+        }
+        Ok(())
+    }
+
+    fn write_res_uniform(&self, n_items: usize, ch: Option<&fl_core::config::ChemistryCfg>, tiny: f64) {
+        let st = self.resident.as_ref().expect("resident");
+        let (gx, gy) = st.key;
+        let items_grid = grid_for((n_items.max(1) as u32).div_ceil(64));
+        let cells_grid = grid_for((st.cells as u32).div_ceil(64));
+        let (emax, gain, thr, kappa) = ch.map_or((0.0, 0.0, 0.0, 0.0), |c| (c.maximum_efficiency, c.affinity_gain, c.discrimination_threshold, c.toxicity_sensitivity));
+        let w: [u32; 12] = [
+            gx as u32,
+            gy as u32,
+            n_items as u32,
+            items_grid.0,
+            (emax as f32).to_bits(),
+            (gain as f32).to_bits(),
+            (thr as f32).to_bits(),
+            (kappa as f32).to_bits(),
+            (tiny as f32).to_bits(),
+            cells_grid.0,
+            0,
+            0,
+        ];
+        self.queue.write_buffer(&st.uniform, 0, bytemuck::cast_slice(&w));
+    }
+
+    fn res_pass(&self, enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, grid: (u32, u32)) {
+        let st = self.resident.as_ref().expect("resident");
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("resident"), timestamp_writes: None });
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &st.bind.as_ref().expect("bind").1, &[]);
+        pass.dispatch_workgroups(grid.0, grid.1, 1);
+    }
+
+    /// Record the deterministic binning of `n` items (already uploaded) by base cell.
+    fn encode_binning(&self, enc: &mut wgpu::CommandEncoder, n: usize) {
+        let st = self.resident.as_ref().expect("resident");
+        let p = &self.res_pipes;
+        let items_grid = grid_for((n.max(1) as u32).div_ceil(64));
+        let cells_grid = grid_for((st.cells as u32).div_ceil(64));
+        enc.clear_buffer(&st.counts, 0, None);
+        self.res_pass(enc, &p.bin_count, items_grid);
+        self.res_pass(enc, &p.bin_scan, (1, 1));
+        self.res_pass(enc, &p.bin_scatter, items_grid);
+        self.res_pass(enc, &p.bin_sort, cells_grid);
+    }
+
+    fn read_res_out(&self, floats: usize) -> Result<Vec<f32>, String> {
+        let st = self.resident.as_ref().expect("resident");
+        let slice = st.staging.slice(0..(floats * 4) as u64);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
+        rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU readback: {e}"))?;
+        let out = {
+            let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
+            bytemuck::try_cast_slice::<u8, f32>(&view).map_err(|e| format!("readback alignment: {e:?}"))?.to_vec()
+        };
+        st.staging.unmap();
+        Ok(out)
+    }
+
+    /// Apply deposit items to the working field (no readback).
+    fn encode_deposits(&mut self, enc: &mut wgpu::CommandEncoder, deps: &[FieldDeposit]) -> Result<(), String> {
+        if deps.is_empty() {
+            return Ok(());
+        }
+        let (_, _, hx, hy) = self.res_geom()?;
+        let items = self.deposit_items(deps, hx, hy);
+        self.ensure_res_work(deps.len())?;
+        let st = self.resident.as_ref().expect("resident");
+        self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
+        self.write_res_uniform(deps.len(), None, 0.0);
+        self.encode_binning(enc, deps.len());
+        let cells_grid = grid_for((st.cells as u32).div_ceil(64));
+        self.res_pass(enc, &self.res_pipes.deposit_gather, cells_grid);
+        Ok(())
+    }
+}
+
+impl ResidentBackend for GpuBackend {
+    fn upload_committed(&mut self, field: &Field, cfg: &Config) -> Result<(), String> {
+        self.ensure_field(field, cfg.pyramid_levels(), cfg.sources.count as usize)?;
+        let cells = field.cells();
+        use wgpu::BufferUsages as U;
+        let mk = |label, size: usize, usage| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size as u64, usage, mapped_at_creation: false });
+        let st = ResidentState {
+            key: (field.gx, field.gy),
+            cells,
+            ce: mk("committed-e", cells * 4, U::STORAGE | U::COPY_SRC | U::COPY_DST),
+            cm: mk("committed-m", cells * 32 * 4, U::STORAGE | U::COPY_SRC | U::COPY_DST),
+            committed_energy: field.total_energy(),
+            pending_energy: 0.0,
+            items_cap: 0,
+            items: mk("items", 16, U::STORAGE | U::COPY_DST),
+            counts: mk("counts", cells * 4, U::STORAGE | U::COPY_DST),
+            starts: mk("starts", (cells + 1) * 4, U::STORAGE),
+            sorted: mk("sorted", 16, U::STORAGE),
+            cell_aux: mk("cell-aux", cells * 4, U::STORAGE),
+            outv: mk("res-out", 16, U::STORAGE | U::COPY_SRC),
+            staging: mk("res-staging", 16, U::MAP_READ | U::COPY_DST),
+            uniform: mk("res-uniform", 48, U::UNIFORM | U::COPY_DST),
+            bind: None,
+        };
+        self.queue.write_buffer(&st.ce, 0, f32_bytes(&field.e));
+        self.queue.write_buffer(&st.cm, 0, f32_bytes(&field.m));
+        self.resident = Some(st);
+        self.ensure_res_work(1)?;
+        Ok(())
+    }
+
+    fn download_committed(&mut self, field: &mut Field) -> Result<(), String> {
+        let st = self.resident.as_ref().ok_or("nothing uploaded")?;
+        let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
+        let cells = st.cells as u64;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("download") });
+        enc.copy_buffer_to_buffer(&st.ce, 0, &fg.fstaging, 0, cells * 4);
+        enc.copy_buffer_to_buffer(&st.cm, 0, &fg.fstaging, cells * 4, cells * 32 * 4);
+        self.queue.submit([enc.finish()]);
+        let slice = fg.fstaging.slice(0..cells * 33 * 4);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
+        rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU readback: {e}"))?;
+        {
+            let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
+            let all: &[f32] = bytemuck::try_cast_slice(&view).map_err(|e| format!("readback alignment: {e:?}"))?;
+            let c = cells as usize;
+            field.e.resize(c, 0.0);
+            field.m.resize(c * 32, 0.0);
+            field.e.copy_from_slice(&all[..c]);
+            field.m.copy_from_slice(&all[c..c * 33]);
+        }
+        fg.fstaging.unmap();
+        Ok(())
+    }
+
+    fn committed_energy(&self) -> f64 {
+        self.resident.as_ref().map_or(0.0, |s| s.committed_energy)
+    }
+
+    fn begin_tick(&mut self, ops: &[FieldDeposit]) -> Result<(), String> {
+        let t = std::time::Instant::now();
+        self.stats.resident_last = ResidentTiming::default();
+        self.field_resident = false;
+        let st = self.resident.as_ref().ok_or("nothing uploaded")?;
+        let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
+        let cells = st.cells as u64;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("begin") });
+        enc.copy_buffer_to_buffer(&st.ce, 0, &fg.fe, 0, cells * 4);
+        enc.copy_buffer_to_buffer(&st.cm, 0, &fg.fm, 0, cells * 32 * 4);
+        self.encode_deposits(&mut enc, ops)?;
+        self.queue.submit([enc.finish()]);
+        self.stats.resident_last.begin_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
+
+    fn transport_resident(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+        let st = self.resident.as_ref().ok_or("nothing uploaded")?;
+        let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
+        let mut geom = Field { gx: st.key.0, gy: st.key.1, hx: fg.levels[0].3 as f64, hy: fg.levels[0].4 as f64, e: Vec::new(), m: Vec::new() };
+        // Use the exact f64 spacing from the configuration (levels store f32).
+        let (hx, hy) = cfg.cell_size();
+        geom.hx = hx;
+        geom.hy = hy;
+        self.run_field_step(&mut geom, cfg, sources, n, true)
+    }
+
+    fn uptake(&mut self, ch: &fl_core::config::ChemistryCfg, jobs: &[UptakeJob<'_>], out: &mut [UptakeOut]) -> Result<f64, String> {
+        let t = std::time::Instant::now();
+        if jobs.is_empty() {
+            return Ok(0.0);
+        }
+        let (gx, gy, hx, hy) = self.res_geom()?;
+        let mut items = Vec::with_capacity(jobs.len() * ITEM_STRIDE);
+        for j in jobs {
+            let (k, tx, ty) = stencil_base(gx, gy, hx, hy, j.x, j.y);
+            items.extend_from_slice(&[f32::from_bits(k), tx, ty, j.demand as f32]);
+            items.extend_from_slice(&j.genome.affinity);
+        }
+        self.ensure_res_work(jobs.len())?;
+        let st = self.resident.as_ref().expect("resident");
+        self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
+        self.write_res_uniform(jobs.len(), Some(ch), 0.0);
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("uptake") });
+        self.encode_binning(&mut enc, jobs.len());
+        let p = &self.res_pipes;
+        let items_grid = grid_for((jobs.len() as u32).div_ceil(64));
+        let cells_grid = grid_for((st.cells as u32).div_ceil(64));
+        self.res_pass(&mut enc, &p.uptake_demand, cells_grid);
+        self.res_pass(&mut enc, &p.uptake_org, items_grid);
+        self.res_pass(&mut enc, &p.uptake_debit, cells_grid);
+        enc.copy_buffer_to_buffer(&st.outv, 0, &st.staging, 0, (jobs.len() * 16) as u64);
+        self.queue.submit([enc.finish()]);
+        let res = self.read_res_out(jobs.len() * 4)?;
+        let mut granted = 0.0;
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = UptakeOut { absorbed: res[k * 4] as f64, useful_gain: res[k * 4 + 1] as f64, toxicity_requested: res[k * 4 + 2] as f64 };
+            granted += o.absorbed;
+        }
+        self.stats.resident_last.uptake_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(granted)
+    }
+
+    fn deposit(&mut self, deposits: &[FieldDeposit]) -> Result<(), String> {
+        let t = std::time::Instant::now();
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("deposit") });
+        self.encode_deposits(&mut enc, deposits)?;
+        self.queue.submit([enc.finish()]);
+        self.stats.resident_last.deposit_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
+
+    fn finish(&mut self, tiny: f64) -> Result<FinishReport, String> {
+        let t = std::time::Instant::now();
+        self.ensure_res_work(1)?;
+        self.write_res_uniform(0, None, tiny);
+        let st = self.resident.as_ref().expect("resident");
+        let cells = st.cells;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("finish") });
+        self.res_pass(&mut enc, &self.res_pipes.finish, grid_for((cells as u32).div_ceil(64)));
+        enc.copy_buffer_to_buffer(&st.outv, 0, &st.staging, 0, (cells * 16) as u64);
+        self.queue.submit([enc.finish()]);
+        let rows = self.read_res_out(cells * 4)?;
+        let mut rep = FinishReport { worst_cone: f64::NEG_INFINITY, min_energy: f64::INFINITY, ..Default::default() };
+        for c in 0..cells {
+            let e = rows[c * 4] as f64;
+            rep.field_energy += e;
+            rep.tiny_removed += rows[c * 4 + 1] as f64;
+            rep.worst_cone = rep.worst_cone.max(rows[c * 4 + 2] as f64);
+            rep.min_energy = rep.min_energy.min(e);
+            rep.cone_projections += (rows[c * 4 + 3] > 0.5) as u32;
+        }
+        if rep.worst_cone < 0.0 {
+            rep.worst_cone = -1.0;
+        }
+        self.resident.as_mut().expect("resident").pending_energy = rep.field_energy;
+        self.stats.resident_last.finish_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(rep)
+    }
+
+    fn commit(&mut self) -> Result<(), String> {
+        let t = std::time::Instant::now();
+        let st = self.resident.as_mut().ok_or("nothing uploaded")?;
+        let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
+        let cells = st.cells as u64;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("commit") });
+        enc.copy_buffer_to_buffer(&fg.fe, 0, &st.ce, 0, cells * 4);
+        enc.copy_buffer_to_buffer(&fg.fm, 0, &st.cm, 0, cells * 32 * 4);
+        self.queue.submit([enc.finish()]);
+        st.committed_energy = st.pending_energy;
+        self.field_resident = false;
+        self.stats.resident_last.commit_ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        // The working field is simply discarded; the next begin_tick recopies the committed field.
+        self.field_resident = false;
     }
 }
 
@@ -1330,5 +1774,99 @@ mod tests {
         assert!(rel < 1e-5);
         assert!(w.totals.births > 0);
         assert!(w.orgs.len() > 500);
+    }
+
+    #[test]
+    fn resident_tick_matches_cpu_reference() {
+        let Ok(mut gpu) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut w = fl_core::World::new(vivid_small()).unwrap();
+        for _ in 0..120 {
+            w.step().unwrap();
+        }
+        let cfg = w.cfg.clone();
+        let mut cpu = fl_core::ReferenceResident::default();
+        let mut srcs = w.sources.clone();
+        for s in &mut srcs {
+            s.advance_to(w.tick, &cfg, &w.rng);
+        }
+        let o = &w.orgs;
+        let dirs: Vec<[f32; 32]> = (0..o.len()).map(|i| o.genome[i].affinity).collect();
+        let ops = vec![
+            FieldDeposit::Cell { cell: 77, q: 3.0, dir: [0.0; 32] },
+            FieldDeposit::Stencil { x: 10.3, y: 99.7, q: 1.5, dir: dirs[0] },
+        ];
+        let jobs: Vec<UptakeJob<'_>> = (0..o.len()).map(|i| UptakeJob { x: o.x[i], y: o.y[i], demand: 0.003 * (1 + i % 5) as f64, genome: &o.genome[i] }).collect();
+        let deps: Vec<FieldDeposit> = (0..o.len()).step_by(3).map(|i| FieldDeposit::Stencil { x: o.x[i], y: o.y[i], q: 0.01, dir: dirs[i] }).collect();
+        let mut fa = w.field.clone();
+        let mut fb = w.field.clone();
+        let mut ua = vec![UptakeOut::default(); jobs.len()];
+        let mut ub = vec![UptakeOut::default(); jobs.len()];
+        let mut reports = Vec::new();
+        for (be, uo) in [(&mut gpu as &mut dyn ResidentBackend, &mut ua), (&mut cpu as &mut dyn ResidentBackend, &mut ub)] {
+            be.upload_committed(&w.field, &cfg).unwrap();
+            be.begin_tick(&ops).unwrap();
+            let acct = be.transport_resident(&cfg, &srcs, w.tick).unwrap();
+            let granted = be.uptake(&cfg.chemistry, &jobs, uo).unwrap();
+            be.deposit(&deps).unwrap();
+            let fin = be.finish(cfg.world.tiny_energy_threshold).unwrap();
+            be.commit().unwrap();
+            reports.push((acct, granted, fin, be.committed_energy()));
+        }
+        gpu.download_committed(&mut fa).unwrap();
+        cpu.download_committed(&mut fb).unwrap();
+        let rel = |x: f64, y: f64| (x - y).abs() / y.abs().max(1e-9);
+        let (ga, gb) = (&reports[0], &reports[1]);
+        let mut du = 0.0f64;
+        for (x, y) in ua.iter().zip(&ub) {
+            du = du.max((x.absorbed - y.absorbed).abs() / (1e-6 + y.absorbed.abs()));
+            du = du.max((x.useful_gain - y.useful_gain).abs() / (1e-6 + y.absorbed.abs()));
+            du = du.max((x.toxicity_requested - y.toxicity_requested).abs() / (1e-6 + y.absorbed.abs()));
+        }
+        let emax = fb.e.iter().fold(0.0f32, |m, &v| m.max(v)) as f64;
+        let de = fa.e.iter().zip(&fb.e).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max) / emax;
+        let dm = fa.m.iter().zip(&fb.m).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max) / emax;
+        eprintln!(
+            "resident vs cpu: uptake {du:.2e}, granted {:.2e}, field e {de:.2e} m {dm:.2e}, energy {:.2e}, injected {:.2e}, cone {:.2e}/{:.2e}, projections {}/{}",
+            rel(ga.1, gb.1), rel(ga.3, gb.3), rel(ga.0.injected, gb.0.injected), ga.2.worst_cone, gb.2.worst_cone, ga.2.cone_projections, gb.2.cone_projections
+        );
+        assert!(du < 1e-4, "uptake differs by {du}");
+        assert!(rel(ga.1, gb.1) < 1e-5, "granted total");
+        assert!(de < 1e-5 && dm < 1e-5, "committed field differs (e {de}, m {dm})");
+        assert!(rel(ga.3, gb.3) < 1e-6, "committed energy");
+        assert!((ga.2.tiny_removed - gb.2.tiny_removed).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resident_gpu_world_is_deterministic_and_closes_its_ledger() {
+        let Ok(mut g1) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut g2 = GpuBackend::new().unwrap();
+        let mut a = fl_core::World::new(vivid_small()).unwrap();
+        let mut b = fl_core::World::new(vivid_small()).unwrap();
+        a.schedule(50, fl_core::Command::EraseDisk { x: 60.0, y: 60.0, radius: 12.0, disposal: fl_core::Disposal::Recycle }).unwrap();
+        b.schedule(50, fl_core::Command::EraseDisk { x: 60.0, y: 60.0, radius: 12.0, disposal: fl_core::Disposal::Recycle }).unwrap();
+        for _ in 0..200 {
+            a.step_inference(fl_core::Inference::Resident(&mut g1)).unwrap();
+            b.step_inference(fl_core::Inference::Resident(&mut g2)).unwrap();
+        }
+        a.sync_field(&mut g1).unwrap();
+        b.sync_field(&mut g2).unwrap();
+        assert_eq!(a.state_hash(), b.state_hash(), "two GPU-resident runs are bit-identical");
+        for _ in 200..640 {
+            a.step_inference(fl_core::Inference::Resident(&mut g1)).unwrap();
+        }
+        a.sync_field(&mut g1).unwrap();
+        let l = &a.ledger;
+        let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+        let rel = (a.total_energy() - expected).abs() / l.transferred.max(1.0);
+        eprintln!("resident world: births {}, user deaths {}, population {}, residual {:.2e} ({rel:.2e} of transfers)", a.totals.births, a.totals.deaths_user, a.orgs.len(), l.residual);
+        assert!(rel < 1e-5);
+        assert!(a.totals.births > 0 && a.totals.deaths_user > 0);
+        assert!(a.orgs.len() > 500);
     }
 }
