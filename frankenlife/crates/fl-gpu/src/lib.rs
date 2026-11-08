@@ -56,11 +56,21 @@ struct Slab {
     dims: Vec<(usize, usize)>,
     /// Floats per slot for each layer: `in*out + out`.
     stride: Vec<usize>,
-    buffers: Vec<wgpu::Buffer>,
-    cap: usize,
+    /// Weight pages: each page holds up to `page_slots` organisms in one buffer per
+    /// layer, so no buffer exceeds the adapter's storage-binding limit (sharding).
+    pages: Vec<Vec<wgpu::Buffer>>,
+    page_slots: usize,
+    /// Capacity of the last (growing) page; earlier pages are full-size.
+    last_cap: usize,
     owner: Vec<Option<u64>>,
     last_used: Vec<u64>,
     free: Vec<usize>,
+}
+
+impl Slab {
+    fn cap(&self) -> usize {
+        if self.pages.is_empty() { 0 } else { (self.pages.len() - 1) * self.page_slots + self.last_cap }
+    }
 }
 
 struct Io {
@@ -146,8 +156,10 @@ impl GpuBackend {
         let slabs = (0..CATALOG.len())
             .map(|t| {
                 let dims = layer_dims(CATALOG[t]);
-                let stride = dims.iter().map(|&(i, o)| i * o + o).collect();
-                Slab { dims, stride, buffers: Vec::new(), cap: 0, owner: Vec::new(), last_used: Vec::new(), free: Vec::new() }
+                let stride: Vec<usize> = dims.iter().map(|&(i, o)| i * o + o).collect();
+                let widest = *stride.iter().max().expect("layers") as u64 * 4;
+                let page_slots = ((limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size) / widest).clamp(1, 1 << 20) as usize;
+                Slab { dims, stride, pages: Vec::new(), page_slots, last_cap: 0, owner: Vec::new(), last_used: Vec::new(), free: Vec::new() }
             })
             .collect();
         let info = GpuInfo {
@@ -170,52 +182,56 @@ impl GpuBackend {
 
     /// Bytes of GPU weight slabs currently allocated (capacity, including free slots).
     pub fn resident_bytes(&self) -> u64 {
-        self.slabs.iter().map(|s| s.stride.iter().map(|&st| (s.cap * st * 4) as u64).sum::<u64>()).sum()
+        self.slabs.iter().map(|s| s.stride.iter().map(|&st| (s.cap() * st * 4) as u64).sum::<u64>()).sum()
+    }
+
+    /// Weight pages currently allocated across all topologies.
+    pub fn pages(&self) -> usize {
+        self.slabs.iter().map(|s| s.pages.len()).sum()
+    }
+
+    /// Cap organisms per weight page (testing / tuning). Only before any genome is uploaded.
+    pub fn set_max_page_slots(&mut self, slots: usize) -> Result<(), String> {
+        if self.slabs.iter().any(|s| !s.pages.is_empty()) {
+            return Err("page size can only change before the first upload".into());
+        }
+        for s in &mut self.slabs {
+            s.page_slots = s.page_slots.min(slots.max(1));
+        }
+        Ok(())
     }
 
     fn grow(&mut self, t: usize) -> Result<(), String> {
         let slab = &mut self.slabs[t];
-        // Double, but never past what one storage binding of this adapter can hold.
-        let widest = *slab.stride.iter().max().expect("layers") as u64 * 4;
-        let limit_slots = (self.info.max_storage_binding_bytes.min(self.info.max_buffer_bytes) / widest) as usize;
-        let new_cap = (slab.cap * 2).max(64).min(limit_slots);
-        if new_cap <= slab.cap {
-            return Err(format!(
-                "topology {:?}: this GPU's {} MiB storage-binding limit holds at most {} organisms per topology (weight sharding is not implemented yet; on Windows try WGPU_BACKEND=vulkan)",
-                CATALOG[t],
-                self.info.max_storage_binding_bytes >> 20,
-                limit_slots
-            ));
-        }
+        let new_page = slab.pages.is_empty() || slab.last_cap >= slab.page_slots;
+        let old_cap = if new_page { 0 } else { slab.last_cap };
+        let new_cap = if new_page { slab.page_slots.min(64) } else { (old_cap * 2).min(slab.page_slots) };
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grow") });
         let mut fresh = Vec::with_capacity(slab.stride.len());
         for (l, &st) in slab.stride.iter().enumerate() {
-            let size = (new_cap * st * 4) as u64;
-            if size > self.info.max_storage_binding_bytes || size > self.info.max_buffer_bytes {
-                return Err(format!(
-                    "topology {:?} layer {l} needs a {} MiB weight buffer for {new_cap} organisms; this GPU allows {} MiB per binding (sharding is not implemented yet)",
-                    CATALOG[t],
-                    size >> 20,
-                    self.info.max_storage_binding_bytes >> 20
-                ));
-            }
             let b = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("weights"),
-                size,
+                size: (new_cap * st * 4) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            if slab.cap > 0 {
-                enc.copy_buffer_to_buffer(&slab.buffers[l], 0, &b, 0, (slab.cap * st * 4) as u64);
+            if old_cap > 0 {
+                enc.copy_buffer_to_buffer(&slab.pages.last().expect("page")[l], 0, &b, 0, (old_cap * st * 4) as u64);
             }
             fresh.push(b);
         }
         self.queue.submit([enc.finish()]);
-        slab.buffers = fresh;
-        slab.free.extend((slab.cap..new_cap).rev());
-        slab.owner.resize(new_cap, None);
-        slab.last_used.resize(new_cap, 0);
-        slab.cap = new_cap;
+        let before = slab.cap();
+        if new_page {
+            slab.pages.push(fresh);
+        } else {
+            *slab.pages.last_mut().expect("page") = fresh;
+        }
+        slab.last_cap = new_cap;
+        let after = slab.cap();
+        slab.free.extend((before..after).rev());
+        slab.owner.resize(after, None);
+        slab.last_used.resize(after, 0);
         self.stats.slab_growths += 1;
         Ok(())
     }
@@ -232,7 +248,8 @@ impl GpuBackend {
             }
             tw[i * o..].copy_from_slice(&params[off + i * o..off + i * o + o]);
             off += i * o + o;
-            self.queue.write_buffer(&slab.buffers[l], (slot * slab.stride[l] * 4) as u64, &f32_bytes(&tw));
+            let (page, local) = (slot / slab.page_slots, slot % slab.page_slots);
+            self.queue.write_buffer(&slab.pages[page][l], (local * slab.stride[l] * 4) as u64, &f32_bytes(&tw));
         }
     }
 
@@ -252,7 +269,7 @@ impl GpuBackend {
         });
     }
 
-    fn run_topology(&mut self, t: usize, slots: &[u32], inputs: &[f32]) -> Result<Vec<f32>, String> {
+    fn run_topology(&mut self, t: usize, page: usize, slots: &[u32], inputs: &[f32]) -> Result<Vec<f32>, String> {
         let n = slots.len();
         self.ensure_io(n);
         let io = self.io.as_ref().expect("io allocated");
@@ -271,7 +288,7 @@ impl GpuBackend {
         self.queue.write_buffer(&self.uniform, 0, &ub);
         self.queue.write_buffer(&io.slots, 0, &slots.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>());
         self.queue.write_buffer(&io.inputs, 0, &f32_bytes(inputs));
-        let w = |l: usize| slab.buffers.get(l).unwrap_or(&self.dummy).as_entire_binding();
+        let w = |l: usize| slab.pages[page].get(l).unwrap_or(&self.dummy).as_entire_binding();
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mlp"),
             layout: &self.layout,
@@ -313,7 +330,7 @@ impl GpuBackend {
 
     fn evict_stale(&mut self) {
         for slab in &mut self.slabs {
-            for slot in 0..slab.cap {
+            for slot in 0..slab.cap() {
                 if let Some(g) = slab.owner[slot] {
                     if self.call - slab.last_used[slot] > EVICT_AFTER_CALLS {
                         slab.owner[slot] = None;
@@ -357,17 +374,19 @@ impl ControllerBackend for GpuBackend {
             self.slabs[t].last_used[slot] = self.call;
             placed.push((t, slot));
         }
-        for t in 0..self.slabs.len() {
-            let mine: Vec<usize> = (0..jobs.len()).filter(|&k| placed[k].0 == t).collect();
-            if mine.is_empty() {
-                continue;
-            }
-            let slots: Vec<u32> = mine.iter().map(|&k| placed[k].1 as u32).collect();
+        // One dispatch per (topology, weight page) that has work.
+        let mut groups: Vec<(usize, usize)> = placed.iter().map(|&(t, slot)| (t, slot / self.slabs[t].page_slots)).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for (t, page) in groups {
+            let ps = self.slabs[t].page_slots;
+            let mine: Vec<usize> = (0..jobs.len()).filter(|&k| placed[k].0 == t && placed[k].1 / ps == page).collect();
+            let slots: Vec<u32> = mine.iter().map(|&k| (placed[k].1 % ps) as u32).collect();
             let mut inputs = Vec::with_capacity(mine.len() * INPUT_WIDTH);
             for &k in &mine {
                 inputs.extend_from_slice(jobs[k].input);
             }
-            let res = self.run_topology(t, &slots, &inputs)?;
+            let res = self.run_topology(t, page, &slots, &inputs)?;
             for (r, &k) in mine.iter().enumerate() {
                 out[k].copy_from_slice(&res[r * OUTPUT_WIDTH..(r + 1) * OUTPUT_WIDTH]);
             }
@@ -412,5 +431,26 @@ mod tests {
         assert!(d < 1e-4, "max |Δlogit| = {d}");
         assert_eq!(gpu.stats.genome_uploads, jobs.len() as u64, "weights stay resident between calls");
         assert_ne!(a[0], a[1], "independent genomes give independent outputs");
+    }
+
+    #[test]
+    fn sharded_pages_match_reference() {
+        let Ok(mut gpu) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        gpu.set_max_page_slots(100).unwrap(); // force several pages and partial last pages
+        let cfg = Config::reference();
+        let rng = SemanticRng::new(11);
+        let genomes: Vec<_> = (0..357u64).map(|i| founder(&cfg, &rng, i, i)).collect();
+        let inputs: Vec<[f32; INPUT_WIDTH]> = (0..genomes.len()).map(|g| std::array::from_fn(|i| ((g * 13 + i * 7) % 200) as f32 / 100.0 - 1.0)).collect();
+        let jobs: Vec<InferenceJob<'_>> = genomes.iter().zip(&inputs).map(|(g, x)| InferenceJob { organism: g.id, genome: g, input: x }).collect();
+        let mut a = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
+        let mut b = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
+        gpu.evaluate(&jobs, &mut a).unwrap();
+        ReferenceBackend.evaluate(&jobs, &mut b).unwrap();
+        assert_eq!(gpu.pages(), 4, "357 organisms over 100-slot pages");
+        let d = a.iter().zip(&b).flat_map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs())).fold(0.0f32, f32::max);
+        assert!(d < 1e-4, "max |Δlogit| = {d}");
     }
 }

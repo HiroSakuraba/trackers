@@ -43,13 +43,24 @@ $env:WGPU_BACKEND = "dx12";   cargo run --release -- gpu-check
 Remove-Item Env:WGPU_BACKEND
 ```
 
-Bigger populations or networks: `cargo run --release -- gpu-check --organisms 32768 --hidden 128,96`.
+The plan's full target (80,000 independent networks, ~3 GB of weights):
+`cargo run --release -- gpu-check --organisms 80000`. Other sizes:
+`cargo run --release -- gpu-check --organisms 32768 --hidden 128,96`.
 
 ## 4. Run a world on the GPU
 
 ```powershell
 cargo run --release -- run --config presets\vivid-field-ecology.toml --backend gpu --seconds 30 --frame-every 32 --out runs\gpu
 ```
+
+The full 80,000-organism target world:
+
+```powershell
+cargo run --release -- run --config presets\target-80k-field-ecology.toml --backend gpu --seconds 5 --frame-every 64 --out runs\t80
+```
+
+It works, but expect it to be slow until the field moves to the GPU: its
+1024² field (33 planes) and the sensing for 80,000 organisms still run on the CPU.
 
 Frames go to `runs\gpu\frames`, plus `metrics.jsonl` and `manifest.json`. For a
 pure speed measurement use `--frame-every 0` (frames are drawn on the CPU).
@@ -62,8 +73,8 @@ Compare with `--backend cpu`.
   inference alone does. Moving the field kernels over is the next step.
 - A GPU run agrees with the CPU reference to about 1e-6 per logit, not bitwise,
   so its trajectory (and state hash) differs from a CPU run with the same seed.
-- At 9,988 parameters per organism, one weight buffer holds about 80,000
-  organisms per topology on DX12/Vulkan; beyond that sharding is needed (not
-  implemented yet). 8 GB of VRAM fits roughly 150,000 such organisms, so the
-  plan's 400,000-organism target does not fit on this card at F32.
+- Weights are split into pages that each fit one GPU storage binding, so
+  population is limited by VRAM, not by a single buffer. The plan's
+  80,000-organism target needs about 3 GB of F32 weights at 9,988 parameters
+  each, which fits the 1080's 8 GB; roughly 150,000 such organisms is the ceiling.
 - If anything fails, send the full `gpu-check` output.

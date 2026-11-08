@@ -48,7 +48,7 @@ Needs `rustup target add wasm32-unknown-unknown`.
 
 ```bash
 cd frankenlife
-cargo test --release                      # 46 tests (the GPU test skips without an adapter)
+cargo test --release                      # 47 tests (the GPU tests skip without an adapter)
 cargo run --release -- validate           # derived capacity & cost report for the reference preset
 cargo run --release -- run --config presets/vivid-field-ecology.toml \
     --seconds 45 --frame-every 4 --size 720 --out runs/vivid
@@ -67,6 +67,11 @@ GPU inference (wgpu: DX12 / Vulkan / Metal) — see [WINDOWS-GPU.md](WINDOWS-GPU
 cargo run --release -- gpu-check                     # open the GPU, verify against the CPU, benchmark
 cargo run --release -- run --config presets/vivid-field-ecology.toml --backend gpu --seconds 30
 ```
+
+The full-scale workload from the revised plan (80,000 organisms, 1024² field):
+`presets/target-80k-field-ecology.toml` (a workload definition, not a qualified
+ecology). The plan itself, revised to the 80,000 target, is in
+[docs/FrankenLife_Design_Plan.html](docs/FrankenLife_Design_Plan.html).
 
 Checkpoints and branches:
 
@@ -103,7 +108,7 @@ Everything below follows the plan's equations; section numbers refer to it.
 | Lifecycle (§7.4–7.6) | Hazard → `expm1` probability, one Bernoulli per eligible tick, viability checks, birth cost, cooldowns, disk-uniform child offsets; exhaustion re-checked after every budget stage; residual-energy recycling. |
 | Tick (§8) | All 10 phases in order, computed into a **candidate** state; publication only after invariant checks. A capacity pause or numerical fault leaves the committed world bit-identical. |
 | Ledger (§4.4) | Per tick and cumulative `ΔE = I − O − D + ε` with a 9-way dissipation breakdown; residual reported, never silently corrected. |
-| Backends (§10, §18.3) | `ControllerBackend` port (`World::step_with`): the scalar reference is built in; `integration/fl-torch` provides FrankenTorch and `crates/fl-gpu` a wgpu GPU backend (`--backend gpu`; logits within 6e-7 of the reference at 4,096 × 9,988 params on a software Vulkan driver). A reference run through the port reproduces the built-in state hash. |
+| Backends (§10, §18.3) | `ControllerBackend` port (`World::step_with`): the scalar reference is built in; `integration/fl-torch` provides FrankenTorch and `crates/fl-gpu` a wgpu GPU backend (`--backend gpu`; weights sharded into binding-sized pages; logits within 7.2e-7 of the reference at 80,000 × 9,988 params on a software Vulkan driver). A reference run through the port reproduces the built-in state hash. |
 | Randomness (§16.2) | Counter-based Philox4x32-10 addressed by `(lane, stable id, tick, candidate, draw)` — never by slot or schedule. State hashes are identical for 1 and 4 worker threads. |
 | Capacity (§7.5) | Live-count and logical-genome-byte quotas; research `pause-before-commit` or exhibition `reject-births-stable-order`. |
 | Checkpoints (§16.3) | `FLCK` v1 container with FNV-1a checksum: effective config, field planes, all organism hot state incl. held outputs/phases/cooldowns/energy history, genome bank, source paths, ID counters, pending future commands, ledger. `save(load(x)) == x`; resume is bit-identical (C.13 test, and CLI hash check). Refuses foreign model versions and corrupt files. |
@@ -154,7 +159,7 @@ Still missing:
   colors in `DotCloud` (organisms are bucketed into 12 colors).
 - **FrankenSQLite** run catalog and crash recovery; checkpoints are plain files
   storing full F32 genomes (~165 MB at 4,096 organisms) without deduplication.
-- Scale: 25k (M2) and 400k (M4) profiles, deterministic GPU reductions,
+- Scale: 25k (M2) and 80k (M4) qualification, deterministic GPU reductions,
   timestep-refinement studies, ablations, seed gallery.
 
 `mutation.rng` in the presets is `fl-philox-semantic-v1` (this crate's own
