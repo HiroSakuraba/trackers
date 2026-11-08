@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 fl-core = { path = "../fl-core" }
+fl-view = { path = "../fl-view" }
 serde.workspace = true
 serde_json.workspace = true
 png.workspace = true

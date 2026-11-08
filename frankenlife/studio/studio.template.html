@@ -1,0 +1,435 @@
+<title>FrankenLife Studio</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=Chivo+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: an instrument — the specimen (canvas) dominates; a narrow control
+   column of stage controls, honest clocks and an organism readout sits beside it,
+   stacking underneath on phones. Single deliberate dark look (a darkfield microscope). */
+:root {
+  color-scheme: dark;
+  --ink: #e6eef2;          /* primary text */
+  --dim: #8a9aa6;          /* secondary text */
+  --ground: #05070d;       /* page */
+  --panel: #0b1019;        /* control column */
+  --rule: #1b2433;         /* hairlines */
+  --teal: #2dd4bf;         /* accent: live / primary action */
+  --amber: #fbbf24;        /* attention: pending command, paused */
+  --rose: #fb7185;         /* destructive tool */
+  --display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --body: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --mono: "Chivo Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+html, body { height: 100%; }
+body {
+  background: var(--ground); color: var(--ink); font-family: var(--body); font-size: 14px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 16px;
+  box-sizing: border-box;
+}
+* { box-sizing: border-box; }
+.app { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; height: 100%; min-height: 560px; }
+@media (max-width: 860px) { .app { grid-template-columns: minmax(0, 1fr); height: auto; } }
+.stage { position: relative; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.titlebar { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+h1 { font-family: var(--display); font-stretch: 125%; font-weight: 800; font-size: 20px; letter-spacing: 0.02em; margin: 0; text-wrap: balance; }
+.model { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+.viewport { position: relative; flex: 1; min-height: 320px; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; background: #020308; }
+@media (max-width: 860px) { .viewport { flex: none; aspect-ratio: 1; max-width: 100%; } }
+canvas#world { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: crosshair; }
+.hud { position: absolute; left: 10px; top: 8px; font-family: var(--mono); font-size: 11.5px; line-height: 1.55; color: #c8d6df; text-shadow: 0 0 6px #000; pointer-events: none; font-variant-numeric: tabular-nums; }
+.hud b { color: var(--teal); font-weight: 600; }
+.badge { position: absolute; right: 10px; bottom: 8px; font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid currentColor; pointer-events: none; }
+.badge.run { color: var(--teal); } .badge.pause { color: var(--amber); }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+button, select, input[type=number] {
+  font: 600 13px var(--body); color: var(--ink); background: #111826; border: 1px solid #263246; border-radius: 6px; padding: 7px 11px;
+}
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: #3a4a64; }
+button:disabled { opacity: 0.45; cursor: default; }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+button.primary { background: var(--teal); color: #03201c; border-color: var(--teal); }
+button[aria-pressed="true"] { border-color: var(--teal); color: var(--teal); }
+button[aria-pressed="true"].danger { border-color: var(--rose); color: var(--rose); }
+.seg { display: inline-flex; border: 1px solid #263246; border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: transparent; padding: 7px 10px; }
+.seg button + button { border-left: 1px solid #263246; }
+label.inline { display: inline-flex; gap: 6px; align-items: center; color: var(--dim); font-size: 12px; }
+input[type=range] { accent-color: var(--teal); width: 110px; }
+aside { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 14px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; min-width: 0; }
+section h2 { font-family: var(--display); font-stretch: 112%; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); margin: 0 0 8px; font-weight: 700; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.grid2 label { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--dim); }
+.grid2 select, .grid2 input { width: 100%; }
+dl.readout { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 0; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+dl.readout dt { color: var(--dim); }
+dl.readout dd { margin: 0; text-align: right; }
+canvas.spark { width: 100%; height: 46px; display: block; margin-top: 8px; }
+.note { color: var(--dim); font-size: 12px; line-height: 1.5; margin: 0; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: -1px; margin-right: 6px; }
+#err { color: var(--rose); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+.pending { color: var(--amber); }
+.hint { font-size: 12px; color: var(--dim); }
+</style>
+
+<div class="app">
+  <div class="stage">
+    <div class="titlebar">
+      <h1>FrankenLife Studio</h1>
+      <span class="model" id="modelline">field-ecology-v1 · loading…</span>
+    </div>
+    <div class="viewport" id="vp">
+      <canvas id="world" aria-label="Live world: organisms over the chemical field"></canvas>
+      <div class="hud" id="hud"></div>
+      <div class="badge pause" id="badge">PAUSED</div>
+    </div>
+    <div class="toolbar" role="toolbar" aria-label="Simulation controls">
+      <button class="primary" id="play">Pause</button>
+      <button id="stepbtn" title="Advance one tick">Step</button>
+      <label class="inline" for="speed">Ticks / frame <input type="range" id="speed" min="1" max="16" value="4"><span id="speedv">4</span></label>
+      <div class="seg" role="group" aria-label="Tool">
+        <button id="t-inspect" aria-pressed="true">Inspect</button>
+        <button id="t-erase" class="danger" aria-pressed="false">Erase</button>
+        <button id="t-feed" aria-pressed="false">Feed</button>
+      </div>
+      <label class="inline" for="brush">Radius <input type="range" id="brush" min="2" max="40" value="12"><span id="brushv">12</span></label>
+      <div class="seg" role="group" aria-label="View">
+        <button id="v-lineage" aria-pressed="true">Lineage</button>
+        <button id="v-chem" aria-pressed="false">Chemistry</button>
+        <button id="v-raw" aria-pressed="false">Raw field</button>
+      </div>
+    </div>
+    <p class="hint">Scroll or pinch to zoom, drag to pan (the world wraps at its edges). Erase and Feed apply at the next tick boundary and are recorded in the energy ledger.</p>
+  </div>
+
+  <aside>
+    <section aria-labelledby="h-world">
+      <h2 id="h-world">World</h2>
+      <div class="grid2">
+        <label for="preset">Preset
+          <select id="preset"><option value="0">Vivid (calibrated)</option><option value="1">Reference (Appendix A)</option></select></label>
+        <label for="pop">Founders
+          <select id="pop"><option>512</option><option>1024</option><option selected>2048</option><option>4096</option></select></label>
+        <label for="topo">Network (params)
+          <select id="topo"><option value="0">8 hidden · 1.2k</option><option value="1" selected>32 hidden · 4.5k</option><option value="2">64·32 · 10k (plan default)</option><option value="3">96·64 · 18.6k</option></select></label>
+        <label for="seed">Seed <input type="number" id="seed" value="42" min="0" step="1"></label>
+      </div>
+      <div class="toolbar" style="margin-top:10px">
+        <button id="newworld">Start new world</button>
+        <button id="snap">Save snapshot</button>
+        <button id="restore" disabled>Return to snapshot</button>
+      </div>
+      <p id="err"></p>
+    </section>
+
+    <section aria-labelledby="h-clock">
+      <h2 id="h-clock">Clocks and ledger</h2>
+      <dl class="readout" id="clock"></dl>
+      <canvas class="spark" id="spark" aria-label="Population over simulated time"></canvas>
+    </section>
+
+    <section aria-labelledby="h-insp">
+      <h2 id="h-insp">Organism</h2>
+      <div id="insp"><p class="note">Pick an organism with the Inspect tool to read its energy, ancestry, network and current decisions.</p></div>
+      <canvas class="spark" id="aff" aria-label="Chemical affinity, 32 channels" hidden></canvas>
+    </section>
+
+    <section>
+      <h2>About this world</h2>
+      <p class="note">Every organism carries its own randomly initialised neural network and mutates it when it splits. Organisms interact only through the 32-channel chemical field: they absorb it, are fed or poisoned by its composition, drift along its gradients and pay energy to emit into it. Moving Gaussian sources supply all energy; nothing is scripted. The same Rust engine runs the native command-line tool and this WebAssembly build.</p>
+    </section>
+  </aside>
+</div>
+
+<script>
+const WASM_B64 = "__WASM_BASE64__";
+const $ = (id) => document.getElementById(id);
+let ex, mem;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const out = () => dec.decode(new Uint8Array(ex.memory.buffer, ex.out_ptr(), ex.out_len()));
+
+const state = {
+  playing: !matchMedia("(prefers-reduced-motion: reduce)").matches,
+  tool: "inspect", color: 0, fieldView: 0, speed: 4,
+  cam: { x: 0, y: 0, zoom: 1 }, W: 128, H: 128,
+  stats: null, popHist: [], stepsPerSec: 0, stepAcc: { n: 0, t: performance.now() },
+  frame: 0, msg: "",
+};
+
+function b64ToBytes(b64) {
+  const bin = atob(b64); const u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u;
+}
+
+async function boot() {
+  const { instance } = await WebAssembly.instantiate(b64ToBytes(WASM_B64), {});
+  ex = instance.exports;
+  newWorld();
+  requestAnimationFrame(loop);
+}
+
+function newWorld() {
+  const ok = ex.world_preset(+$("preset").value, +$("pop").value, +$("topo").value, Math.max(0, +$("seed").value | 0));
+  $("err").textContent = ok ? "" : "Could not start this world: " + out();
+  if (!ok) return;
+  state.W = ex.world_width(); state.H = ex.world_height();
+  state.cam = { x: state.W / 2, y: state.H / 2, zoom: 1 };
+  state.popHist = []; state.msg = "";
+  ex.clear_selection(); $("restore").disabled = true;
+  refreshStats(); drawInspector();
+}
+
+/* ---------- camera ---------- */
+const cv = $("world"), ctx = cv.getContext("2d");
+const fieldCanvas = document.createElement("canvas"), fctx = fieldCanvas.getContext("2d");
+function resize() {
+  const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1;
+  cv.width = Math.max(1, Math.round(r.width * d)); cv.height = Math.max(1, Math.round(r.height * d));
+}
+new ResizeObserver(resize).observe($("vp"));
+function scale() { return Math.min(cv.width / state.W, cv.height / state.H) * state.cam.zoom; }
+function wrapD(d, L) { return d - L * Math.round(d / L); }
+function toScreen(x, y) {
+  const s = scale();
+  return [cv.width / 2 + wrapD(x - state.cam.x, state.W) * s, cv.height / 2 + wrapD(y - state.cam.y, state.H) * s];
+}
+function toWorld(px, py) {
+  const s = scale(), d = devicePixelRatio || 1;
+  let x = state.cam.x + (px * d - cv.width / 2) / s, y = state.cam.y + (py * d - cv.height / 2) / s;
+  return [((x % state.W) + state.W) % state.W, ((y % state.H) + state.H) % state.H];
+}
+
+/* ---------- drawing ---------- */
+function drawField() {
+  const gw = ex.field_w(), gh = ex.field_h();
+  const ptr = ex.field_image(state.fieldView);
+  if (fieldCanvas.width !== gw) { fieldCanvas.width = gw; fieldCanvas.height = gh; }
+  fctx.putImageData(new ImageData(new Uint8ClampedArray(ex.memory.buffer, ptr, gw * gh * 4).slice(), gw, gh), 0, 0);
+  const s = scale(), Ws = state.W * s, Hs = state.H * s;
+  const ox = cv.width / 2 - state.cam.x * s, oy = cv.height / 2 - state.cam.y * s;
+  ctx.imageSmoothingEnabled = true;
+  ctx.fillStyle = "#020308"; ctx.fillRect(0, 0, cv.width, cv.height);
+  // Tile the torus so the seam is continuous at every pan/zoom.
+  const i0 = Math.floor(-ox / Ws), i1 = Math.floor((cv.width - ox) / Ws);
+  const j0 = Math.floor(-oy / Hs), j1 = Math.floor((cv.height - oy) / Hs);
+  for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) ctx.drawImage(fieldCanvas, ox + i * Ws, oy + j * Hs, Ws, Hs);
+}
+
+function drawParticles() {
+  if (state.fieldView === 1) return;
+  const n = ex.particle_count(); if (!n) return;
+  const p = new Float32Array(ex.memory.buffer, ex.particles(state.color), n * 6);
+  const s = scale(), d = devicePixelRatio || 1;
+  const r = Math.max(0.9 * d, Math.min(4 * d, 0.32 * s));
+  const Ws = state.W * s, Hs = state.H * s;
+  const ox = cv.width / 2 - state.cam.x * s, oy = cv.height / 2 - state.cam.y * s;
+  // Same torus tiling as the field, so organisms appear in every visible copy.
+  const i0 = Math.floor(-ox / Ws) - 1, i1 = Math.floor((cv.width - ox) / Ws);
+  const j0 = Math.floor(-oy / Hs) - 1, j1 = Math.floor((cv.height - oy) / Hs);
+  ctx.globalCompositeOperation = "lighter";
+  for (let k = 0; k < n; k++) {
+    const o = k * 6, e = p[o + 5], b = 0.45 + 0.9 * e / (e + 3);
+    ctx.fillStyle = `rgb(${p[o + 2] * 255 * b | 0},${p[o + 3] * 255 * b | 0},${p[o + 4] * 255 * b | 0})`;
+    const bx = ox + p[o] * s, by = oy + p[o + 1] * s;
+    for (let i = i0; i <= i1 + 1; i++) for (let j = j0; j <= j1 + 1; j++) {
+      const sx = bx + i * Ws, sy = by + j * Hs;
+      if (sx < -6 || sy < -6 || sx > cv.width + 6 || sy > cv.height + 6) continue;
+      ctx.beginPath(); ctx.arc(sx, sy, r, 0, 6.2832); ctx.fill();
+    }
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function drawOverlay() {
+  const st = state.stats, d = devicePixelRatio || 1;
+  if (st && st.selected) {
+    const [sx, sy] = toScreen(st.selected.x, st.selected.y);
+    ctx.strokeStyle = "#e6eef2"; ctx.lineWidth = 1.2 * d;
+    ctx.beginPath(); ctx.arc(sx, sy, 9 * d, 0, 6.2832); ctx.stroke();
+  }
+  if (hover && state.tool !== "inspect") {
+    const [sx, sy] = toScreen(hover[0], hover[1]);
+    ctx.strokeStyle = state.tool === "erase" ? "#fb7185" : "#fbbf24"; ctx.setLineDash([4 * d, 4 * d]);
+    ctx.beginPath(); ctx.arc(sx, sy, +$("brush").value * scale(), 0, 6.2832); ctx.stroke(); ctx.setLineDash([]);
+  }
+}
+
+/* ---------- telemetry ---------- */
+const fmt = (v, k = 2) => Number(v).toLocaleString(undefined, { minimumFractionDigits: k, maximumFractionDigits: k });
+function refreshStats() {
+  if (!ex.stats()) return;
+  const st = state.stats = JSON.parse(out());
+  const rt = state.stepsPerSec * st.dt;
+  $("modelline").textContent = `field-ecology-v1 · ${st.name} · seed ${st.seed}`;
+  $("hud").innerHTML = `TICK <b>${st.tick.toLocaleString()}</b> · SIM <b>${fmt(st.sim_seconds)}</b> s · POP <b>${st.population.toLocaleString()}</b><br>`
+    + `GEN max ${st.max_generation} · ${st.lineages.toLocaleString()} founder lineages`
+    + (st.pending_commands ? `<br><span class="pending">${st.pending_commands} command(s) pending for the next tick</span>` : "")
+    + (state.msg ? `<br><span class="pending">${state.msg}</span>` : "");
+  const rows = [
+    ["Simulated time", fmt(st.sim_seconds) + " s"],
+    ["Timestep", "1/" + Math.round(1 / st.dt) + " s"],
+    ["Achieved", fmt(state.stepsPerSec, 1) + " ticks/s"],
+    ["Speed vs real time", fmt(rt, 2) + "×"],
+    ["Requested", state.playing ? state.speed + " ticks/frame" : "paused"],
+    ["Population", st.population.toLocaleString()],
+    ["Births / deaths", st.births.toLocaleString() + " / " + st.deaths.toLocaleString()],
+    ["Mean energy", fmt(st.mean_energy, 3)],
+    ["Mean speed", fmt(st.mean_speed, 3) + " L/s"],
+    ["Mean params", Math.round(st.mean_params).toLocaleString()],
+    ["Field energy", fmt(st.field_energy, 1)],
+    ["Organism energy", fmt(st.organism_energy, 1)],
+    ["Injected / dissipated", fmt(st.injected, 0) + " / " + fmt(st.dissipated, 0)],
+    ["Ledger residual", Number(st.residual).toExponential(2)],
+  ];
+  $("clock").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+  $("restore").disabled = !st.has_snapshot;
+  $("restore").textContent = st.has_snapshot ? `Return to snapshot (tick ${st.snapshot_tick.toLocaleString()})` : "Return to snapshot";
+  const h = state.popHist;
+  if (!h.length || h[h.length - 1][0] !== st.tick) h.push([st.tick, st.population]);
+  if (h.length > 600) h.splice(0, h.length - 600);
+  drawSpark();
+}
+
+function drawSpark() {
+  const c = $("spark"), d = devicePixelRatio || 1, g = c.getContext("2d");
+  c.width = c.clientWidth * d; c.height = c.clientHeight * d;
+  const h = state.popHist; g.clearRect(0, 0, c.width, c.height);
+  if (h.length < 2) return;
+  let lo = Infinity, hi = -Infinity; for (const [, p] of h) { lo = Math.min(lo, p); hi = Math.max(hi, p); }
+  if (hi === lo) { hi += 1; lo -= 1; }
+  const X = (i) => i / (h.length - 1) * (c.width - 2 * d) + d, Y = (p) => c.height - 4 * d - (p - lo) / (hi - lo) * (c.height - 14 * d);
+  g.strokeStyle = "#1b2433"; g.lineWidth = d; g.beginPath(); g.moveTo(0, Y(lo) + 0.5); g.lineTo(c.width, Y(lo) + 0.5); g.stroke();
+  g.beginPath(); h.forEach(([, p], i) => i ? g.lineTo(X(i), Y(p)) : g.moveTo(X(i), Y(p)));
+  g.strokeStyle = "#2dd4bf"; g.lineWidth = 1.5 * d; g.stroke();
+  g.lineTo(X(h.length - 1), c.height); g.lineTo(X(0), c.height); g.closePath(); g.fillStyle = "rgba(45,212,191,0.10)"; g.fill();
+  g.fillStyle = "#8a9aa6"; g.font = `${10 * d}px Chivo Mono, monospace`;
+  g.fillText(`population ${lo.toLocaleString()}–${hi.toLocaleString()}`, 4 * d, 10 * d);
+  g.fillStyle = "#2dd4bf"; g.beginPath(); g.arc(X(h.length - 1), Y(h[h.length - 1][1]), 2.5 * d, 0, 6.2832); g.fill();
+}
+
+function lineageCss(rgb) { return `rgb(${rgb.map(v => v * 255 | 0).join(",")})`; }
+function drawInspector() {
+  const box = $("insp"), aff = $("aff");
+  if (!ex.inspect_selected()) {
+    box.innerHTML = state.stats && state.stats.selected === null && box.dataset.had
+      ? `<p class="note">Organism ${box.dataset.had} is no longer alive.</p>`
+      : `<p class="note">Pick an organism with the Inspect tool to read its energy, ancestry, network and current decisions.</p>`;
+    aff.hidden = true; return;
+  }
+  const o = JSON.parse(out()); box.dataset.had = o.id;
+  const dcd = o.decoded;
+  const rows = [
+    ["Organism", "#" + o.id], ["Founder lineage", "#" + o.lineage], ["Generation", o.generation],
+    ["Energy", fmt(o.energy, 3)], ["Recent change", fmt(o.energy_change_rate, 3) + " /s"], ["Age", fmt(o.age_seconds, 2) + " s"],
+    ["Network", "104→" + o.topology.join("→") + "→36"], ["Parameters", o.parameters.toLocaleString()],
+    ["Sensing scale", fmt(o.sensing_scale, 2) + " L"], ["Speed", fmt(Math.hypot(...o.velocity), 3) + " L/s"],
+  ];
+  if (dcd) rows.push(
+    ["Split rate", fmt(dcd.reproduction_rate_per_second, 3) + " /s"], ["Child share", fmt(dcd.child_share * 100, 0) + "%"],
+    ["Emitting", dcd.emission_gate_open ? "yes · " + fmt(dcd.emission_fraction_per_tick * 128 * 100, 1) + "% E/s" : "no"],
+    ["Decided at tick", o.held_output_tick.toLocaleString()]);
+  if (o.mutation) rows.push(["Mutations at birth", `${o.mutation.parameters_perturbed} perturbed, ${o.mutation.parameters_replaced} replaced` + (o.mutation.topology_changed ? ", new topology" : "")]);
+  box.innerHTML = `<dl class="readout">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+  aff.hidden = false;
+  const d = devicePixelRatio || 1, g = aff.getContext("2d");
+  aff.width = aff.clientWidth * d; aff.height = aff.clientHeight * d; g.clearRect(0, 0, aff.width, aff.height);
+  const mid = aff.height / 2 + 5 * d, bw = aff.width / 32;
+  g.fillStyle = "#8a9aa6"; g.font = `${10 * d}px Chivo Mono, monospace`; g.fillText("chemical affinity · 32 channels", 2 * d, 10 * d);
+  g.fillStyle = "#1b2433"; g.fillRect(0, mid, aff.width, d);
+  o.affinity.forEach((v, k) => {
+    g.fillStyle = v >= 0 ? "#2dd4bf" : "#fb7185";
+    const hgt = Math.abs(v) / 0.5 * (aff.height / 2 - 8 * d);
+    g.fillRect(k * bw + bw * 0.15, v >= 0 ? mid - hgt : mid + d, bw * 0.7, Math.max(d, hgt));
+  });
+}
+
+/* ---------- main loop ---------- */
+function loop(now) {
+  if (state.playing) {
+    const t0 = performance.now();
+    const done = ex.step(state.speed);
+    const msgLen = ex.out_len();
+    if (done < state.speed) {
+      if (ex.particle_count() === 0) { state.msg = "Extinct: the population died out."; setPlaying(false); }
+      else if (msgLen) { state.msg = out().slice(0, 160); setPlaying(false); }
+    }
+    state.stepAcc.n += done;
+    // Keep the page responsive: shrink the batch if a frame's ticks ran long.
+    if (performance.now() - t0 > 60 && state.speed > 1) { state.speed = Math.max(1, state.speed - 1); syncSpeed(); }
+  }
+  const el = now - state.stepAcc.t;
+  if (el > 500) { state.stepsPerSec = state.stepAcc.n * 1000 / el; state.stepAcc = { n: 0, t: now }; }
+  drawField(); drawParticles(); drawOverlay();
+  if (state.frame++ % 6 === 0) { refreshStats(); drawInspector(); }
+  requestAnimationFrame(loop);
+}
+
+function setPlaying(p) {
+  state.playing = p;
+  $("play").textContent = p ? "Pause" : "Play";
+  $("badge").textContent = p ? "RUNNING" : "PAUSED";
+  $("badge").className = "badge " + (p ? "run" : "pause");
+}
+function syncSpeed() { $("speed").value = state.speed; $("speedv").textContent = state.speed; }
+
+/* ---------- input ---------- */
+$("play").onclick = () => { state.msg = ""; setPlaying(!state.playing); };
+$("stepbtn").onclick = () => { setPlaying(false); ex.step(1); refreshStats(); drawInspector(); };
+$("speed").oninput = (e) => { state.speed = +e.target.value; syncSpeed(); };
+$("brush").oninput = (e) => { $("brushv").textContent = e.target.value; };
+for (const t of ["inspect", "erase", "feed"]) $("t-" + t).onclick = () => {
+  state.tool = t; for (const u of ["inspect", "erase", "feed"]) $("t-" + u).setAttribute("aria-pressed", u === t);
+};
+const views = { lineage: [0, 0], chem: [1, 0], raw: [0, 1] };
+for (const [v, [c, f]] of Object.entries(views)) $("v-" + v).onclick = () => {
+  state.color = c; state.fieldView = f; for (const u of Object.keys(views)) $("v-" + u).setAttribute("aria-pressed", u === v);
+};
+$("newworld").onclick = () => { newWorld(); setPlaying(true); };
+$("snap").onclick = () => { ex.snapshot_save(); refreshStats(); };
+$("restore").onclick = () => { ex.snapshot_restore(); state.msg = ""; refreshStats(); drawInspector(); };
+
+let drag = null, hover = null, pinch = null;
+const pts = new Map();
+cv.addEventListener("pointerdown", (e) => {
+  cv.setPointerCapture(e.pointerId); pts.set(e.pointerId, [e.offsetX, e.offsetY]);
+  if (pts.size === 2) { const [a, b] = [...pts.values()]; pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]), z: state.cam.zoom }; drag = null; return; }
+  drag = { x: e.offsetX, y: e.offsetY, cx: state.cam.x, cy: state.cam.y, moved: false };
+});
+cv.addEventListener("pointermove", (e) => {
+  hover = toWorld(e.offsetX, e.offsetY);
+  if (pts.has(e.pointerId)) pts.set(e.pointerId, [e.offsetX, e.offsetY]);
+  if (pinch && pts.size === 2) { const [a, b] = [...pts.values()]; state.cam.zoom = Math.min(24, Math.max(1, pinch.z * Math.hypot(a[0] - b[0], a[1] - b[1]) / pinch.d)); return; }
+  if (!drag) return;
+  const d = devicePixelRatio || 1, s = scale();
+  const dx = e.offsetX - drag.x, dy = e.offsetY - drag.y;
+  if (Math.hypot(dx, dy) > 4) drag.moved = true;
+  if (drag.moved) { state.cam.x = drag.cx - dx * d / s; state.cam.y = drag.cy - dy * d / s; }
+});
+cv.addEventListener("pointerup", (e) => {
+  pts.delete(e.pointerId);
+  if (pinch) { if (pts.size < 2) pinch = null; drag = null; return; }
+  if (drag && !drag.moved) {
+    const [x, y] = toWorld(e.offsetX, e.offsetY), r = +$("brush").value;
+    if (state.tool === "inspect") { ex.pick(x, y, 12 / scale() * (devicePixelRatio || 1) + 0.5) || ex.clear_selection(); }
+    else if (state.tool === "erase") ex.erase(x, y, r);
+    else ex.energy_brush(x, y, r, 40 * r * r / 144);
+    refreshStats(); drawInspector();
+  }
+  drag = null;
+});
+cv.addEventListener("pointerleave", () => { hover = null; });
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const before = toWorld(e.offsetX, e.offsetY);
+  state.cam.zoom = Math.min(24, Math.max(1, state.cam.zoom * Math.exp(-e.deltaY * 0.0015)));
+  const after = toWorld(e.offsetX, e.offsetY);
+  state.cam.x += wrapD(before[0] - after[0], state.W); state.cam.y += wrapD(before[1] - after[1], state.H);
+}, { passive: false });
+
+setPlaying(state.playing);
+boot().catch((err) => { $("err").textContent = "The engine failed to load: " + err; });
+</script>

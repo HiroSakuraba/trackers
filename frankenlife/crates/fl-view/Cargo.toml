@@ -1,0 +1,9 @@
+[package]
+name = "fl-view"
+description = "Declared, stable display mappings for FrankenLife (lineage, chemistry, field)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fl-core = { path = "../fl-core" }

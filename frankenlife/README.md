@@ -8,7 +8,11 @@ controllers** decide → chemistry causes gain/loss and motion → paid emission
 changes the field → reproduction produces a **mutated child** → death releases
 resources → the committed world is rendered.
 
-It is a self-contained Rust workspace. Both crates use `#![forbid(unsafe_code)]`.
+It is a self-contained Rust workspace. `fl-core`, `fl-view` and the CLI use
+`#![forbid(unsafe_code)]`. The WebAssembly boundary `fl-wasm` uses
+`#![deny(unsafe_code)]` with one allowed construct, the `#[no_mangle]`
+export attribute (the lint counts it); it performs no unsafe operations and
+uses no JS-glue crates.
 
 ```
 frankenlife/
@@ -16,15 +20,34 @@ frankenlife/
 │   ├── reference-field-ecology.toml   # Appendix A starter profile (one documented deviation)
 │   └── vivid-field-ecology.toml       # declared viability-calibrated profile
 └── crates/
-    ├── fl-core/       # authoritative model: config, RNG, field, sensors, MLPs, genomes, tick, ledger
-    └── frankenlife/   # CLI: validate, run, metrics, inspection, headless renderer
+    ├── fl-core/       # authoritative model: config, RNG, field, sensors, MLPs, genomes, tick, ledger, checkpoints
+    ├── fl-view/       # declared display mappings (lineage / chemistry / field colors) shared by all views
+    ├── fl-wasm/       # WebAssembly boundary for the browser Studio
+    └── frankenlife/   # CLI: validate, run, inspect, metrics, headless renderer
+studio/
+    studio.template.html, build.sh   # single-file browser Studio (wasm inlined)
 ```
+
+## Studio (browser)
+
+`./studio/build.sh` compiles `fl-core` to `wasm32-unknown-unknown` (SIMD128)
+and inlines it into `studio/frankenlife-studio.html`, a self-contained page
+that runs the same engine live: play/pause/step, ticks-per-frame, zoom and
+pan on the torus, lineage / chemistry / raw-field views, click-to-inspect
+(energy, ancestry, network, sensing scale, decoded decisions, affinity), erase
+and feed brushes applied at the next tick boundary, an in-memory snapshot to
+branch from, and honest clocks (achieved ticks/s and speed versus real time are
+shown separately from the requested ticks per frame). Browser runs are
+single-threaded; at 2,048 founders with 4,548-parameter networks headless
+Chromium here manages ~55 ticks/s (≈0.4× real time).
+
+Needs `rustup target add wasm32-unknown-unknown`.
 
 ## Quick start
 
 ```bash
 cd frankenlife
-cargo test --release                      # 42 unit/known-answer/world fixtures
+cargo test --release                      # 44 unit/known-answer/world fixtures
 cargo run --release -- validate           # derived capacity & cost report for the reference preset
 cargo run --release -- run --config presets/vivid-field-ecology.toml \
     --seconds 45 --frame-every 4 --size 720 --out runs/vivid
@@ -114,8 +137,9 @@ this directory should be described as using it:
   `std::thread::scope` (deterministic, execution-only).
 - **FrankenTorch / FrankenNumPy** typed storage, population kernels, Metal —
   the scalar CPU evaluator here is the "reference evaluator" role only.
-- **FrankenManim** bulk primitives, live Studio, cameras, Cinema export — a
-  headless CPU rasterizer renders committed epochs to PNG instead.
+- **FrankenManim** bulk primitives, cameras, timeline and Cinema export — a
+  headless CPU rasterizer renders committed epochs to PNG, and the browser
+  Studio draws them with Canvas 2D instead.
 - **FrankenSQLite** run catalog, write-ahead command journal and durable
   crash recovery — not implemented; metrics are JSONL and checkpoints are
   plain files. Checkpoints store full F32 genomes (~165 MB at 4,096

@@ -1,7 +1,6 @@
 //! The world state and the ordered, transactional tick (plan §8).
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde::Serialize;
 
@@ -14,6 +13,26 @@ use crate::rng::{Lane, SemanticRng};
 use crate::sensors::{intrinsic, observe, Observation, Pyramid, PLANES};
 use crate::sources::{init_sources, inject, isotropic_unit, Source};
 use crate::CHANNELS;
+
+/// Wall-clock stopwatch for execution telemetry. On `wasm32-unknown-unknown`,
+/// where `std::time::Instant` is unavailable, it reports zero.
+#[derive(Clone, Copy)]
+struct Stopwatch(#[cfg(not(target_arch = "wasm32"))] std::time::Instant);
+
+impl Stopwatch {
+    fn start() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        return Stopwatch(std::time::Instant::now());
+        #[cfg(target_arch = "wasm32")]
+        return Stopwatch();
+    }
+    fn ms(&self) -> f64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.0.elapsed().as_secs_f64() * 1e3;
+        #[cfg(target_arch = "wasm32")]
+        return 0.0;
+    }
+}
 
 /// Raw controller output layout (plan §6.3).
 pub mod out {
@@ -331,7 +350,7 @@ impl World {
 
     /// Advance `n -> n+1`. On error the committed world is unchanged.
     pub fn step(&mut self) -> Result<TickReport, TickError> {
-        let t_start = Instant::now();
+        let t_start = Stopwatch::start();
         let cfg = &self.cfg;
         let dt = cfg.dt();
         let n = self.tick;
@@ -403,7 +422,7 @@ impl World {
         }
 
         // ── Phase 2: transport, then scheduled sources → observation field ─
-        let t = Instant::now();
+        let t = Stopwatch::start();
         let mut scratch = Field { gx: 0, gy: 0, hx: field.hx, hy: field.hy, e: Vec::new(), m: Vec::new() };
         let (decay, sub) = field.transport(cfg.world.diffusion, cfg.world.decay_per_second, dt, &mut scratch);
         dis.decay += decay;
@@ -413,10 +432,10 @@ impl World {
         }
         led.injected_sources = inject(&mut field, &sources, n, cfg).map_err(|detail| TickError::NumericalFault { tick: event, detail })?;
         dis.tiny_reservoir += field.clear_tiny(tiny);
-        timing.transport_ms = t.elapsed().as_secs_f64() * 1e3;
+        timing.transport_ms = t.ms();
 
         // ── Phase 3: sensing pyramid ──────────────────────────────────────
-        let t = Instant::now();
+        let t = Stopwatch::start();
         let pyr = Pyramid::build(&field, self.pyramid_extra_levels);
 
         // ── Phase 4: sample organisms, evaluate due controllers ───────────
@@ -430,10 +449,10 @@ impl World {
                 counts.parameter_evaluations += orgs.genome[i].param_count() as u64;
             }
         }
-        timing.sense_and_infer_ms = t.elapsed().as_secs_f64() * 1e3;
+        timing.sense_and_infer_ms = t.ms();
 
         // ── Phase 5: uptake requests and cell grants ──────────────────────
-        let t = Instant::now();
+        let t = Stopwatch::start();
         let ch = &cfg.chemistry;
         let umax = ch.uptake_capacity_per_second;
         let stencils: Vec<Stencil> = (0..orgs.len()).map(|i| field.stencil(orgs.x[i], orgs.y[i])).collect();
@@ -531,10 +550,10 @@ impl World {
             }
             exhaust(&mut orgs.energy[i], &mut dead[i], &mut dis, &mut counts);
         }
-        timing.exchange_ms = t.elapsed().as_secs_f64() * 1e3;
+        timing.exchange_ms = t.ms();
 
         // ── Phase 7: motion → emission → reproduction proposals ──────────
-        let t = Instant::now();
+        let t = Stopwatch::start();
         let drag_keep = (-ch.drag_per_second * dt).exp();
         let drag_coef = drag_force_coefficient(ch.drag_per_second, dt);
         let em = &cfg.emission;
@@ -718,7 +737,7 @@ impl World {
 
         // ── Phase 9: paid deposits and recycling enter the next field ─────
         field.add_assign(&deposits);
-        timing.lifecycle_ms = t.elapsed().as_secs_f64() * 1e3;
+        timing.lifecycle_ms = t.ms();
 
         // ── Phase 10: tiny-reservoir clearing, validate invariants, publish ─
         dis.tiny_reservoir += field.clear_tiny(tiny);
@@ -768,7 +787,7 @@ impl World {
         tt.parameter_evaluations += counts.parameter_evaluations;
         tt.emitting += counts.emitting;
         tt.cone_projections += counts.cone_projections;
-        timing.total_ms = t_start.elapsed().as_secs_f64() * 1e3;
+        timing.total_ms = t_start.ms();
         let report = TickReport { tick: event, simulation_seconds: event as f64 * dt, population: self.orgs.len(), counts, ledger: led, timing };
         self.last_report = Some(report);
         Ok(report)

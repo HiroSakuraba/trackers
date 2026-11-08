@@ -1,0 +1,14 @@
+[package]
+name = "fl-wasm"
+description = "WebAssembly boundary for the FrankenLife browser Studio (no JS glue crates)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+fl-core = { path = "../fl-core" }
+fl-view = { path = "../fl-view" }
+serde_json.workspace = true

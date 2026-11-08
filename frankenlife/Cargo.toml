@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fl-core", "crates/frankenlife"]
+members = ["crates/fl-core", "crates/fl-view", "crates/fl-wasm", "crates/frankenlife"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,3 +20,6 @@ codegen-units = 1
 
 [profile.test]
 opt-level = 3
+
+[profile.release.package.fl-wasm]
+strip = true
