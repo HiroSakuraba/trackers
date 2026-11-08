@@ -42,6 +42,18 @@ pub struct GpuInfo {
     pub max_buffer_bytes: u64,
 }
 
+/// Where the time of the most recent `evaluate` call went.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EvalTiming {
+    /// CPU work before submission: slot lookup, genome uploads, input packing, buffer writes.
+    pub host_prep_ms: f64,
+    /// Submit, wait for completion and read the logits back (includes the kernel).
+    pub gpu_roundtrip_ms: f64,
+    /// Compute-pass time from GPU timestamps, when the adapter supports them.
+    pub kernel_ms: Option<f64>,
+    pub dispatches: u32,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GpuStats {
     pub calls: u64,
@@ -50,6 +62,7 @@ pub struct GpuStats {
     pub evictions: u64,
     pub dispatches: u64,
     pub slab_growths: u64,
+    pub last: EvalTiming,
 }
 
 struct Slab {
@@ -73,6 +86,13 @@ impl Slab {
     }
 }
 
+struct Timestamps {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    period_ns: f64,
+}
+
 struct Io {
     cap: usize,
     slots: wgpu::Buffer,
@@ -92,6 +112,7 @@ pub struct GpuBackend {
     slot_of: HashMap<u64, (usize, usize)>,
     io: Option<Io>,
     call: u64,
+    timestamps: Option<Timestamps>,
     pub info: GpuInfo,
     pub stats: GpuStats,
 }
@@ -127,8 +148,10 @@ impl GpuBackend {
         // Weight slabs are large: ask for everything the adapter offers here.
         limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
         limits.max_buffer_size = al.max_buffer_size;
+        let ts_ok = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let required_features = if ts_ok { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: Some("frankenlife"), required_limits: limits.clone(), ..Default::default() })
+            .request_device(&wgpu::DeviceDescriptor { label: Some("frankenlife"), required_features, required_limits: limits.clone(), ..Default::default() })
             .await
             .map_err(|e| format!("could not open GPU device: {e}"))?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mlp"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
@@ -162,6 +185,12 @@ impl GpuBackend {
                 Slab { dims, stride, pages: Vec::new(), page_slots, last_cap: 0, owner: Vec::new(), last_used: Vec::new(), free: Vec::new() }
             })
             .collect();
+        let timestamps = ts_ok.then(|| Timestamps {
+            set: device.create_query_set(&wgpu::QuerySetDescriptor { label: Some("kernel"), ty: wgpu::QueryType::Timestamp, count: 2 }),
+            resolve: device.create_buffer(&wgpu::BufferDescriptor { label: Some("ts-resolve"), size: 16, usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false }),
+            readback: device.create_buffer(&wgpu::BufferDescriptor { label: Some("ts-read"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            period_ns: queue.get_timestamp_period() as f64,
+        });
         let info = GpuInfo {
             name: ai.name.clone(),
             backend: format!("{:?}", ai.backend),
@@ -170,7 +199,7 @@ impl GpuBackend {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
             max_buffer_bytes: limits.max_buffer_size,
         };
-        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, info, stats: GpuStats::default() })
+        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, info, stats: GpuStats::default() })
     }
 
     pub fn capability(&self) -> String {
@@ -270,6 +299,7 @@ impl GpuBackend {
     }
 
     fn run_topology(&mut self, t: usize, page: usize, slots: &[u32], inputs: &[f32]) -> Result<Vec<f32>, String> {
+        let prep = std::time::Instant::now();
         let n = slots.len();
         self.ensure_io(n);
         let io = self.io.as_ref().expect("io allocated");
@@ -305,26 +335,54 @@ impl GpuBackend {
         let bytes = (n * OUTPUT_WIDTH * 4) as u64;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mlp") });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("mlp"), timestamp_writes: None });
+            let tw = self.timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites { query_set: &ts.set, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("mlp"), timestamp_writes: tw });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(grid_x, grid_y, 1);
         }
         enc.copy_buffer_to_buffer(&io.outputs, 0, &io.staging, 0, bytes);
+        if let Some(ts) = &self.timestamps {
+            enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
+            enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
+        }
+        self.stats.last.host_prep_ms += prep.elapsed().as_secs_f64() * 1e3;
+        let round = std::time::Instant::now();
         self.queue.submit([enc.finish()]);
         self.stats.dispatches += 1;
+        self.stats.last.dispatches += 1;
         let slice = io.staging.slice(0..bytes);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
+        let ts_rx = self.timestamps.as_ref().map(|ts| {
+            let (ttx, trx) = mpsc::channel();
+            ts.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = ttx.send(r);
+            });
+            trx
+        });
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
         rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU readback: {e}"))?;
+        if let (Some(ts), Some(trx)) = (&self.timestamps, ts_rx) {
+            if matches!(trx.recv(), Ok(Ok(()))) {
+                let k = {
+                    let v = ts.readback.slice(..).get_mapped_range().map_err(|e| format!("timestamp map: {e:?}"))?;
+                    let t0 = u64::from_le_bytes(v[0..8].try_into().expect("8 bytes"));
+                    let t1 = u64::from_le_bytes(v[8..16].try_into().expect("8 bytes"));
+                    t1.saturating_sub(t0) as f64 * ts.period_ns / 1e6
+                };
+                ts.readback.unmap();
+                *self.stats.last.kernel_ms.get_or_insert(0.0) += k;
+            }
+        }
         let out: Vec<f32> = {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             view.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
         };
         io.staging.unmap();
+        self.stats.last.gpu_roundtrip_ms += round.elapsed().as_secs_f64() * 1e3;
         Ok(out)
     }
 
@@ -353,6 +411,8 @@ impl ControllerBackend for GpuBackend {
         self.call += 1;
         self.stats.calls += 1;
         self.stats.evaluations += jobs.len() as u64;
+        self.stats.last = EvalTiming::default();
+        let prep = std::time::Instant::now();
         let mut placed = Vec::with_capacity(jobs.len());
         for j in jobs {
             let g = j.genome;
@@ -374,6 +434,7 @@ impl ControllerBackend for GpuBackend {
             self.slabs[t].last_used[slot] = self.call;
             placed.push((t, slot));
         }
+        self.stats.last.host_prep_ms += prep.elapsed().as_secs_f64() * 1e3;
         // One dispatch per (topology, weight page) that has work.
         let mut groups: Vec<(usize, usize)> = placed.iter().map(|&(t, slot)| (t, slot / self.slabs[t].page_slots)).collect();
         groups.sort_unstable();

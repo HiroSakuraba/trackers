@@ -202,11 +202,20 @@ fn gpu_check(organisms: usize, hidden: &str, iters: usize) -> i32 {
     let upload_s = t.elapsed().as_secs_f64();
     let _ = ReferenceBackend.evaluate(&jobs, &mut b);
     let diff = a.iter().zip(&b).flat_map(|(x, y)| x.iter().zip(y).map(|(p, q)| (p - q).abs())).fold(0.0f32, f32::max);
+    let (mut prep_ms, mut round_ms, mut kernel_ms, mut kernel_n) = (0.0, 0.0, 0.0, 0usize);
     let t = Instant::now();
     for _ in 0..iters {
         let _ = gpu.evaluate(&jobs, &mut a);
+        let l = gpu.stats.last;
+        prep_ms += l.host_prep_ms;
+        round_ms += l.gpu_roundtrip_ms;
+        if let Some(k) = l.kernel_ms {
+            kernel_ms += k;
+            kernel_n += 1;
+        }
     }
     let gpu_s = t.elapsed().as_secs_f64() / iters.max(1) as f64;
+    let it = iters.max(1) as f64;
     let t = Instant::now();
     for _ in 0..iters.clamp(1, 3) {
         let _ = ReferenceBackend.evaluate(&jobs, &mut b);
@@ -217,6 +226,16 @@ fn gpu_check(organisms: usize, hidden: &str, iters: usize) -> i32 {
     println!("first batch  : {:.1} ms (includes uploading every genome)", upload_s * 1e3);
     println!("max |dlogit| : {diff:.2e} vs CPU reference ({})", if diff < 1e-4 { "OK" } else { "TOO LARGE" });
     println!("GPU batch    : {:.2} ms  ->  {:.0} network evals/s, {:.1} GB/s of weights", gpu_s * 1e3, organisms as f64 / gpu_s, weights_mib / 1024.0 / gpu_s);
+    println!("  host prep  : {:.2} ms (slot lookup, input packing, buffer writes)", prep_ms / it);
+    println!("  round trip : {:.2} ms (submit, wait, read back logits; includes the kernel)", round_ms / it);
+    if kernel_n > 0 {
+        let k = kernel_ms / kernel_n as f64;
+        println!("  kernel     : {:.2} ms (GPU timestamps)  ->  {:.1} GB/s of weights in the kernel alone", k, weights_mib / 1024.0 / (k / 1e3));
+    } else {
+        println!("  kernel     : n/a (this adapter does not support timestamp queries)");
+    }
+    println!("weights bound: {:.2} ms if the kernel streamed weights at 320 GB/s (GTX 1080 peak)", weights_mib * 1024.0 * 1024.0 / 320e9 * 1e3);
+    println!("budget       : {:.2} ms per whole simulation step at 128 steps/s", 1000.0 / 128.0);
     println!("CPU batch    : {:.2} ms (scalar reference, one thread)  ->  GPU is {:.1}x faster", cpu_s * 1e3, cpu_s / gpu_s);
     if diff < 1e-4 { 0 } else { 1 }
 }
@@ -384,6 +403,8 @@ fn run(a: RunArgs) -> i32 {
     let mut frame_no = 0usize;
     let mut stop_reason = "completed".to_string();
     let mut steps_per_s = 0.0;
+    let mut phases = Phases::default();
+    let mut run_phases = Phases::default();
     if a.frame_every > 0 {
         save_frame(&world, &opts_base, &frames_dir, frame_no, steps_per_s);
         frame_no += 1;
@@ -407,33 +428,48 @@ fn run(a: RunArgs) -> i32 {
                 break;
             }
         };
+        phases.add(&r.timing);
+        run_phases.add(&r.timing);
         interval.0 += r.counts.births;
         interval.1 += r.counts.deaths_exhaustion + r.counts.deaths_user;
         interval_ticks += 1;
         if r.population == 0 {
             stop_reason = format!("extinction at tick {}", r.tick);
             eprintln!("{stop_reason}");
-            write_metrics(&mut metrics, &world, interval, steps_per_s);
+            write_metrics(&mut metrics, &world, interval, steps_per_s, &phases);
             break;
         }
         if world.tick % metrics_every == 0 {
             let el = interval_wall.elapsed().as_secs_f64();
             steps_per_s = interval_ticks as f64 / el.max(1e-9);
-            write_metrics(&mut metrics, &world, interval, steps_per_s);
+            write_metrics(&mut metrics, &world, interval, steps_per_s, &phases);
             let l = &world.ledger;
+            let n = phases.ticks.max(1) as f64;
             eprintln!(
-                "tick {:>6}  t={:>7.2}s  pop {:>6}  births {:>5}  deaths {:>5}  E_field {:>9.2}  E_org {:>9.2}  resid {:>9.2e}  {:>6.1} steps/s",
-                world.tick, world.simulation_seconds(), world.orgs.len(), interval.0, interval.1, r.ledger.field_energy_after, r.ledger.organism_energy_after, l.residual, steps_per_s
+                "tick {:>6}  t={:>7.2}s  pop {:>6}  births {:>5}  deaths {:>5}  resid {:>9.2e}  {:>6.1} steps/s | step {:>6.2} ms = field {:.2} + sense/infer {:.2} (backend {:.2}) + exchange {:.2} + lifecycle {:.2}",
+                world.tick, world.simulation_seconds(), world.orgs.len(), interval.0, interval.1, l.residual, steps_per_s,
+                phases.step_ms / n, phases.transport_ms / n, phases.sense_and_infer_ms / n, phases.backend_inference_ms / n, phases.exchange_ms / n, phases.lifecycle_ms / n
             );
+            phases = Phases::default();
             interval = (0, 0);
             interval_ticks = 0;
             interval_wall = Instant::now();
         }
         if ckpt_every.is_some_and(|k| world.tick % k == 0) {
+            let t = Instant::now();
             write_checkpoint(&world, &ckpt_dir, retain);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            phases.checkpoint_ms += ms;
+            run_phases.checkpoint_ms += ms;
         }
         if a.frame_every > 0 && world.tick % a.frame_every == 0 {
+            let t = Instant::now();
             save_frame(&world, &opts_base, &frames_dir, frame_no, steps_per_s);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            phases.frame_ms += ms;
+            phases.frames += 1;
+            run_phases.frame_ms += ms;
+            run_phases.frames += 1;
             frame_no += 1;
         }
     }
@@ -458,6 +494,7 @@ fn run(a: RunArgs) -> i32 {
         "wall_seconds": wall,
         "workers": world.workers,
         "inference_backend": format!("{:?}", a.backend),
+        "timing": run_phases.json(),
         "final_state_hash": format!("{:016x}", world.state_hash()),
         "population": world.orgs.len(),
         "totals": world.totals,
@@ -502,7 +539,55 @@ fn save_frame(world: &World, base: &RenderOpts, dir: &Path, frame: usize, steps_
     }
 }
 
-fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_per_s: f64) {
+/// Wall-clock cost per phase, summed over one metrics interval (execution telemetry only).
+#[derive(Default, Clone, Copy)]
+struct Phases {
+    ticks: u64,
+    step_ms: f64,
+    transport_ms: f64,
+    sense_and_infer_ms: f64,
+    backend_inference_ms: f64,
+    exchange_ms: f64,
+    lifecycle_ms: f64,
+    frame_ms: f64,
+    frames: u64,
+    checkpoint_ms: f64,
+}
+
+impl Phases {
+    fn add(&mut self, t: &fl_core::world::TickTiming) {
+        self.ticks += 1;
+        self.step_ms += t.total_ms;
+        self.transport_ms += t.transport_ms;
+        self.sense_and_infer_ms += t.sense_and_infer_ms;
+        self.backend_inference_ms += t.backend_inference_ms;
+        self.exchange_ms += t.exchange_ms;
+        self.lifecycle_ms += t.lifecycle_ms;
+    }
+    fn json(&self) -> serde_json::Value {
+        let n = self.ticks.max(1) as f64;
+        let step = self.step_ms / n;
+        json!({
+            "ticks": self.ticks,
+            "mean_step_ms": step,
+            "simulation_only_steps_per_second": if step > 0.0 { 1000.0 / step } else { 0.0 },
+            "mean_ms": {
+                "field_transport_and_sources": self.transport_ms / n,
+                "sensing_and_inference": self.sense_and_infer_ms / n,
+                "of_which_backend_inference": self.backend_inference_ms / n,
+                "uptake_exchange_and_settlement": self.exchange_ms / n,
+                "motion_emission_lifecycle_deposits": self.lifecycle_ms / n,
+                "other_in_step": (self.step_ms - self.transport_ms - self.sense_and_infer_ms - self.exchange_ms - self.lifecycle_ms) / n,
+            },
+            "frames_written": self.frames,
+            "mean_frame_ms": if self.frames > 0 { self.frame_ms / self.frames as f64 } else { 0.0 },
+            "checkpoint_ms": self.checkpoint_ms,
+            "budget_ms_at_128_steps_per_second": 1000.0 / 128.0,
+        })
+    }
+}
+
+fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_per_s: f64, phases: &Phases) {
     let o = &w.orgs;
     let n = o.len().max(1) as f64;
     let mut topo: BTreeMap<String, usize> = BTreeMap::new();
@@ -529,6 +614,7 @@ fn write_metrics(out: &mut impl Write, w: &World, interval: (u32, u32), steps_pe
         "organism_energy": o.energy.iter().sum::<f64>(),
         "ledger": w.ledger,
         "achieved_steps_per_wall_second": steps_per_s,
+        "timing": phases.json(),
     });
     writeln!(out, "{rec}").ok();
 }

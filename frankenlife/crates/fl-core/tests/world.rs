@@ -258,7 +258,7 @@ fn c15_integer_ticks_keep_aging_past_f32_horizon() {
 
 #[test]
 fn shipped_presets_validate() {
-    for p in ["reference-field-ecology.toml", "vivid-field-ecology.toml", "target-80k-field-ecology.toml"] {
+    for p in ["reference-field-ecology.toml", "vivid-field-ecology.toml", "target-20k-field-ecology.toml", "target-80k-field-ecology.toml"] {
         let path = format!("{}/../../presets/{p}", env!("CARGO_MANIFEST_DIR"));
         let c = Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
         c.validate().unwrap_or_else(|e| panic!("{p}: {e:?}"));

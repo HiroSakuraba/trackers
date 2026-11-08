@@ -68,7 +68,13 @@ cargo run --release -- gpu-check                     # open the GPU, verify agai
 cargo run --release -- run --config presets/vivid-field-ecology.toml --backend gpu --seconds 30
 ```
 
-The full-scale workload from the revised plan (80,000 organisms, 1024² field):
+Performance targets from the revised plan: **20,000 organisms first**
+(`presets/target-20k-field-ecology.toml`, 256² field), 80,000 as the stretch goal.
+Measure with `--frame-every 0`; every run reports per-phase step timings
+(console, `metrics.jsonl`, `manifest.json` → `"timing"`), and `gpu-check`
+reports host prep / GPU round trip / kernel time separately.
+
+The stretch workload (80,000 organisms, 1024² field):
 `presets/target-80k-field-ecology.toml` (a workload definition, not a qualified
 ecology). The plan itself, revised to the 80,000 target, is in
 [docs/FrankenLife_Design_Plan.html](docs/FrankenLife_Design_Plan.html).
@@ -159,7 +165,7 @@ Still missing:
   colors in `DotCloud` (organisms are bucketed into 12 colors).
 - **FrankenSQLite** run catalog and crash recovery; checkpoints are plain files
   storing full F32 genomes (~165 MB at 4,096 organisms) without deduplication.
-- Scale: 25k (M2) and 80k (M4) qualification, deterministic GPU reductions,
+- Scale: 20k (first performance target) and 80k (stretch) qualification, deterministic GPU reductions,
   timestep-refinement studies, ablations, seed gallery.
 
 `mutation.rng` in the presets is `fl-philox-semantic-v1` (this crate's own

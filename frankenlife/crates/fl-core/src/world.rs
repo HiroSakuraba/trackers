@@ -214,6 +214,9 @@ pub struct TickTiming {
     pub total_ms: f64,
     pub transport_ms: f64,
     pub sense_and_infer_ms: f64,
+    /// Part of `sense_and_infer_ms` spent inside an external backend's `evaluate`
+    /// (0 for the built-in reference, where inference is fused with sensing).
+    pub backend_inference_ms: f64,
     pub exchange_ms: f64,
     pub lifecycle_ms: f64,
 }
@@ -454,7 +457,10 @@ impl World {
             let jobs: Vec<InferenceJob<'_>> =
                 due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &orgs.genome[i], input: &senses[i].input }).collect();
             let mut outs = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
-            be.evaluate(&jobs, &mut outs).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", be.name()) })?;
+            let tb = Stopwatch::start();
+            let res = be.evaluate(&jobs, &mut outs);
+            timing.backend_inference_ms = tb.ms();
+            res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", be.name()) })?;
             drop(jobs);
             for (k, &i) in due.iter().enumerate() {
                 if outs[k].iter().any(|v| !v.is_finite()) {

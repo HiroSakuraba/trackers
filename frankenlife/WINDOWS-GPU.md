@@ -53,6 +53,22 @@ The plan's full target (80,000 independent networks, ~3 GB of weights):
 cargo run --release -- run --config presets\vivid-field-ecology.toml --backend gpu --seconds 30 --frame-every 32 --out runs\gpu
 ```
 
+**Performance measurement at the first target (20,000 organisms)**, no images, so
+only simulation time is counted:
+
+```powershell
+cargo run --release -- run --config presets\target-20k-field-ecology.toml --backend gpu --seconds 10 --frame-every 0 --out runs\t20
+cargo run --release -- run --config presets\target-20k-field-ecology.toml --backend cpu --seconds 10 --frame-every 0 --out runs\t20cpu
+cargo run --release -- gpu-check --organisms 20000
+```
+
+Each run prints, every simulated second, the mean step time split into field,
+sensing/inference (and the GPU backend's share), exchange and lifecycle, against
+the 7.8 ms budget for 128 steps/s; the same numbers are in `metrics.jsonl` and
+`manifest.json` under `"timing"`. `gpu-check` now also splits each batch into
+host preparation, GPU round trip and kernel time (GPU timestamps). Please send
+the console output of all three.
+
 The full 80,000-organism target world:
 
 ```powershell

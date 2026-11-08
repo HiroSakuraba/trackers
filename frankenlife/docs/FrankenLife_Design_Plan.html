@@ -482,6 +482,7 @@ Implementation handoff</a></li>
 <h1 id="comprehensive-plan-for-the-design-of-frankenlife">Comprehensive
 Plan for the Design of FrankenLife</h1>
 <p><strong>Revision (2026-11-08):</strong> the full target scale is <strong>80,000 organisms</strong> (previously 400,000), sized so the complete F32 weight bank (≈2.98 GiB at a 10k-parameter average) fits an 8 GB GPU such as a GTX 1080. Derived figures in §19 (weight bytes, MACs, bandwidth, memory, energy budget), the profile table, gate G7, milestone M4 and the backlog follow from it; the Desktop ecology profile drops from 100,000 to 50,000 so it stays below the full target. Observations about the reference screenshots (≈400,000 particles) are unchanged.</p>
+<p><strong>Revision (2026-11-08, second):</strong> 20,000 organisms is the first performance target and 80,000 the stretch goal (§19.5, “Performance targets”); the Interactive profile, milestone M2 and the matching backlog item move from 25k to 20k, and the 100k profile qualification item to 50k. §19.5 now states the weight-stream floor that rules out full-evaluation F32 at 80,000 and 128 steps/s on an 8 GB, ≈320 GB/s GPU.</p>
 <p><strong>FrankenLife</strong> is a real-time artificial-life
 laboratory in memory-safe Rust: hundreds of thousands of continuously
 positioned organisms, each with its own heritable neural controller and
@@ -3616,11 +3617,11 @@ targets or model settings; no row is a measured capability.</p>
 </tr>
 <tr class="even">
 <td>Interactive</td>
-<td style="text-align: right;">25,000</td>
+<td style="text-align: right;">20,000</td>
 <td>256² × 33</td>
 <td>F32 or separately identified F16</td>
 <td>Every tick</td>
-<td>First polished live viewer</td>
+<td>First polished live viewer; first performance target</td>
 </tr>
 <tr class="odd">
 <td>Desktop ecology</td>
@@ -3665,6 +3666,8 @@ interactive.</p>
 <p>At 30 achieved steps/s with <code>Δt=1/128</code>, the world advances
 at about 0.234 simulation-seconds per wall-second. Report that ratio. A
 high display rate cannot conceal a slowly advancing ecology.</p>
+<p><strong>Performance targets.</strong> 20,000 organisms is the first performance target and 80,000 the stretch goal; neither is yet a demonstrated real-time population. Qualify against two step rates separately: 30 achieved steps/s (the interactive bar above, 33.3 ms per step) and 128 steps/s (one simulation-second per wall-second, 7.8 ms per step for the <em>whole</em> step, of which controller evaluation is only one part). The weight stream sets a hard floor: one full-evaluation sweep at F32 and a 10k-parameter average reads 0.8 GB at 20,000 organisms and 3.2 GB at 80,000, which on a GTX 1080 (≈320 GB/s) is at least 2.5 ms and 10 ms respectively. Full-evaluation F32 at 80,000 therefore cannot reach 128 steps/s on that class of GPU; it needs F16 weights, a multi-rate controller schedule, or a lower step rate, and each of those changes the model or its numerics and must be validated as a separately identified profile.</p>
+<p>The order of work toward these targets: (1) measure the 20,000-organism world without image output, with per-phase timings and separate GPU kernel/transfer times; (2) move the field, sensing, uptake/grant resolution and deposits onto the accelerator, using the deterministic reduction route of §11.3 or declaring a separate determinism class; (3) keep world state device-resident between steps, transferring only births, deaths, commands and bounded render projections; (4) decouple display (30 fps) from the advancing world. Reducing controller cadence or the step rate comes last and only as named, validated profiles.</p>
 <p>For a multi-rate profile, scientific steps/s divided by the
 controller interval is only a <strong>nominal</strong>
 full-population-equivalent evaluation rate. Actual work changes with
@@ -4071,7 +4074,7 @@ ledger, reproduction/mutation/death, and live Manim view</td>
 </tr>
 <tr class="odd">
 <td>M2 Usable laboratory</td>
-<td>Polished 25k profile, inspector, interventions, checkpoint/resume,
+<td>Polished 20k profile, inspector, interventions, checkpoint/resume,
 branches, basic recording</td>
 <td>G3, G5, G6 at this profile</td>
 <td>Resolve UX and semantics before large-scale optimization</td>
@@ -4482,7 +4485,7 @@ measured copy/readback volume</td>
 </tr>
 <tr class="even">
 <td>FL-034</td>
-<td>Qualify 25k and 100k live accelerated profiles</td>
+<td>Qualify 20k and 50k live accelerated profiles</td>
 <td>FL-024, FL-030, FL-031, FL-032, FL-033, FL-043</td>
 <td>G4 and G6 with full runtime telemetry and memory admission</td>
 </tr>
