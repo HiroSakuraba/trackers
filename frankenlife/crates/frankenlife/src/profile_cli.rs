@@ -281,7 +281,7 @@ impl GpuRollup {
             clock::CPU_WALL,
             self.uptake_pack_ms,
             self.resident_ticks,
-            "CPU build of the uptake item records, including the per-tick affinity copy. Already included in resident_uptake_submit_and_wait. Not GPU kernel time.",
+            "CPU build of the compact uptake headers (cell, bilinear weights, demand, affinity slot). Affinity floats stay resident and are expanded on the device. Already included in resident_uptake_submit_and_wait. Not GPU kernel time.",
         );
         push(
             &mut out,

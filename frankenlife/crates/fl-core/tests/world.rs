@@ -339,11 +339,22 @@ fn c15_integer_ticks_keep_aging_past_f32_horizon() {
 
 #[test]
 fn shipped_presets_validate() {
-    for p in ["reference-field-ecology.toml", "vivid-field-ecology.toml", "target-20k-field-ecology.toml", "target-80k-field-ecology.toml"] {
+    for p in ["reference-field-ecology.toml", "vivid-field-ecology.toml", "target-10k-field-ecology.toml", "target-20k-field-ecology.toml", "target-80k-field-ecology.toml"] {
         let path = format!("{}/../../presets/{p}", env!("CARGO_MANIFEST_DIR"));
         let c = Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
         c.validate().unwrap_or_else(|e| panic!("{p}: {e:?}"));
     }
+    let root = format!("{}/../../presets", env!("CARGO_MANIFEST_DIR"));
+    let mut t10 = Config::from_toml(&std::fs::read_to_string(format!("{root}/target-10k-field-ecology.toml")).unwrap()).unwrap();
+    let t20 = Config::from_toml(&std::fs::read_to_string(format!("{root}/target-20k-field-ecology.toml")).unwrap()).unwrap();
+    assert_eq!(t10.population.initial_count, 10_000);
+    assert_eq!(t10.population.maximum_count, 12_000);
+    assert_eq!(t20.population.initial_count, 20_000);
+    assert_eq!(t20.population.maximum_count, 24_000);
+    t10.name = t20.name.clone();
+    t10.population.initial_count = t20.population.initial_count;
+    t10.population.maximum_count = t20.population.maximum_count;
+    assert_eq!(t10, t20, "10k preset is the 20k preset with organism counts halved");
 }
 
 #[test]

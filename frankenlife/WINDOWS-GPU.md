@@ -124,11 +124,32 @@ is 7.8125 ms per step.
 With `--profile`, `profile.json` also splits the resident uptake wall into
 `resident_uptake_pack`, `resident_uptake_upload_encode`, and
 `resident_uptake_wait_readback` (the three already sum into the uptake wall;
-do not add them again). `resident_deposit_timestamp_span` is the deposit GPU
-timestamp span, read in the finish poll that already waits. `sense_or_mlp_dispatches`
-is a count of compute dispatches, and `sense_or_mlp_readback_copy` is only the
-CPU copy after that wait returns. The unprofiled command stream does not record
-these and does not write the deposit timestamp queries.
+do not add them again). `resident_uptake_pack` is now only the compact header
+(cell, weights, demand, affinity slot). Affinity floats stay in a resident
+buffer and a device copy expands them into the same item records as before.
+`resident_deposit_timestamp_span` is the deposit GPU timestamp span, read in
+the finish poll that already waits. `sense_or_mlp_dispatches` is a count of
+compute dispatches, and `sense_or_mlp_readback_copy` is the scatter out of the
+mapped sense/MLP rows (there is no second intermediate copy). Sense slot and
+scale stay resident; the per-tick upload is position, due, and the five
+intrinsic inputs, expanded on device into the same 12-float job. The
+unprofiled command stream does not write the deposit timestamp queries.
+Profiling does not change results.
+
+`presets/target-10k-field-ecology.toml` is the 20k preset with
+`initial_count` 10000 and `maximum_count` 12000. Nothing else differs.
+
+```powershell
+cargo run --release -- run --config presets\target-10k-field-ecology.toml --backend gpu-resident --seconds 6 --frame-every 0 --out runs\t10r
+cargo run --release -- run --config presets\target-10k-field-ecology.toml --backend gpu-resident --seconds 6 --frame-every 0 --profile --out runs\t10r-profile
+cargo run --release -- run --config presets\target-20k-field-ecology.toml --backend gpu-resident --seconds 6 --frame-every 0 --out runs\t20r-overlap
+cargo run --release -- run --config presets\target-20k-field-ecology.toml --backend gpu-resident --seconds 6 --frame-every 0 --profile --out runs\t20r-overlap-profile
+```
+
+The 20k unprofiled run should keep population 19809 and hash
+`611e5a19ee18a552`. `resident_uptake_pack` should fall well below the previous
+2.46 ms/tick, and `sense_or_mlp_host_prep` should fall below the previous
+3.76 ms/tick.
 
 ## Other runs
 

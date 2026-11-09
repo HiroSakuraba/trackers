@@ -621,17 +621,14 @@ impl World {
             s.advance_to(n, cfg, &self.rng);
         }
         prof.stop(CpuStage::ChemistryField, ps);
+        // Resident transport is submitted and not waited on yet. Sense-job
+        // packing below overlaps that GPU work; the accounting wait follows it.
+        let mut transport_open = false;
         if let Some(r) = resident.as_mut() {
             let ps = prof.start();
-            let acct = r.transport_resident(cfg, &sources, n).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident transport: {detail}") })?;
-            // Device field step: host record plus the wait the step already uses
-            // for accounting readback. The GPU timestamp span, if any, is reported
-            // by the backend and is not this CPU span.
+            r.submit_transport(cfg, &sources, n).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident transport: {detail}") })?;
             prof.stop(CpuStage::TransfersSync, ps);
-            dis.decay += acct.decay_removed;
-            counts.transport_subcycles = acct.subcycles;
-            led.injected_sources = acct.injected;
-            dis.tiny_reservoir += acct.tiny_removed;
+            transport_open = true;
         } else if let Some(d) = device.as_mut() {
             let ps = prof.start();
             let acct = d
@@ -651,16 +648,14 @@ impl World {
             led.injected_sources = acct.injected;
             dis.tiny_reservoir += acct.tiny_removed;
         }
-        timing.transport_ms = t.ms();
+        if !transport_open {
+            timing.transport_ms = t.ms();
+        }
 
         // ── Phase 3–4: sensing pyramid, sample organisms, evaluate due controllers ──
-        let t = Stopwatch::start();
-        let fused: Option<&mut dyn SenseInferBackend> = match (device, resident.as_mut()) {
-            (Some(d), _) => Some(d),
-            (None, Some(r)) => Some(&mut **r),
-            (None, None) => fused,
-        };
-        let mut senses = if let Some(fb) = fused {
+        let t_sense = Stopwatch::start();
+        let sense_now = device.is_some() || resident.is_some() || fused.is_some();
+        let mut senses = if sense_now {
             let ps = prof.start();
             let k_eval = cfg.controller.evaluation_interval_ticks as u64;
             let idx: Vec<usize> = (0..orgs.len()).filter(|&i| !dead[i]).collect();
@@ -679,6 +674,23 @@ impl World {
                 })
                 .collect();
             prof.stop(CpuStage::Sensing, ps);
+            if transport_open {
+                let ps = prof.start();
+                let acct = resident.as_mut().expect("resident transport").finish_transport().map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident transport: {detail}") })?;
+                // The wait that remains after sense-job packing. Not GPU kernel time.
+                prof.stop(CpuStage::TransfersSync, ps);
+                dis.decay += acct.decay_removed;
+                counts.transport_subcycles = acct.subcycles;
+                led.injected_sources = acct.injected;
+                dis.tiny_reservoir += acct.tiny_removed;
+                timing.transport_ms = t.ms();
+            }
+            let fused: Option<&mut dyn SenseInferBackend> = match (device, resident.as_mut()) {
+                (Some(d), _) => Some(d),
+                (None, Some(r)) => Some(&mut **r),
+                (None, None) => fused,
+            };
+            let fb = fused.expect("fused backend");
             let mut senses_buf = std::mem::take(&mut self.sense_scratch.0);
             if senses_buf.len() != orgs.len() {
                 senses_buf.resize(orgs.len(), Sense::blank());
@@ -762,7 +774,7 @@ impl World {
             }
         }
         prof.stop_other(OtherPart::HeldStore, ps);
-        timing.sense_and_infer_ms = t.ms();
+        timing.sense_and_infer_ms = t_sense.ms();
 
         // ── Phase 5: uptake requests and cell grants ──────────────────────
         let t = Stopwatch::start();
@@ -1460,7 +1472,15 @@ pub trait ResidentBackend: SenseInferBackend {
     fn download_committed(&mut self, field: &mut Field) -> Result<(), String>;
     fn committed_energy(&self) -> f64;
     fn begin_tick(&mut self, ops: &[FieldDeposit]) -> Result<(), String>;
-    fn transport_resident(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String>;
+    /// Queue the field step without waiting. The GPU implementation returns
+    /// after `queue.submit`, so the caller can pack sense jobs while it runs.
+    fn submit_transport(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<(), String>;
+    /// Wait for the field step submitted by [`Self::submit_transport`] and return its accounting.
+    fn finish_transport(&mut self) -> Result<FieldAccounting, String>;
+    fn transport_resident(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+        self.submit_transport(cfg, sources, n)?;
+        self.finish_transport()
+    }
     /// Fills `out` and debits granted energy from the working field; returns total granted energy.
     fn uptake(&mut self, chemistry: &crate::config::ChemistryCfg, jobs: &[UptakeJob<'_>], out: &mut [UptakeOut]) -> Result<f64, String>;
     fn deposit(&mut self, deposits: &[FieldDeposit]) -> Result<(), String>;
@@ -1490,6 +1510,7 @@ pub struct ReferenceResident {
     working: Option<Field>,
     pending_energy: f64,
     committed_energy: f64,
+    pending_transport: Option<FieldAccounting>,
 }
 
 impl SenseInferBackend for ReferenceResident {
@@ -1523,8 +1544,13 @@ impl ResidentBackend for ReferenceResident {
         self.working = Some(w);
         Ok(())
     }
-    fn transport_resident(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
-        cpu_transport_and_sources(self.working.as_mut().ok_or("no working field")?, cfg, sources, n)
+    fn submit_transport(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<(), String> {
+        let acct = cpu_transport_and_sources(self.working.as_mut().ok_or("no working field")?, cfg, sources, n)?;
+        self.pending_transport = Some(acct);
+        Ok(())
+    }
+    fn finish_transport(&mut self) -> Result<FieldAccounting, String> {
+        self.pending_transport.take().ok_or_else(|| "transport was not submitted".into())
     }
     fn uptake(&mut self, ch: &crate::config::ChemistryCfg, jobs: &[UptakeJob<'_>], out: &mut [UptakeOut]) -> Result<f64, String> {
         let field = self.working.as_mut().ok_or("no working field")?;

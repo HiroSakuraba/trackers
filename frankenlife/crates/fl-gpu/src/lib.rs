@@ -34,7 +34,14 @@ const SENSE_SHADER: &str = include_str!("sense.wgsl");
 const PYRAMID_SHADER: &str = include_str!("pyramid.wgsl");
 const FIELD_SHADER: &str = include_str!("field.wgsl");
 const RESIDENT_SHADER: &str = include_str!("resident.wgsl");
+const EXPAND_SHADER: &str = include_str!("expand.wgsl");
+const JOB_EXPAND_SHADER: &str = include_str!("job_expand.wgsl");
 const ITEM_STRIDE: usize = 36;
+/// Compact uptake header: cell, tx, ty, demand, affinity slot. Expanded on device.
+const HEADER_STRIDE: usize = 5;
+/// Per-tick sense inputs: x, y, due, five intrinsics. Slot and scale stay resident.
+const DYN_STRIDE: usize = 8;
+const STATIC_STRIDE: usize = 2;
 const SOURCE_STRIDE: usize = 44;
 /// Floats per slot in the resident traits buffer: 33 motion sensitivities + padding.
 const TRAITS_STRIDE: usize = 36;
@@ -115,6 +122,8 @@ struct Slab {
     owner: Vec<Option<u64>>,
     last_used: Vec<u64>,
     free: Vec<usize>,
+    /// Bumped when this slab's buffers are replaced, so cached bind groups die with them.
+    epoch: u64,
 }
 
 impl Slab {
@@ -143,6 +152,9 @@ struct ResidentPipelines {
     uptake_debit: wgpu::ComputePipeline,
     deposit_gather: wgpu::ComputePipeline,
     finish: wgpu::ComputePipeline,
+    expand: wgpu::ComputePipeline,
+    expand_layout: wgpu::BindGroupLayout,
+    expand_uniform: wgpu::Buffer,
 }
 
 /// Device-resident field state: the committed field plus exchange work buffers.
@@ -156,6 +168,8 @@ struct ResidentState {
     // Work buffers (grown on demand).
     items_cap: usize,
     items: wgpu::Buffer,
+    headers: wgpu::Buffer,
+    expand_bind: Option<wgpu::BindGroup>,
     counts: wgpu::Buffer,
     starts: wgpu::Buffer,
     sorted: wgpu::Buffer,
@@ -290,8 +304,52 @@ pub struct GpuBackend {
     res_pipes: ResidentPipelines,
     resident: Option<ResidentState>,
     sense_io: Option<Io>,
+    /// Field-step readback submitted but not polled yet, so the CPU can pack
+    /// sense jobs while that GPU work runs. `None` unless `submit_transport` is ahead.
+    pending_field: Option<PendingField>,
+    affinity: Option<wgpu::Buffer>,
+    affinity_cap: u32,
+    affinity_len: u32,
+    affinity_free: Vec<u32>,
+    affinity_of: HashMap<u64, u32>,
+    /// Stencils computed while a sense dispatch was in flight, in sense-job order.
+    stencil_ids: Vec<u64>,
+    stencil_xy: Vec<(u64, u64)>,
+    stencil_val: Vec<(u32, f32, f32)>,
+    job_dyn: Option<wgpu::Buffer>,
+    job_static: Option<wgpu::Buffer>,
+    job_expand_bind: Option<wgpu::BindGroup>,
+    job_expand_pipe: Option<wgpu::ComputePipeline>,
+    job_expand_layout: Option<wgpu::BindGroupLayout>,
+    job_expand_uniform: Option<wgpu::Buffer>,
+    job_cap: usize,
+    sense_bind: Option<SenseBind>,
+    sense_words: Option<[u32; 76]>,
+    sense_static_sig: Vec<(u64, u32, u32)>,
     pub info: GpuInfo,
     pub stats: GpuStats,
+}
+
+struct PendingField {
+    rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    ts_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    start: u64,
+    end: u64,
+    cells: usize,
+    resident: bool,
+    subcycles: u32,
+    round_started: std::time::Instant,
+}
+
+struct SenseInflight {
+    rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    ts_rx: Option<mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    bytes: u64,
+}
+
+struct SenseBind {
+    key: (usize, usize, usize, u64, u64),
+    group: wgpu::BindGroup,
 }
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -359,7 +417,7 @@ impl GpuBackend {
                 let stride: Vec<usize> = dims.iter().map(|&(i, o)| i * o + o).collect();
                 let widest = *stride.iter().max().expect("layers") as u64 * 4;
                 let page_slots = ((limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size) / widest).clamp(1, 1 << 20) as usize;
-                Slab { dims, stride, pages: Vec::new(), traits: Vec::new(), page_slots, last_cap: 0, owner: Vec::new(), last_used: Vec::new(), free: Vec::new() }
+                Slab { dims, stride, pages: Vec::new(), traits: Vec::new(), page_slots, last_cap: 0, owner: Vec::new(), last_used: Vec::new(), free: Vec::new(), epoch: 0 }
             })
             .collect();
         let uentry = |binding| wgpu::BindGroupLayoutEntry {
@@ -458,6 +516,36 @@ impl GpuBackend {
                 cache: None,
             })
         };
+        let expand_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("expand-items"), source: wgpu::ShaderSource::Wgsl(EXPAND_SHADER.into()) });
+        let expand_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("expand-items"),
+            entries: &[uentry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false)],
+        });
+        let epl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("expand-items"), bind_group_layouts: &[Some(&expand_layout)], immediate_size: 0 });
+        let expand_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("expand_items"),
+            layout: Some(&epl),
+            module: &expand_module,
+            entry_point: Some("expand_items"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let expand_uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expand-items-dims"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let job_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("expand-jobs"), source: wgpu::ShaderSource::Wgsl(JOB_EXPAND_SHADER.into()) });
+        let job_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("expand-jobs"),
+            entries: &[uentry(0), storage_entry(1, true), storage_entry(2, true), storage_entry(3, false)],
+        });
+        let jpl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("expand-jobs"), bind_group_layouts: &[Some(&job_layout)], immediate_size: 0 });
+        let job_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("expand_jobs"),
+            layout: Some(&jpl),
+            module: &job_module,
+            entry_point: Some("expand_jobs"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let job_uniform = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expand-jobs-dims"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let res_pipes = ResidentPipelines {
             bin_count: mkr("bin_count"),
             bin_scan: mkr("bin_scan"),
@@ -469,6 +557,9 @@ impl GpuBackend {
             deposit_gather: mkr("deposit_gather"),
             finish: mkr("finish"),
             layout: res_layout,
+            expand: expand_pipe,
+            expand_layout,
+            expand_uniform,
         };
         let field_pipes = FieldPipelines { diffuse: mkf("diffuse"), decay: mkf("decay"), source_norm: mkf("source_norm"), inject: mkf("inject"), tiny: mkf("tiny"), layout: field_layout };
         let timestamps = ts_ok.then(|| Timestamps {
@@ -485,7 +576,55 @@ impl GpuBackend {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
             max_buffer_bytes: limits.max_buffer_size,
         };
-        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, resident_timestamps, deposit_timestamps, deposit_ts_armed: false, profiling: false, field_resident: false, field_gpu: None, field_gen: 0, res_pipes, resident: None, sense_io: None, info, stats: GpuStats::default() })
+        Ok(GpuBackend {
+            device,
+            queue,
+            pipeline,
+            layout,
+            uniform,
+            dummy,
+            slabs,
+            slot_of: HashMap::new(),
+            io: None,
+            call: 0,
+            timestamps,
+            pyramid_timestamps,
+            input_scratch: Vec::new(),
+            sense,
+            field_pipes,
+            field_timestamps,
+            resident_timestamps,
+            deposit_timestamps,
+            deposit_ts_armed: false,
+            profiling: false,
+            field_resident: false,
+            field_gpu: None,
+            field_gen: 0,
+            res_pipes,
+            resident: None,
+            sense_io: None,
+            pending_field: None,
+            affinity: None,
+            affinity_cap: 0,
+            affinity_len: 0,
+            affinity_free: Vec::new(),
+            affinity_of: HashMap::new(),
+            stencil_ids: Vec::new(),
+            stencil_xy: Vec::new(),
+            stencil_val: Vec::new(),
+            job_dyn: None,
+            job_static: None,
+            job_expand_bind: None,
+            job_expand_pipe: Some(job_pipe),
+            job_expand_layout: Some(job_layout),
+            job_expand_uniform: Some(job_uniform),
+            job_cap: 0,
+            sense_bind: None,
+            sense_words: None,
+            sense_static_sig: Vec::new(),
+            info,
+            stats: GpuStats::default(),
+        })
     }
 
     /// Record resident uptake/finish timestamp spans. Off by default, so the
@@ -575,6 +714,8 @@ impl GpuBackend {
         slab.free.extend((before..after).rev());
         slab.owner.resize(after, None);
         slab.last_used.resize(after, 0);
+        slab.epoch = slab.epoch.wrapping_add(1);
+        self.sense_bind = None;
         self.stats.slab_growths += 1;
         Ok(())
     }
@@ -746,6 +887,9 @@ impl GpuBackend {
                         slab.owner[slot] = None;
                         slab.free.push(slot);
                         self.slot_of.remove(&g);
+                        if let Some(slot) = self.affinity_of.remove(&g) {
+                            self.affinity_free.push(slot);
+                        }
                         self.stats.evictions += 1;
                     }
                 }
@@ -878,7 +1022,7 @@ impl GpuBackend {
     }
 
     fn ensure_sense_io(&mut self, n: usize) {
-        if self.sense_io.as_ref().is_some_and(|io| io.cap >= n) {
+        if self.sense_io.as_ref().is_some_and(|io| io.cap >= n) && self.job_cap >= n {
             return;
         }
         let cap = n.next_power_of_two().max(256);
@@ -891,13 +1035,73 @@ impl GpuBackend {
             outputs: mk("sense-out", cap * SENSE_OUT_STRIDE * 4, U::STORAGE | U::COPY_SRC),
             staging: mk("sense-staging", cap * SENSE_OUT_STRIDE * 4, U::MAP_READ | U::COPY_DST),
         });
+        self.job_dyn = Some(mk("sense-dyn", cap * DYN_STRIDE * 4, U::STORAGE | U::COPY_DST));
+        self.job_static = Some(mk("sense-static", cap * STATIC_STRIDE * 4, U::STORAGE | U::COPY_DST));
+        self.job_cap = cap;
+        self.job_expand_bind = None;
+        self.sense_bind = None;
+        self.sense_static_sig.clear();
+        self.sense_words = None;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_sense(&mut self, t: usize, page: usize, slots: &[u32], jobs_f: &[f32], sensors: &fl_core::config::SensorsCfg) -> Result<Vec<f32>, String> {
+    fn ensure_job_expand_bind(&mut self) {
+        if self.job_expand_bind.is_some() {
+            return;
+        }
+        let io = self.sense_io.as_ref().expect("sense io");
+        let dynb = self.job_dyn.as_ref().expect("dynamic jobs");
+        let stb = self.job_static.as_ref().expect("static jobs");
+        let layout = self.job_expand_layout.as_ref().expect("job expand layout");
+        let uniform = self.job_expand_uniform.as_ref().expect("job expand uniform");
+        self.job_expand_bind = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("expand-jobs"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: dynb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: stb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: io.inputs.as_entire_binding() },
+            ],
+        }));
+    }
+
+    fn ensure_sense_bind(&mut self, t: usize, page: usize) {
+        let cap = self.sense_io.as_ref().expect("sense io").cap;
+        let epoch = self.slabs[t].epoch;
+        let key = (t, page, cap, self.field_gen, epoch);
+        if self.sense_bind.as_ref().is_some_and(|b| b.key == key) {
+            return;
+        }
+        let io = self.sense_io.as_ref().expect("sense io");
+        let fg = self.field_gpu.as_ref().expect("field resources");
+        let slab = &self.slabs[t];
+        let wb = |l: usize| slab.pages[page].get(l).unwrap_or(&self.dummy).as_entire_binding();
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sense"),
+            layout: &self.sense.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.sense.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: io.inputs.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: fg.pyr.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: slab.traits[page].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wb(0) },
+                wgpu::BindGroupEntry { binding: 5, resource: wb(1) },
+                wgpu::BindGroupEntry { binding: 6, resource: if slab.dims.len() == MAX_LAYERS { wb(2) } else { self.dummy.as_entire_binding() } },
+                wgpu::BindGroupEntry { binding: 7, resource: io.outputs.as_entire_binding() },
+            ],
+        });
+        self.sense_bind = Some(SenseBind { key, group });
+    }
+
+    /// Record one fused sense dispatch and map its output, without waiting.
+    /// The job buffer the shader reads is filled by `expand_jobs` from the
+    /// dynamic upload plus the resident slot/scale buffer, byte-for-byte the
+    /// same 12-float records the CPU used to write.
+    fn submit_sense_group(&mut self, t: usize, page: usize, n: usize, dynamic: &[f32], statics: &[f32], statics_changed: bool, sensors: &fl_core::config::SensorsCfg) -> Result<SenseInflight, String> {
         let prep = std::time::Instant::now();
-        let n = slots.len();
         self.ensure_sense_io(n);
+        self.ensure_job_expand_bind();
+        self.ensure_sense_bind(t, page);
         let io = self.sense_io.as_ref().expect("sense io");
         let fg = self.field_gpu.as_ref().expect("field resources");
         let slab = &self.slabs[t];
@@ -922,30 +1126,42 @@ impl GpuBackend {
             w[44 + 4 * l] = hx.to_bits();
             w[44 + 4 * l + 1] = hy.to_bits();
         }
-        self.queue.write_buffer(&self.sense.uniform, 0, bytemuck::cast_slice(&w));
-        self.queue.write_buffer(&io.inputs, 0, f32_bytes(jobs_f));
-        let wb = |l: usize| slab.pages[page].get(l).unwrap_or(&self.dummy).as_entire_binding();
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("sense"),
-            layout: &self.sense.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.sense.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: io.inputs.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: fg.pyr.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: slab.traits[page].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: wb(0) },
-                wgpu::BindGroupEntry { binding: 5, resource: wb(1) },
-                wgpu::BindGroupEntry { binding: 6, resource: if slab.dims.len() == MAX_LAYERS { wb(2) } else { self.dummy.as_entire_binding() } },
-                wgpu::BindGroupEntry { binding: 7, resource: io.outputs.as_entire_binding() },
-            ],
-        });
+        if self.sense_words != Some(w) {
+            self.queue.write_buffer(&self.sense.uniform, 0, bytemuck::cast_slice(&w));
+            self.sense_words = Some(w);
+        }
+        let dynb = self.job_dyn.as_ref().expect("dynamic jobs");
+        self.queue.write_buffer(dynb, 0, f32_bytes(dynamic));
+        if statics_changed {
+            let stb = self.job_static.as_ref().expect("static jobs");
+            self.queue.write_buffer(stb, 0, f32_bytes(statics));
+        }
+        let expand_grid = grid_for((n as u32).div_ceil(64));
+        let dims = [n as u32, expand_grid.0, 0, 0];
+        let uniform = self.job_expand_uniform.as_ref().expect("job expand uniform");
+        self.queue.write_buffer(uniform, 0, bytemuck::cast_slice(&dims));
         let bytes = (n * SENSE_OUT_STRIDE * 4) as u64;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sense") });
         {
-            let tw = self.timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites { query_set: &ts.set, beginning_of_pass_write_index: Some(0), end_of_pass_write_index: Some(1) });
+            let tw = self.timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: None,
+            });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expand-jobs"), timestamp_writes: tw });
+            pass.set_pipeline(self.job_expand_pipe.as_ref().expect("job expand"));
+            pass.set_bind_group(0, self.job_expand_bind.as_ref().expect("job expand bind"), &[]);
+            pass.dispatch_workgroups(expand_grid.0, expand_grid.1, 1);
+        }
+        {
+            let tw = self.timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(1),
+            });
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("sense"), timestamp_writes: tw });
             pass.set_pipeline(&self.sense.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
+            pass.set_bind_group(0, &self.sense_bind.as_ref().expect("sense bind").group, &[]);
             pass.dispatch_workgroups(grid_x, grid_y, 1);
         }
         enc.copy_buffer_to_buffer(&io.outputs, 0, &io.staging, 0, bytes);
@@ -953,9 +1169,8 @@ impl GpuBackend {
             enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
             enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
         }
-        self.stats.last.host_prep_ms += prep.elapsed().as_secs_f64() * 1e3;
-        let round = std::time::Instant::now();
         self.queue.submit([enc.finish()]);
+        self.stats.last.host_prep_ms += prep.elapsed().as_secs_f64() * 1e3;
         self.stats.dispatches += 1;
         self.stats.last.dispatches += 1;
         let slice = io.staging.slice(0..bytes);
@@ -970,6 +1185,14 @@ impl GpuBackend {
             });
             trx
         });
+        Ok(SenseInflight { rx, ts_rx, bytes })
+    }
+
+    fn finish_sense_group(&mut self, inflight: SenseInflight, mine: Option<&[usize]>, out: &mut [SenseOutput]) -> Result<(), String> {
+        let round_started = std::time::Instant::now();
+        let SenseInflight { rx, ts_rx, bytes } = inflight;
+        let io = self.sense_io.as_ref().expect("sense io");
+        let slice = io.staging.slice(0..bytes);
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
         rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU readback: {e}"))?;
         if let (Some(ts), Some(trx)) = (&self.timestamps, ts_rx) {
@@ -978,19 +1201,46 @@ impl GpuBackend {
             }
         }
         let copy_started = self.profiling.then(std::time::Instant::now);
-        let out: Vec<f32> = {
+        {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
-            match bytemuck::try_cast_slice::<u8, f32>(&view) {
-                Ok(f) => f.to_vec(),
-                Err(_) => view.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            let rows: &[f32] = bytemuck::try_cast_slice(&view).map_err(|e| format!("sense readback alignment: {e:?}"))?;
+            let n = rows.len() / SENSE_OUT_STRIDE;
+            for r in 0..n {
+                let k = mine.map(|m| m[r]).unwrap_or(r);
+                let row = &rows[r * SENSE_OUT_STRIDE..(r + 1) * SENSE_OUT_STRIDE];
+                let o = &mut out[k];
+                o.logits.copy_from_slice(&row[..OUTPUT_WIDTH]);
+                o.motion_drive = [row[36] as f64, row[37] as f64];
+                o.density0 = row[38] as f64;
             }
-        };
+        }
         if let Some(started) = copy_started {
             self.stats.last.readback_copy_ms += started.elapsed().as_secs_f64() * 1e3;
         }
         io.staging.unmap();
-        self.stats.last.gpu_roundtrip_ms += round.elapsed().as_secs_f64() * 1e3;
-        Ok(out)
+        self.stats.last.gpu_roundtrip_ms += round_started.elapsed().as_secs_f64() * 1e3;
+        Ok(())
+    }
+
+    /// Cell, tx, ty for every sense job, computed while the sense dispatch is
+    /// already on the queue. Uptake reuses these bits instead of recomputing them.
+    fn remember_stencils(&mut self, jobs: &[SenseJob<'_>]) {
+        if self.resident.is_none() {
+            return;
+        }
+        let Ok((gx, gy, hx, hy)) = self.res_geom() else { return };
+        self.stencil_ids.clear();
+        self.stencil_xy.clear();
+        self.stencil_val.clear();
+        self.stencil_ids.reserve(jobs.len());
+        self.stencil_xy.reserve(jobs.len());
+        self.stencil_val.reserve(jobs.len());
+        for j in jobs {
+            let (k, tx, ty) = stencil_base(gx, gy, hx, hy, j.x, j.y);
+            self.stencil_ids.push(j.genome.id);
+            self.stencil_xy.push((j.x.to_bits(), j.y.to_bits()));
+            self.stencil_val.push((k, tx, ty));
+        }
     }
 }
 
@@ -1042,37 +1292,53 @@ impl SenseInferBackend for GpuBackend {
             rx
         });
         self.stats.last.host_prep_ms += prep.elapsed().as_secs_f64() * 1e3;
-        // One fused dispatch per (topology, weight page).
+        // One fused dispatch per (topology, weight page). A single page is the
+        // steady state of the 10k/20k targets: skip the filter and overlap the
+        // stencil precompute with that one in-flight dispatch.
         let mut groups: Vec<(usize, usize)> = placed.iter().map(|&(t, slot)| (t, slot / self.slabs[t].page_slots)).collect();
         groups.sort_unstable();
         groups.dedup();
-        for (t, page) in groups {
+        let single = groups.len() == 1;
+        for (gi, (t, page)) in groups.into_iter().enumerate() {
             let bk = std::time::Instant::now();
+            // Grow the resident job buffers before comparing the static signature,
+            // so a reallocation cannot skip the upload into a fresh buffer.
+            self.ensure_sense_io(jobs.len());
             let ps = self.slabs[t].page_slots;
-            let mine: Vec<usize> = (0..jobs.len()).filter(|&k| placed[k].0 == t && placed[k].1 / ps == page).collect();
-            let slots: Vec<u32> = mine.iter().map(|&k| (placed[k].1 % ps) as u32).collect();
-            let mut jf = std::mem::take(&mut self.input_scratch);
-            jf.clear();
-            jf.reserve(mine.len() * JOB_STRIDE);
-            for (r, &k) in mine.iter().enumerate() {
+            let (mine, slots): (Option<Vec<usize>>, Vec<u32>) = if single {
+                (None, placed.iter().map(|&(_, slot)| (slot % ps) as u32).collect())
+            } else {
+                let mine: Vec<usize> = (0..jobs.len()).filter(|&k| placed[k].0 == t && placed[k].1 / ps == page).collect();
+                let slots = mine.iter().map(|&k| (placed[k].1 % ps) as u32).collect();
+                (Some(mine), slots)
+            };
+            let n = slots.len();
+            let mut dynamic = Vec::with_capacity(n * DYN_STRIDE);
+            let mut statics = Vec::with_capacity(n * STATIC_STRIDE);
+            let mut sig = Vec::with_capacity(n);
+            for (r, &slot) in slots.iter().enumerate() {
+                let k = mine.as_ref().map(|m| m[r]).unwrap_or(r);
                 let j = &jobs[k];
-                jf.extend_from_slice(&[f32::from_bits(slots[r]), j.x as f32, j.y as f32, j.genome.scale() as f32, if j.due { 1.0 } else { 0.0 }]);
-                jf.extend_from_slice(&j.intrinsic);
-                jf.extend_from_slice(&[0.0, 0.0]);
+                let scale = j.genome.scale() as f32;
+                dynamic.extend_from_slice(&[j.x as f32, j.y as f32, if j.due { 1.0 } else { 0.0 }]);
+                dynamic.extend_from_slice(&j.intrinsic);
+                statics.extend_from_slice(&[f32::from_bits(slot), scale]);
+                sig.push((j.genome.id, slot, scale.to_bits()));
+            }
+            let statics_changed = sig != self.sense_static_sig;
+            if statics_changed {
+                self.sense_static_sig = sig;
             }
             self.stats.last.bookkeeping_ms += bk.elapsed().as_secs_f64() * 1e3;
-            let res = self.run_sense(t, page, &slots, &jf, sensors);
-            self.input_scratch = jf;
-            let res = res?;
-            let bk = std::time::Instant::now();
-            for (r, &k) in mine.iter().enumerate() {
-                let row = &res[r * SENSE_OUT_STRIDE..(r + 1) * SENSE_OUT_STRIDE];
-                let o = &mut out[k];
-                o.logits.copy_from_slice(&row[..OUTPUT_WIDTH]);
-                o.motion_drive = [row[36] as f64, row[37] as f64];
-                o.density0 = row[38] as f64;
+            let inflight = self.submit_sense_group(t, page, n, &dynamic, &statics, statics_changed, sensors)?;
+            if gi == 0 {
+                // The dispatch is queued. Stencil bases depend only on positions,
+                // so this CPU work overlaps the sense kernel instead of the uptake pack.
+                let overlap = std::time::Instant::now();
+                self.remember_stencils(jobs);
+                self.stats.last.bookkeeping_ms += overlap.elapsed().as_secs_f64() * 1e3;
             }
-            self.stats.last.bookkeeping_ms += bk.elapsed().as_secs_f64() * 1e3;
+            self.finish_sense_group(inflight, mine.as_deref(), out)?;
         }
         if let (Some(ts), Some(rx)) = (&self.pyramid_timestamps, pyr_rx) {
             self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
@@ -1092,7 +1358,7 @@ impl FieldBackend for GpuBackend {
     }
 
     fn transport_and_sources(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
-        self.run_field_step(field, cfg, sources, n, false)
+        self.run_field_step(field, cfg, sources, n, false, false)
     }
 }
 
@@ -1100,7 +1366,10 @@ impl GpuBackend {
     /// The field step. `resident`: the working field is already on the device and stays
     /// there (only the accounting is read back); otherwise `field` is uploaded first and
     /// the observation field is downloaded into it.
-    fn run_field_step(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64, resident: bool) -> Result<FieldAccounting, String> {
+    /// `defer` maps the accounting readback and returns without polling, so the
+    /// caller can do CPU work before `finish_field_read`. Only used for the
+    /// resident field, whose planes stay on the device.
+    fn run_field_step(&mut self, field: &mut Field, cfg: &Config, sources: &[Source], n: u64, resident: bool, defer: bool) -> Result<FieldAccounting, String> {
         self.field_resident = false;
         self.stats.field_last = FieldTiming::default();
         let host = std::time::Instant::now();
@@ -1231,7 +1500,9 @@ impl GpuBackend {
         self.stats.field_last.host_ms = host.elapsed().as_secs_f64() * 1e3;
         let round = std::time::Instant::now();
         self.queue.submit([enc.finish()]);
-        let slice = if resident { fg.fstaging.slice(cells * 33 * 4..cells * 36 * 4) } else { fg.fstaging.slice(..) };
+        let start = if resident { cells * 33 * 4 } else { 0 };
+        let end = cells * 36 * 4;
+        let slice = fg.fstaging.slice(start..end);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -1243,16 +1514,30 @@ impl GpuBackend {
             });
             trx
         });
+        let subcycles = if diffusion > 0.0 { sub } else { 1 };
+        let pending = PendingField { rx, ts_rx, start, end, cells: cells as usize, resident, subcycles, round_started: round };
+        if defer {
+            self.pending_field = Some(pending);
+            self.field_resident = true;
+            return Ok(FieldAccounting { subcycles, ..Default::default() });
+        }
+        self.finish_field_read(pending, field)
+    }
+
+    fn finish_field_read(&mut self, pending: PendingField, field: &mut Field) -> Result<FieldAccounting, String> {
+        let PendingField { rx, ts_rx, start, end, cells, resident, subcycles, round_started } = pending;
+        let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
+        let slice = fg.fstaging.slice(start..end);
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
         rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU field readback: {e}"))?;
         if let (Some(ts), Some(trx)) = (&self.field_timestamps, ts_rx) {
             self.stats.field_last.kernel_ms = read_timestamps(&self.device, ts, trx);
         }
-        let mut acct = FieldAccounting { subcycles: if diffusion > 0.0 { sub } else { 1 }, ..Default::default() };
+        let mut acct = FieldAccounting { subcycles, ..Default::default() };
         {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             let all: &[f32] = bytemuck::try_cast_slice(&view).map_err(|e| format!("field readback alignment: {e:?}"))?;
-            let c = cells as usize;
+            let c = cells;
             let a = if resident {
                 &all[..c * 3]
             } else {
@@ -1267,7 +1552,7 @@ impl GpuBackend {
             }
         }
         fg.fstaging.unmap();
-        self.stats.field_last.roundtrip_ms = round.elapsed().as_secs_f64() * 1e3;
+        self.stats.field_last.roundtrip_ms = round_started.elapsed().as_secs_f64() * 1e3;
         self.field_resident = true;
         Ok(acct)
     }
@@ -1320,6 +1605,8 @@ impl GpuBackend {
             let mk = |label, size: usize, usage| self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: size as u64, usage, mapped_at_creation: false });
             let out_floats = (cap * 4).max(st.cells * 4);
             st.items = mk("items", cap * ITEM_STRIDE * 4, U::STORAGE | U::COPY_DST);
+            st.headers = mk("headers", cap * HEADER_STRIDE * 4, U::STORAGE | U::COPY_DST);
+            st.expand_bind = None;
             st.sorted = mk("sorted", cap * 4, U::STORAGE);
             st.outv = mk("res-out", out_floats * 4, U::STORAGE | U::COPY_SRC);
             st.staging = mk("res-staging", out_floats * 4, U::MAP_READ | U::COPY_DST);
@@ -1373,7 +1660,9 @@ impl GpuBackend {
     /// `stamp` writes a TIMESTAMP_QUERY at the start of the first binning pass.
     /// The matching end stamp is written by the caller on its last pass.
     /// `BinStamp::Off` leaves the command stream unchanged. This does not wait.
-    fn encode_binning(&self, enc: &mut wgpu::CommandEncoder, n: usize, stamp: BinStamp) {
+    /// `begin` writes the opening timestamp on the first binning pass.
+    /// Uptake turns that off because the item-expand pass already wrote it.
+    fn encode_binning(&self, enc: &mut wgpu::CommandEncoder, n: usize, stamp: BinStamp, begin: bool) {
         let st = self.resident.as_ref().expect("resident");
         let p = &self.res_pipes;
         let items_grid = grid_for((n.max(1) as u32).div_ceil(64));
@@ -1384,12 +1673,16 @@ impl GpuBackend {
             BinStamp::Resident => self.resident_timestamps.as_ref(),
             BinStamp::Deposit => self.deposit_timestamps.as_ref(),
         };
-        let begin = ts.map(|ts| wgpu::ComputePassTimestampWrites {
-            query_set: &ts.set,
-            beginning_of_pass_write_index: Some(0),
-            end_of_pass_write_index: None,
-        });
-        dispatch_resident(st, enc, &p.bin_count, items_grid, begin);
+        let begin_tw = if begin {
+            ts.map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: None,
+            })
+        } else {
+            None
+        };
+        dispatch_resident(st, enc, &p.bin_count, items_grid, begin_tw);
         dispatch_resident(st, enc, &p.bin_scan, (1, 1), None);
         dispatch_resident(st, enc, &p.bin_scatter, items_grid, None);
         dispatch_resident(st, enc, &p.bin_sort, cells_grid, None);
@@ -1402,7 +1695,10 @@ impl GpuBackend {
     /// `with_deposit_timestamp` reads the deposit query in that same poll.
     /// The last value is the CPU time spent copying the mapped rows, and is 0
     /// when profiling is off.
-    fn read_res_out(&self, floats: usize, with_timestamp: bool, with_deposit_timestamp: bool) -> Result<(Vec<f32>, Option<f64>, Option<f64>, f64), String> {
+    /// Map the resident staging buffer and run `body` on the floats in place.
+    /// The copy timer covers `body` only, so callers that reduce in the mapping
+    /// do not pay a second allocation. The last value is 0 when profiling is off.
+    fn read_res_out<T>(&self, floats: usize, with_timestamp: bool, with_deposit_timestamp: bool, body: impl FnOnce(&[f32]) -> T) -> Result<(T, Option<f64>, Option<f64>, f64), String> {
         let st = self.resident.as_ref().expect("resident");
         let slice = st.staging.slice(0..(floats * 4) as u64);
         let (tx, rx) = mpsc::channel();
@@ -1444,7 +1740,8 @@ impl GpuBackend {
         let copy_started = self.profiling.then(std::time::Instant::now);
         let out = {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
-            bytemuck::try_cast_slice::<u8, f32>(&view).map_err(|e| format!("readback alignment: {e:?}"))?.to_vec()
+            let rows = bytemuck::try_cast_slice::<u8, f32>(&view).map_err(|e| format!("readback alignment: {e:?}"))?;
+            body(rows)
         };
         let copy_ms = copy_started.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
         st.staging.unmap();
@@ -1462,7 +1759,7 @@ impl GpuBackend {
         let st = self.resident.as_ref().expect("resident");
         self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
         self.write_res_uniform(deps.len(), None, 0.0);
-        self.encode_binning(enc, deps.len(), if stamp { BinStamp::Deposit } else { BinStamp::Off });
+        self.encode_binning(enc, deps.len(), if stamp { BinStamp::Deposit } else { BinStamp::Off }, stamp);
         let cells_grid = grid_for((st.cells as u32).div_ceil(64));
         let pipe = &self.res_pipes.deposit_gather;
         let end = if stamp {
@@ -1500,6 +1797,88 @@ fn dispatch_resident(st: &ResidentState, enc: &mut wgpu::CommandEncoder, pipe: &
     pass.dispatch_workgroups(grid.0, grid.1, 1);
 }
 
+impl GpuBackend {
+    fn take_stencil(&self, j: &UptakeJob<'_>, gx: usize, gy: usize, hx: f64, hy: f64, cursor: &mut usize) -> (u32, f32, f32) {
+        let xb = j.x.to_bits();
+        let yb = j.y.to_bits();
+        while *cursor < self.stencil_ids.len() {
+            if self.stencil_ids[*cursor] == j.genome.id && self.stencil_xy[*cursor] == (xb, yb) {
+                let s = self.stencil_val[*cursor];
+                *cursor += 1;
+                return s;
+            }
+            *cursor += 1;
+        }
+        stencil_base(gx, gy, hx, hy, j.x, j.y)
+    }
+
+    fn affinity_slot(&mut self, id: u64, affinity: &[f32]) -> Result<u32, String> {
+        if let Some(&slot) = self.affinity_of.get(&id) {
+            return Ok(slot);
+        }
+        let slot = if let Some(slot) = self.affinity_free.pop() {
+            slot
+        } else {
+            if self.affinity_len == self.affinity_cap {
+                self.grow_affinity()?;
+            }
+            let slot = self.affinity_len;
+            self.affinity_len += 1;
+            slot
+        };
+        let buf = self.affinity.as_ref().ok_or("affinity buffer")?;
+        self.queue.write_buffer(buf, slot as u64 * 32 * 4, f32_bytes(affinity));
+        self.affinity_of.insert(id, slot);
+        Ok(slot)
+    }
+
+    fn grow_affinity(&mut self) -> Result<(), String> {
+        let new_cap = (self.affinity_cap.max(1) * 2).max(1024);
+        use wgpu::BufferUsages as U;
+        let fresh = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("affinity"),
+            size: new_cap as u64 * 32 * 4,
+            usage: U::STORAGE | U::COPY_DST | U::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        if let Some(old) = self.affinity.take() {
+            if self.affinity_len > 0 {
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("affinity-grow") });
+                enc.copy_buffer_to_buffer(&old, 0, &fresh, 0, self.affinity_len as u64 * 32 * 4);
+                self.queue.submit([enc.finish()]);
+            }
+        }
+        self.affinity = Some(fresh);
+        self.affinity_cap = new_cap;
+        if let Some(st) = self.resident.as_mut() {
+            st.expand_bind = None;
+        }
+        Ok(())
+    }
+
+    fn ensure_expand_bind(&mut self) -> Result<(), String> {
+        if self.resident.as_ref().is_some_and(|st| st.expand_bind.is_some()) {
+            return Ok(());
+        }
+        let affinity = self.affinity.as_ref().ok_or("affinity buffer")?.clone();
+        let st = self.resident.as_ref().ok_or("resident")?;
+        let headers = st.headers.clone();
+        let items = st.items.clone();
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("expand-items"),
+            layout: &self.res_pipes.expand_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.res_pipes.expand_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: headers.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: affinity.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: items.as_entire_binding() },
+            ],
+        });
+        self.resident.as_mut().expect("resident").expand_bind = Some(bg);
+        Ok(())
+    }
+}
+
 impl ResidentBackend for GpuBackend {
     fn upload_committed(&mut self, field: &Field, cfg: &Config) -> Result<(), String> {
         self.ensure_field(field, cfg.pyramid_levels(), cfg.sources.count as usize)?;
@@ -1515,6 +1894,8 @@ impl ResidentBackend for GpuBackend {
             pending_energy: 0.0,
             items_cap: 0,
             items: mk("items", 16, U::STORAGE | U::COPY_DST),
+            headers: mk("headers", 16, U::STORAGE | U::COPY_DST),
+            expand_bind: None,
             counts: mk("counts", cells * 4, U::STORAGE | U::COPY_DST),
             starts: mk("starts", (cells + 1) * 4, U::STORAGE),
             sorted: mk("sorted", 16, U::STORAGE),
@@ -1580,15 +1961,26 @@ impl ResidentBackend for GpuBackend {
         Ok(())
     }
 
-    fn transport_resident(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<FieldAccounting, String> {
+    fn submit_transport(&mut self, cfg: &Config, sources: &[Source], n: u64) -> Result<(), String> {
+        if self.pending_field.is_some() {
+            let mut discard = Field { gx: 1, gy: 1, hx: 1.0, hy: 1.0, e: Vec::new(), m: Vec::new() };
+            let pending = self.pending_field.take().expect("pending");
+            self.finish_field_read(pending, &mut discard)?;
+        }
         let st = self.resident.as_ref().ok_or("nothing uploaded")?;
         let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
         let mut geom = Field { gx: st.key.0, gy: st.key.1, hx: fg.levels[0].3 as f64, hy: fg.levels[0].4 as f64, e: Vec::new(), m: Vec::new() };
-        // Use the exact f64 spacing from the configuration (levels store f32).
         let (hx, hy) = cfg.cell_size();
         geom.hx = hx;
         geom.hy = hy;
-        self.run_field_step(&mut geom, cfg, sources, n, true)
+        self.run_field_step(&mut geom, cfg, sources, n, true, true)?;
+        Ok(())
+    }
+
+    fn finish_transport(&mut self) -> Result<FieldAccounting, String> {
+        let pending = self.pending_field.take().ok_or("transport was not submitted")?;
+        let mut discard = Field { gx: 1, gy: 1, hx: 1.0, hy: 1.0, e: Vec::new(), m: Vec::new() };
+        self.finish_field_read(pending, &mut discard)
     }
 
     fn uptake(&mut self, ch: &fl_core::config::ChemistryCfg, jobs: &[UptakeJob<'_>], out: &mut [UptakeOut]) -> Result<f64, String> {
@@ -1598,26 +1990,46 @@ impl ResidentBackend for GpuBackend {
         }
         let pack_t = self.profiling.then(std::time::Instant::now);
         let (gx, gy, hx, hy) = self.res_geom()?;
-        let mut items = Vec::with_capacity(jobs.len() * ITEM_STRIDE);
+        let mut headers = Vec::with_capacity(jobs.len() * HEADER_STRIDE);
+        let mut cursor = 0usize;
         for j in jobs {
-            let (k, tx, ty) = stencil_base(gx, gy, hx, hy, j.x, j.y);
-            items.extend_from_slice(&[f32::from_bits(k), tx, ty, j.demand as f32]);
-            items.extend_from_slice(&j.genome.affinity);
+            let (k, tx, ty) = self.take_stencil(j, gx, gy, hx, hy, &mut cursor);
+            let slot = self.affinity_slot(j.genome.id, &j.genome.affinity)?;
+            headers.extend_from_slice(&[f32::from_bits(k), tx, ty, j.demand as f32, f32::from_bits(slot)]);
         }
         if self.profiling {
             self.stats.resident_last.uptake_pack_ms = pack_t.map(|s| s.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
         }
         let upload_t = self.profiling.then(std::time::Instant::now);
         self.ensure_res_work(jobs.len())?;
+        self.ensure_expand_bind()?;
         let st = self.resident.as_ref().expect("resident");
-        self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
+        self.queue.write_buffer(&st.headers, 0, f32_bytes(&headers));
         self.write_res_uniform(jobs.len(), Some(ch), 0.0);
+        let items_grid = grid_for((jobs.len() as u32).div_ceil(64));
+        let dims = [jobs.len() as u32, items_grid.0, 0, 0];
+        self.queue.write_buffer(&self.res_pipes.expand_uniform, 0, bytemuck::cast_slice(&dims));
         let stamp = self.profiling && self.resident_timestamps.is_some();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("uptake") });
-        self.encode_binning(&mut enc, jobs.len(), if stamp { BinStamp::Resident } else { BinStamp::Off });
+        {
+            let tw = if stamp {
+                self.resident_timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                    query_set: &ts.set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: None,
+                })
+            } else {
+                None
+            };
+            let st = self.resident.as_ref().expect("resident");
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expand-items"), timestamp_writes: tw });
+            pass.set_pipeline(&self.res_pipes.expand);
+            pass.set_bind_group(0, st.expand_bind.as_ref().expect("expand bind"), &[]);
+            pass.dispatch_workgroups(items_grid.0, items_grid.1, 1);
+        }
+        self.encode_binning(&mut enc, jobs.len(), if stamp { BinStamp::Resident } else { BinStamp::Off }, false);
         let st = self.resident.as_ref().expect("resident");
         let p = &self.res_pipes;
-        let items_grid = grid_for((jobs.len() as u32).div_ceil(64));
         let cells_grid = grid_for((st.cells as u32).div_ceil(64));
         dispatch_resident(st, &mut enc, &p.uptake_demand, cells_grid, None);
         dispatch_resident(st, &mut enc, &p.uptake_org, items_grid, None);
@@ -1642,17 +2054,19 @@ impl ResidentBackend for GpuBackend {
         }
         let wait_t = self.profiling.then(std::time::Instant::now);
         self.queue.submit([enc.finish()]);
-        let (res, span, _, _copy_ms) = self.read_res_out(jobs.len() * 4, stamp, false)?;
+        let (granted, span, _, _copy_ms) = self.read_res_out(jobs.len() * 4, stamp, false, |res| {
+            let mut granted = 0.0;
+            for (k, o) in out.iter_mut().enumerate() {
+                *o = UptakeOut { absorbed: res[k * 4] as f64, useful_gain: res[k * 4 + 1] as f64, toxicity_requested: res[k * 4 + 2] as f64 };
+                granted += o.absorbed;
+            }
+            granted
+        })?;
         if self.profiling {
             self.stats.resident_last.uptake_wait_readback_ms = wait_t.map(|s| s.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
         }
         if stamp {
             self.stats.resident_last.uptake_timestamp_span_ms = span;
-        }
-        let mut granted = 0.0;
-        for (k, o) in out.iter_mut().enumerate() {
-            *o = UptakeOut { absorbed: res[k * 4] as f64, useful_gain: res[k * 4 + 1] as f64, toxicity_requested: res[k * 4 + 2] as f64 };
-            granted += o.absorbed;
         }
         self.stats.resident_last.uptake_ms = t.elapsed().as_secs_f64() * 1e3;
         Ok(granted)
@@ -1695,7 +2109,21 @@ impl ResidentBackend for GpuBackend {
         }
         let read_deposit_ts = self.deposit_ts_armed;
         self.queue.submit([enc.finish()]);
-        let (rows, span, deposit_span, copy_ms) = self.read_res_out(cells * 4, stamp, read_deposit_ts)?;
+        let (rep, span, deposit_span, copy_ms) = self.read_res_out(cells * 4, stamp, read_deposit_ts, |rows| {
+            let mut rep = FinishReport { worst_cone: f64::NEG_INFINITY, min_energy: f64::INFINITY, ..Default::default() };
+            for c in 0..cells {
+                let e = rows[c * 4] as f64;
+                rep.field_energy += e;
+                rep.tiny_removed += rows[c * 4 + 1] as f64;
+                rep.worst_cone = rep.worst_cone.max(rows[c * 4 + 2] as f64);
+                rep.min_energy = rep.min_energy.min(e);
+                rep.cone_projections += (rows[c * 4 + 3] > 0.5) as u32;
+            }
+            if rep.worst_cone < 0.0 {
+                rep.worst_cone = -1.0;
+            }
+            rep
+        })?;
         self.deposit_ts_armed = false;
         if stamp {
             self.stats.resident_last.finish_timestamp_span_ms = span;
@@ -1705,18 +2133,6 @@ impl ResidentBackend for GpuBackend {
         }
         if self.profiling {
             self.stats.resident_last.finish_readback_copy_ms = copy_ms;
-        }
-        let mut rep = FinishReport { worst_cone: f64::NEG_INFINITY, min_energy: f64::INFINITY, ..Default::default() };
-        for c in 0..cells {
-            let e = rows[c * 4] as f64;
-            rep.field_energy += e;
-            rep.tiny_removed += rows[c * 4 + 1] as f64;
-            rep.worst_cone = rep.worst_cone.max(rows[c * 4 + 2] as f64);
-            rep.min_energy = rep.min_energy.min(e);
-            rep.cone_projections += (rows[c * 4 + 3] > 0.5) as u32;
-        }
-        if rep.worst_cone < 0.0 {
-            rep.worst_cone = -1.0;
         }
         self.resident.as_mut().expect("resident").pending_energy = rep.field_energy;
         self.stats.resident_last.finish_ms = t.elapsed().as_secs_f64() * 1e3;
