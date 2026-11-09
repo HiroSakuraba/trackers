@@ -121,6 +121,15 @@ single run on this machine (about 54 s wall for gpu-resident, exit 0, final
 population near 19809) is one observation, not a diagnosis. Real time at 128 Hz
 is 7.8125 ms per step.
 
+With `--profile`, `profile.json` also splits the resident uptake wall into
+`resident_uptake_pack`, `resident_uptake_upload_encode`, and
+`resident_uptake_wait_readback` (the three already sum into the uptake wall;
+do not add them again). `resident_deposit_timestamp_span` is the deposit GPU
+timestamp span, read in the finish poll that already waits. `sense_or_mlp_dispatches`
+is a count of compute dispatches, and `sense_or_mlp_readback_copy` is only the
+CPU copy after that wait returns. The unprofiled command stream does not record
+these and does not write the deposit timestamp queries.
+
 ## Other runs
 
 The full 80,000-organism target world:

@@ -71,6 +71,9 @@ pub struct EvalTiming {
     /// Sensor-pyramid build on the GPU (timestamps), fused path only.
     pub pyramid_ms: Option<f64>,
     pub dispatches: u32,
+    /// CPU time copying the mapped sense/MLP output after the wait has returned.
+    /// Filled only while profiling. Already included in `gpu_roundtrip_ms`.
+    pub readback_copy_ms: f64,
 }
 
 /// Where the time of the most recent field step went.
@@ -182,6 +185,22 @@ pub struct ResidentTiming {
     pub uptake_timestamp_span_ms: Option<f64>,
     /// GPU timestamp-query span for the finish submission. Same caveat as uptake.
     pub finish_timestamp_span_ms: Option<f64>,
+    /// CPU time building the uptake item buffer (cell, weights, demand, affinity).
+    /// Filled only while profiling. Already included in `uptake_ms`.
+    pub uptake_pack_ms: f64,
+    /// CPU time for `write_buffer` and command recording before `queue.submit`.
+    /// Filled only while profiling. Already included in `uptake_ms`.
+    pub uptake_upload_encode_ms: f64,
+    /// CPU time from `queue.submit` through the mapped uptake readback.
+    /// Includes the GPU timestamp span. Not kernel time. Already included in `uptake_ms`.
+    pub uptake_wait_readback_ms: f64,
+    /// CPU time copying the mapped finish rows after the wait returned.
+    /// Filled only while profiling. Already included in `finish_ms`.
+    pub finish_readback_copy_ms: f64,
+    /// GPU timestamp span of the deposit passes. Deposit itself does not wait;
+    /// this span is read in the finish poll that already waits. `None` when
+    /// profiling is off, timestamps are unsupported, or there was nothing to deposit.
+    pub deposit_timestamp_span_ms: Option<f64>,
 }
 
 struct FieldPipelines {
@@ -254,6 +273,12 @@ pub struct GpuBackend {
     /// Timestamp queries for resident uptake/finish. Used only while profiling,
     /// and only on submissions that already wait for readback.
     resident_timestamps: Option<Timestamps>,
+    /// Deposit passes do not wait. When profiling, their timestamp span is
+    /// resolved here and read in the later finish poll. Separate query set so
+    /// it does not collide with uptake/finish queries.
+    deposit_timestamps: Option<Timestamps>,
+    /// A deposit submission wrote timestamps that finish has not read yet.
+    deposit_ts_armed: bool,
     /// Opt-in. Does not change dispatch results. Default false.
     profiling: bool,
     /// True while the device copy of the field equals the observation field just
@@ -390,6 +415,7 @@ impl GpuBackend {
         let pyramid_timestamps = ts_ok.then(&mk_ts);
         let field_timestamps = ts_ok.then(&mk_ts);
         let resident_timestamps = ts_ok.then(&mk_ts);
+        let deposit_timestamps = ts_ok.then(&mk_ts);
         let field_module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("field"), source: wgpu::ShaderSource::Wgsl(FIELD_SHADER.into()) });
         let field_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("field"),
@@ -459,7 +485,7 @@ impl GpuBackend {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size as u64,
             max_buffer_bytes: limits.max_buffer_size,
         };
-        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, resident_timestamps, profiling: false, field_resident: false, field_gpu: None, field_gen: 0, res_pipes, resident: None, sense_io: None, info, stats: GpuStats::default() })
+        Ok(GpuBackend { device, queue, pipeline, layout, uniform, dummy, slabs, slot_of: HashMap::new(), io: None, call: 0, timestamps, pyramid_timestamps, input_scratch: Vec::new(), sense, field_pipes, field_timestamps, resident_timestamps, deposit_timestamps, deposit_ts_armed: false, profiling: false, field_resident: false, field_gpu: None, field_gen: 0, res_pipes, resident: None, sense_io: None, info, stats: GpuStats::default() })
     }
 
     /// Record resident uptake/finish timestamp spans. Off by default, so the
@@ -671,6 +697,7 @@ impl GpuBackend {
                 *self.stats.last.kernel_ms.get_or_insert(0.0) += k;
             }
         }
+        let copy_started = self.profiling.then(std::time::Instant::now);
         let out: Vec<f32> = {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             match bytemuck::try_cast_slice::<u8, f32>(&view) {
@@ -678,6 +705,9 @@ impl GpuBackend {
                 Err(_) => view.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
             }
         };
+        if let Some(started) = copy_started {
+            self.stats.last.readback_copy_ms += started.elapsed().as_secs_f64() * 1e3;
+        }
         io.staging.unmap();
         self.stats.last.gpu_roundtrip_ms += round.elapsed().as_secs_f64() * 1e3;
         Ok(out)
@@ -947,6 +977,7 @@ impl GpuBackend {
                 *self.stats.last.kernel_ms.get_or_insert(0.0) += k;
             }
         }
+        let copy_started = self.profiling.then(std::time::Instant::now);
         let out: Vec<f32> = {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             match bytemuck::try_cast_slice::<u8, f32>(&view) {
@@ -954,6 +985,9 @@ impl GpuBackend {
                 Err(_) => view.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
             }
         };
+        if let Some(started) = copy_started {
+            self.stats.last.readback_copy_ms += started.elapsed().as_secs_f64() * 1e3;
+        }
         io.staging.unmap();
         self.stats.last.gpu_roundtrip_ms += round.elapsed().as_secs_f64() * 1e3;
         Ok(out)
@@ -1336,25 +1370,25 @@ impl GpuBackend {
         self.queue.write_buffer(&st.uniform, 0, bytemuck::cast_slice(&w));
     }
 
-    /// `stamp_begin` writes a TIMESTAMP_QUERY at the start of the first binning
-    /// pass. The matching end stamp is written by the caller on its last pass.
-    /// Both stay off unless profiling is enabled, so the default command stream
-    /// is unchanged. This does not insert a wait.
-    fn encode_binning(&self, enc: &mut wgpu::CommandEncoder, n: usize, stamp_begin: bool) {
+    /// `stamp` writes a TIMESTAMP_QUERY at the start of the first binning pass.
+    /// The matching end stamp is written by the caller on its last pass.
+    /// `BinStamp::Off` leaves the command stream unchanged. This does not wait.
+    fn encode_binning(&self, enc: &mut wgpu::CommandEncoder, n: usize, stamp: BinStamp) {
         let st = self.resident.as_ref().expect("resident");
         let p = &self.res_pipes;
         let items_grid = grid_for((n.max(1) as u32).div_ceil(64));
         let cells_grid = grid_for((st.cells as u32).div_ceil(64));
         enc.clear_buffer(&st.counts, 0, None);
-        let begin = if stamp_begin {
-            self.resident_timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
-                query_set: &ts.set,
-                beginning_of_pass_write_index: Some(0),
-                end_of_pass_write_index: None,
-            })
-        } else {
-            None
+        let ts = match stamp {
+            BinStamp::Off => None,
+            BinStamp::Resident => self.resident_timestamps.as_ref(),
+            BinStamp::Deposit => self.deposit_timestamps.as_ref(),
         };
+        let begin = ts.map(|ts| wgpu::ComputePassTimestampWrites {
+            query_set: &ts.set,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: None,
+        });
         dispatch_resident(st, enc, &p.bin_count, items_grid, begin);
         dispatch_resident(st, enc, &p.bin_scan, (1, 1), None);
         dispatch_resident(st, enc, &p.bin_scatter, items_grid, None);
@@ -1364,7 +1398,11 @@ impl GpuBackend {
     /// Read the resident staging buffer. When `with_timestamp` is set, the
     /// timestamp readback is mapped before the same `poll` the data already
     /// waits on — no second synchronization.
-    fn read_res_out(&self, floats: usize, with_timestamp: bool) -> Result<(Vec<f32>, Option<f64>), String> {
+    /// `with_timestamp` reads the uptake/finish query in this same poll.
+    /// `with_deposit_timestamp` reads the deposit query in that same poll.
+    /// The last value is the CPU time spent copying the mapped rows, and is 0
+    /// when profiling is off.
+    fn read_res_out(&self, floats: usize, with_timestamp: bool, with_deposit_timestamp: bool) -> Result<(Vec<f32>, Option<f64>, Option<f64>, f64), String> {
         let st = self.resident.as_ref().expect("resident");
         let slice = st.staging.slice(0..(floats * 4) as u64);
         let (tx, rx) = mpsc::channel();
@@ -1382,22 +1420,39 @@ impl GpuBackend {
         } else {
             None
         };
+        let dep_rx = if with_deposit_timestamp {
+            self.deposit_timestamps.as_ref().map(|ts| {
+                let (ttx, trx) = mpsc::channel();
+                ts.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = ttx.send(r);
+                });
+                trx
+            })
+        } else {
+            None
+        };
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("GPU poll: {e}"))?;
         rx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU readback: {e}"))?;
         let span = match (self.resident_timestamps.as_ref(), ts_rx) {
             (Some(ts), Some(trx)) => read_timestamps(&self.device, ts, trx),
             _ => None,
         };
+        let deposit_span = match (self.deposit_timestamps.as_ref(), dep_rx) {
+            (Some(ts), Some(trx)) => read_timestamps(&self.device, ts, trx),
+            _ => None,
+        };
+        let copy_started = self.profiling.then(std::time::Instant::now);
         let out = {
             let view = slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             bytemuck::try_cast_slice::<u8, f32>(&view).map_err(|e| format!("readback alignment: {e:?}"))?.to_vec()
         };
+        let copy_ms = copy_started.map(|t| t.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
         st.staging.unmap();
-        Ok((out, span))
+        Ok((out, span, deposit_span, copy_ms))
     }
 
     /// Apply deposit items to the working field (no readback).
-    fn encode_deposits(&mut self, enc: &mut wgpu::CommandEncoder, deps: &[FieldDeposit]) -> Result<(), String> {
+    fn encode_deposits(&mut self, enc: &mut wgpu::CommandEncoder, deps: &[FieldDeposit], stamp: bool) -> Result<(), String> {
         if deps.is_empty() {
             return Ok(());
         }
@@ -1407,12 +1462,35 @@ impl GpuBackend {
         let st = self.resident.as_ref().expect("resident");
         self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
         self.write_res_uniform(deps.len(), None, 0.0);
-        self.encode_binning(enc, deps.len(), false);
+        self.encode_binning(enc, deps.len(), if stamp { BinStamp::Deposit } else { BinStamp::Off });
         let cells_grid = grid_for((st.cells as u32).div_ceil(64));
         let pipe = &self.res_pipes.deposit_gather;
-        dispatch_resident(st, enc, pipe, cells_grid, None);
+        let end = if stamp {
+            self.deposit_timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+                query_set: &ts.set,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(1),
+            })
+        } else {
+            None
+        };
+        dispatch_resident(st, enc, pipe, cells_grid, end);
+        if stamp {
+            if let Some(ts) = &self.deposit_timestamps {
+                enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
+                enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
+                self.deposit_ts_armed = true;
+            }
+        }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum BinStamp {
+    Off,
+    Resident,
+    Deposit,
 }
 
 fn dispatch_resident(st: &ResidentState, enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, grid: (u32, u32), tw: Option<wgpu::ComputePassTimestampWrites<'_>>) {
@@ -1495,7 +1573,8 @@ impl ResidentBackend for GpuBackend {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("begin") });
         enc.copy_buffer_to_buffer(&st.ce, 0, &fg.fe, 0, cells * 4);
         enc.copy_buffer_to_buffer(&st.cm, 0, &fg.fm, 0, cells * 32 * 4);
-        self.encode_deposits(&mut enc, ops)?;
+        self.deposit_ts_armed = false;
+        self.encode_deposits(&mut enc, ops, false)?;
         self.queue.submit([enc.finish()]);
         self.stats.resident_last.begin_ms = t.elapsed().as_secs_f64() * 1e3;
         Ok(())
@@ -1517,6 +1596,7 @@ impl ResidentBackend for GpuBackend {
         if jobs.is_empty() {
             return Ok(0.0);
         }
+        let pack_t = self.profiling.then(std::time::Instant::now);
         let (gx, gy, hx, hy) = self.res_geom()?;
         let mut items = Vec::with_capacity(jobs.len() * ITEM_STRIDE);
         for j in jobs {
@@ -1524,13 +1604,17 @@ impl ResidentBackend for GpuBackend {
             items.extend_from_slice(&[f32::from_bits(k), tx, ty, j.demand as f32]);
             items.extend_from_slice(&j.genome.affinity);
         }
+        if self.profiling {
+            self.stats.resident_last.uptake_pack_ms = pack_t.map(|s| s.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+        }
+        let upload_t = self.profiling.then(std::time::Instant::now);
         self.ensure_res_work(jobs.len())?;
         let st = self.resident.as_ref().expect("resident");
         self.queue.write_buffer(&st.items, 0, f32_bytes(&items));
         self.write_res_uniform(jobs.len(), Some(ch), 0.0);
         let stamp = self.profiling && self.resident_timestamps.is_some();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("uptake") });
-        self.encode_binning(&mut enc, jobs.len(), stamp);
+        self.encode_binning(&mut enc, jobs.len(), if stamp { BinStamp::Resident } else { BinStamp::Off });
         let st = self.resident.as_ref().expect("resident");
         let p = &self.res_pipes;
         let items_grid = grid_for((jobs.len() as u32).div_ceil(64));
@@ -1553,8 +1637,15 @@ impl ResidentBackend for GpuBackend {
             enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
             enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
         }
+        if self.profiling {
+            self.stats.resident_last.uptake_upload_encode_ms = upload_t.map(|s| s.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+        }
+        let wait_t = self.profiling.then(std::time::Instant::now);
         self.queue.submit([enc.finish()]);
-        let (res, span) = self.read_res_out(jobs.len() * 4, stamp)?;
+        let (res, span, _, _copy_ms) = self.read_res_out(jobs.len() * 4, stamp, false)?;
+        if self.profiling {
+            self.stats.resident_last.uptake_wait_readback_ms = wait_t.map(|s| s.elapsed().as_secs_f64() * 1e3).unwrap_or(0.0);
+        }
         if stamp {
             self.stats.resident_last.uptake_timestamp_span_ms = span;
         }
@@ -1569,8 +1660,9 @@ impl ResidentBackend for GpuBackend {
 
     fn deposit(&mut self, deposits: &[FieldDeposit]) -> Result<(), String> {
         let t = std::time::Instant::now();
+        let stamp = self.profiling && self.deposit_timestamps.is_some() && !deposits.is_empty();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("deposit") });
-        self.encode_deposits(&mut enc, deposits)?;
+        self.encode_deposits(&mut enc, deposits, stamp)?;
         self.queue.submit([enc.finish()]);
         self.stats.resident_last.deposit_ms = t.elapsed().as_secs_f64() * 1e3;
         Ok(())
@@ -1601,10 +1693,18 @@ impl ResidentBackend for GpuBackend {
             enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
             enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
         }
+        let read_deposit_ts = self.deposit_ts_armed;
         self.queue.submit([enc.finish()]);
-        let (rows, span) = self.read_res_out(cells * 4, stamp)?;
+        let (rows, span, deposit_span, copy_ms) = self.read_res_out(cells * 4, stamp, read_deposit_ts)?;
+        self.deposit_ts_armed = false;
         if stamp {
             self.stats.resident_last.finish_timestamp_span_ms = span;
+        }
+        if read_deposit_ts {
+            self.stats.resident_last.deposit_timestamp_span_ms = deposit_span;
+        }
+        if self.profiling {
+            self.stats.resident_last.finish_readback_copy_ms = copy_ms;
         }
         let mut rep = FinishReport { worst_cone: f64::NEG_INFINITY, min_energy: f64::INFINITY, ..Default::default() };
         for c in 0..cells {

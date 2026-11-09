@@ -105,6 +105,8 @@ pub mod clock {
     /// to last stamped pass in that submission), converted with the device
     /// timestamp period. Not CPU time. Not an exclusive kernel trace.
     pub const GPU_TIMESTAMP_QUERY: &str = "gpu_timestamp_query";
+    /// A count. `samples` is the total, not a duration.
+    pub const COUNT: &str = "count";
 }
 
 /// A clock sample. When profiling is off this does not call `Instant::now`.
@@ -670,6 +672,8 @@ impl StageProfiler {
                     c.samples,
                     self.ticks
                 )
+            } else if c.clock == clock::COUNT {
+                format!("{:.2}/tick ({} total)", c.samples as f64 / self.ticks.max(1) as f64, c.samples)
             } else {
                 format!("{:.3}", per_tick_ms(c.total_ms, self.ticks))
             };
