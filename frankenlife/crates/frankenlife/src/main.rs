@@ -77,6 +77,10 @@ enum Backend {
     GpuField,
     /// The field stays on the GPU across steps; uptake exchange and deposits run there too.
     GpuResident,
+    /// The resident path with the whole front half of a tick (field step,
+    /// sensing, inference, uptake) queued together and read with one wait.
+    /// Same rules; the uptake request is evaluated in f32 on the device.
+    GpuRealtime,
 }
 
 #[derive(Parser)]
@@ -371,9 +375,10 @@ fn run(a: RunArgs) -> i32 {
     world.set_profiling(a.profile);
     #[cfg(feature = "gpu")]
     let mut gpu = match a.backend {
-        Backend::Gpu | Backend::GpuFused | Backend::GpuField | Backend::GpuResident => match fl_gpu::GpuBackend::new() {
+        Backend::Gpu | Backend::GpuFused | Backend::GpuField | Backend::GpuResident | Backend::GpuRealtime => match fl_gpu::GpuBackend::new() {
             Ok(mut g) => {
                 g.set_profiling(a.profile);
+                g.set_single_wait(a.backend == Backend::GpuRealtime);
                 eprintln!("GPU: {}", g.capability());
                 if a.profile {
                     eprintln!(
@@ -458,7 +463,7 @@ fn run(a: RunArgs) -> i32 {
         let stepped = match gpu.as_mut() {
             Some(g) if a.backend == Backend::GpuFused => world.step_inference(fl_core::Inference::Fused(g)),
             Some(g) if a.backend == Backend::GpuField => world.step_inference(fl_core::Inference::Device(g)),
-            Some(g) if a.backend == Backend::GpuResident => world.step_inference(fl_core::Inference::Resident(g)),
+            Some(g) if matches!(a.backend, Backend::GpuResident | Backend::GpuRealtime) => world.step_inference(fl_core::Inference::Resident(g)),
             Some(g) => world.step_with(Some(g as &mut dyn fl_core::ControllerBackend)),
             None => world.step(),
         };

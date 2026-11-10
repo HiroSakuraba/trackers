@@ -78,6 +78,11 @@ works. `--backend gpu-field` runs only the field step on the GPU;
 the GPU (inputs never leave it); it agrees with CPU sensing to ~1e-5 on logits
 and ~6e-5 relative on the motion drive and density.
 
+`--backend gpu-realtime` is that path with one GPU wait for the front half of
+a tick and one for the back half; on a GTX 1080 it runs the 5,000-organism
+preset at about 190 steps/s (128 is real time). See
+[WINDOWS-GPU.md](WINDOWS-GPU.md).
+
 Performance targets from the revised plan: **20,000 organisms first**
 (`presets/target-20k-field-ecology.toml`, 256² field), 80,000 as the stretch goal.
 Measure with `--frame-every 0`; every run reports per-phase step timings

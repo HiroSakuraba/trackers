@@ -89,9 +89,11 @@ impl Organisms {
         r!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid, genome);
     }
 
-    /// Copy `src` into `self`, keeping allocated capacity. Arc genomes are cloned
-    /// (shallow). Used so a tick does not allocate a fresh organism table.
-    fn copy_from(&mut self, src: &Organisms) {
+    /// Copy every column of `src` except the genomes into `self`, keeping allocated
+    /// capacity, so a tick does not allocate a fresh organism table. A tick's candidate
+    /// reads genomes from the committed table (they are immutable and indexed alike
+    /// until the commit), which saves touching every genome's reference count.
+    fn copy_from_without_genomes(&mut self, src: &Organisms) {
         macro_rules! c {
             ($($f:ident),*) => {$(
                 self.$f.clear();
@@ -100,7 +102,6 @@ impl Organisms {
         }
         c!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid);
         self.genome.clear();
-        self.genome.extend(src.genome.iter().cloned());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -325,6 +326,32 @@ org_scratch: Reused<Organisms>,
     energy_scratch: Reused<Vec<f64>>,
     /// Reused per-organism sense table.
     sense_scratch: Reused<Vec<Sense>>,
+    /// Genome-derived per-organism constants, aligned with `orgs` (rebuilt when it is not).
+    genome_hot: Reused<Vec<GenomeHot>>,
+    /// The cost parameters `genome_hot` was computed with.
+    genome_hot_key: Reused<[u64; 4]>,
+}
+
+/// Per-organism values derived only from its (immutable) genome and the
+/// configuration, kept next to the organism table so the tick does not chase
+/// every genome pointer for them. Execution cache, not scientific state.
+#[derive(Clone, Copy, Debug)]
+struct GenomeHot {
+    organism: u64,
+    /// `basal + sensor * (scale / unit)^exponent`, energy per second.
+    upkeep_rate: f64,
+    params: u32,
+}
+
+impl GenomeHot {
+    fn of(cfg: &Config, organism: u64, g: &Genome) -> GenomeHot {
+        let co = &cfg.costs;
+        GenomeHot {
+            organism,
+            upkeep_rate: co.basal_energy_per_second + co.sensor_energy_per_second_at_unit_scale * (g.scale() / co.sensor_unit_scale_world_units).powf(co.sensor_scale_cost_exponent),
+            params: g.param_count() as u32,
+        }
+    }
 }
 
 /// Execution cache. `PartialEq` ignores it so a reused buffer cannot change world equality.
@@ -385,6 +412,8 @@ impl World {
             org_scratch: Reused::default(),
             energy_scratch: Reused::default(),
             sense_scratch: Reused::default(),
+            genome_hot: Reused::default(),
+            genome_hot_key: Reused::default(),
         })
     }
 
@@ -534,7 +563,20 @@ impl World {
             self.field.clone()
         };
         let mut orgs = std::mem::take(&mut self.org_scratch.0);
-        orgs.copy_from(&self.orgs);
+        orgs.copy_from_without_genomes(&self.orgs);
+        // Genomes of the committed organisms, by pre-tick index. The candidate's own
+        // genome column only collects this tick's children until the commit.
+        let genomes: &[Arc<Genome>] = &self.orgs.genome;
+        let mut hot = std::mem::take(&mut self.genome_hot.0);
+        let hot_key = {
+            let c = &cfg.costs;
+            [c.basal_energy_per_second.to_bits(), c.sensor_energy_per_second_at_unit_scale.to_bits(), c.sensor_unit_scale_world_units.to_bits(), c.sensor_scale_cost_exponent.to_bits()]
+        };
+        if self.genome_hot_key.0 != hot_key || hot.len() != orgs.len() || hot.iter().zip(&orgs.id).any(|(h, id)| h.organism != *id) {
+            self.genome_hot_key.0 = hot_key;
+            hot.clear();
+            hot.extend((0..orgs.len()).map(|i| GenomeHot::of(cfg, orgs.id[i], &genomes[i])));
+        }
         let mut sources = self.sources.clone();
         self.energy_scratch.0.clear();
         self.energy_scratch.0.extend_from_slice(&orgs.energy);
@@ -563,10 +605,10 @@ impl World {
                                 Disposal::Dissipate => dis.death += e,
                                 Disposal::Recycle => {
                                     if is_resident {
-                                        ops.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: e, dir: orgs.genome[i].affinity });
+                                        ops.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: e, dir: genomes[i].affinity });
                                     } else {
                                         let s = field.stencil(orgs.x[i], orgs.y[i]);
-                                        field.deposit(&s, e, &orgs.genome[i].affinity);
+                                        field.deposit(&s, e, &genomes[i].affinity);
                                     }
                                 }
                             }
@@ -654,6 +696,8 @@ impl World {
 
         // ── Phase 3–4: sensing pyramid, sample organisms, evaluate due controllers ──
         let t_sense = Stopwatch::start();
+        // Set by a device's single-wait front half: (organism index per job, uptake results, granted energy).
+        let mut fused_uptake: Option<(Vec<usize>, Vec<UptakeOut>, f64)> = None;
         let sense_now = device.is_some() || resident.is_some() || fused.is_some();
         let mut senses = if sense_now {
             let ps = prof.start();
@@ -665,7 +709,7 @@ impl World {
                     let age = (n - orgs.birth_tick[i]) as f64 * dt;
                     SenseJob {
                         organism: orgs.id[i],
-                        genome: &orgs.genome[i],
+                        genome: &genomes[i],
                         x: orgs.x[i],
                         y: orgs.y[i],
                         intrinsic: intrinsic(&cfg.sensors, orgs.energy[i], age, orgs.vx[i], orgs.vy[i], orgs.energy_change_rate[i]),
@@ -674,6 +718,28 @@ impl World {
                 })
                 .collect();
             prof.stop(CpuStage::Sensing, ps);
+            let mut outs = vec![SenseOutput::default(); jobs.len()];
+            let mut front_done = false;
+            if transport_open {
+                // Single-wait front half when the device offers it: transport accounting,
+                // sensing, inference and the uptake exchange come back together.
+                let mut up = vec![UptakeOut::default(); jobs.len()];
+                let tb = Stopwatch::start();
+                let ps = prof.start();
+                if let Some(res) = resident.as_mut().expect("resident transport").sense_uptake(cfg, self.pyramid_extra_levels, &jobs, &mut outs, &mut up) {
+                    prof.stop(CpuStage::ExternalEvaluate, ps);
+                    timing.backend_inference_ms = tb.ms();
+                    let (acct, granted) = res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident front: {detail}") })?;
+                    dis.decay += acct.decay_removed;
+                    counts.transport_subcycles = acct.subcycles;
+                    led.injected_sources = acct.injected;
+                    dis.tiny_reservoir += acct.tiny_removed;
+                    timing.transport_ms = t.ms();
+                    fused_uptake = Some((idx.clone(), up, granted));
+                    transport_open = false;
+                    front_done = true;
+                }
+            }
             if transport_open {
                 let ps = prof.start();
                 let acct = resident.as_mut().expect("resident transport").finish_transport().map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident transport: {detail}") })?;
@@ -695,15 +761,16 @@ impl World {
             if senses_buf.len() != orgs.len() {
                 senses_buf.resize(orgs.len(), Sense::blank());
             }
-            let mut outs = vec![SenseOutput::default(); jobs.len()];
-            let tb = Stopwatch::start();
-            let ps = prof.start();
-            let res = fb.sense_and_infer(&field, &cfg.sensors, self.pyramid_extra_levels, &jobs, &mut outs);
-            // Whole backend call. A GPU implementation's submit/wait is not kernel time;
-            // that split is reported by the backend, on its own clocks.
-            prof.stop(CpuStage::ExternalEvaluate, ps);
-            timing.backend_inference_ms = tb.ms();
-            res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", fb.name()) })?;
+            if !front_done {
+                let tb = Stopwatch::start();
+                let ps = prof.start();
+                let res = fb.sense_and_infer(&field, &cfg.sensors, self.pyramid_extra_levels, &jobs, &mut outs);
+                // Whole backend call. A GPU implementation's submit/wait is not kernel time;
+                // that split is reported by the backend, on its own clocks.
+                prof.stop(CpuStage::ExternalEvaluate, ps);
+                timing.backend_inference_ms = tb.ms();
+                res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", fb.name()) })?;
+            }
             let ps = prof.start();
             for (k, &i) in idx.iter().enumerate() {
                 let o = &outs[k];
@@ -726,9 +793,9 @@ impl World {
             let wall = prof.start();
             let infer = backend.is_none();
             let (senses, sense_thread, net_thread) = if profiling {
-                sense_all::<true>(cfg, &pyr, &orgs, &dead, n, self.workers, infer)
+                sense_all::<true>(cfg, &pyr, &orgs, genomes, &dead, n, self.workers, infer)
             } else {
-                sense_all::<false>(cfg, &pyr, &orgs, &dead, n, self.workers, infer)
+                sense_all::<false>(cfg, &pyr, &orgs, genomes, &dead, n, self.workers, infer)
             };
             if profiling {
                 let (sense_part, net_part) = proportion(wall.elapsed_ns(), sense_thread, net_thread);
@@ -744,7 +811,7 @@ impl World {
             let ps = prof.start();
             let due: Vec<usize> = (0..senses.len()).filter(|&i| senses[i].evaluated).collect();
             let jobs: Vec<InferenceJob<'_>> =
-                due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &orgs.genome[i], input: senses[i].input.as_deref().expect("controller path keeps due inputs") }).collect();
+                due.iter().map(|&i| InferenceJob { organism: orgs.id[i], genome: &genomes[i], input: senses[i].input.as_deref().expect("controller path keeps due inputs") }).collect();
             let mut outs = vec![[0.0f32; OUTPUT_WIDTH]; jobs.len()];
             prof.stop_other(OtherPart::SenseScatter, ps);
             let tb = Stopwatch::start();
@@ -770,7 +837,7 @@ impl World {
                 orgs.held_tick[i] = event;
                 orgs.held_valid[i] = true;
                 counts.controller_evaluations += 1;
-                counts.parameter_evaluations += orgs.genome[i].param_count() as u64;
+                counts.parameter_evaluations += hot[i].params as u64;
             }
         }
         prof.stop_other(OtherPart::HeldStore, ps);
@@ -788,15 +855,20 @@ impl World {
         let mut uptake_total = vec![0.0f64; orgs.len()];
         let mut settlements: Vec<crate::chemistry::Settlement> = Vec::with_capacity(orgs.len());
         if let Some(r) = resident.as_mut() {
-            let ps = prof.start();
-            let idx: Vec<usize> = (0..orgs.len()).filter(|&i| demand[i] > 0.0).collect();
-            let jobs: Vec<UptakeJob<'_>> = idx.iter().map(|&i| UptakeJob { x: orgs.x[i], y: orgs.y[i], demand: demand[i], genome: &orgs.genome[i] }).collect();
-            prof.stop(CpuStage::ChemistryField, ps);
-            let mut outs = vec![UptakeOut::default(); jobs.len()];
-            let ps = prof.start();
-            let granted = r.uptake(ch, &jobs, &mut outs).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident uptake: {detail}") })?;
-            // Includes the readback wait uptake already performs. Not kernel time.
-            prof.stop(CpuStage::TransfersSync, ps);
+            let (idx, outs, granted) = if let Some(front) = fused_uptake.take() {
+                front
+            } else {
+                let ps = prof.start();
+                let idx: Vec<usize> = (0..orgs.len()).filter(|&i| demand[i] > 0.0).collect();
+                let jobs: Vec<UptakeJob<'_>> = idx.iter().map(|&i| UptakeJob { x: orgs.x[i], y: orgs.y[i], demand: demand[i], genome: &genomes[i] }).collect();
+                prof.stop(CpuStage::ChemistryField, ps);
+                let mut outs = vec![UptakeOut::default(); jobs.len()];
+                let ps = prof.start();
+                let granted = r.uptake(ch, &jobs, &mut outs).map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("resident uptake: {detail}") })?;
+                // Includes the readback wait uptake already performs. Not kernel time.
+                prof.stop(CpuStage::TransfersSync, ps);
+                (idx, outs, granted)
+            };
             led.transferred += granted;
             let ps = prof.start();
             settlements = vec![Default::default(); orgs.len()];
@@ -833,7 +905,7 @@ impl World {
                 continue;
             }
             let s = &stencils[i];
-            let a = &orgs.genome[i].affinity;
+            let a = &genomes[i].affinity;
             let mut packets = [(0.0f64, 0.0f64); 4];
             for k in 0..s.n {
                 let c = s.cells[k];
@@ -893,9 +965,7 @@ impl World {
             orgs.energy[i] += st.net();
             dis.uptake_inefficiency += st.absorbed - st.useful_gain;
             dis.toxicity += st.toxicity_paid;
-            let g = &orgs.genome[i];
-            let cost = dt * (co.basal_energy_per_second + co.sensor_energy_per_second_at_unit_scale * (g.scale() / co.sensor_unit_scale_world_units).powf(co.sensor_scale_cost_exponent))
-                + if senses[i].evaluated { co.neural_energy_per_parameter_evaluation * g.param_count() as f64 } else { 0.0 };
+            let cost = dt * hot[i].upkeep_rate + if senses[i].evaluated { co.neural_energy_per_parameter_evaluation * hot[i].params as f64 } else { 0.0 };
             let paid = cost.min(orgs.energy[i].max(0.0));
             orgs.energy[i] -= paid;
             dis.maintenance += paid;
@@ -927,7 +997,7 @@ impl World {
             }
             // Motion (field-mediated chemotaxis; no pairwise forces).
             // Genome bytes are immutable here; a shared reference avoids an Arc clone per organism.
-            let g = &*orgs.genome[i];
+            let g = &*genomes[i];
             let s = &senses[i];
             let gu = if umax > 0.0 { (uptake_total[i] / (dt * umax)).clamp(0.0, 1.0) } else { 0.0 };
             let (mut fx, mut fy) = (s.motion_drive[0], s.motion_drive[1]);
@@ -1017,7 +1087,7 @@ impl World {
 
         // ── Phase 8: capacities, births, deaths ───────────────────────────
         let survivors: Vec<usize> = (0..orgs.len()).filter(|&i| !dead[i]).collect();
-        let live_bytes: u64 = survivors.iter().map(|&i| orgs.genome[i].param_count() as u64 * 4).sum();
+        let live_bytes: u64 = survivors.iter().map(|&i| hot[i].params as u64 * 4).sum();
         let birth_bytes: u64 = proposals.iter().map(|p| p.genome.param_count() as u64 * 4).sum();
         let max_count = cfg.population.maximum_count as usize;
         let quota = cfg.execution.maximum_logical_genome_bytes;
@@ -1082,10 +1152,10 @@ impl World {
             if dead[i] && orgs.energy[i] > 0.0 {
                 let e = orgs.energy[i];
                 if is_resident {
-                    dep_list.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: recycle * e, dir: orgs.genome[i].affinity });
+                    dep_list.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: recycle * e, dir: genomes[i].affinity });
                 } else {
                     let st = field.stencil(orgs.x[i], orgs.y[i]);
-                    deposits.deposit(&st, recycle * e, &orgs.genome[i].affinity);
+                    deposits.deposit(&st, recycle * e, &genomes[i].affinity);
                 }
                 dis.death += (1.0 - recycle) * e;
                 orgs.energy[i] = 0.0;
@@ -1099,8 +1169,17 @@ impl World {
         self.energy_scratch.0 = e_start;
         let keep: Vec<bool> = dead.iter().map(|d| !d).collect();
         orgs.retain(&keep);
+        {
+            let mut i = 0;
+            hot.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
+        }
         for (id, lin, gen, x, y, e, g) in children {
             let deadline = event + cd_ticks;
+            hot.push(GenomeHot::of(cfg, id, &g));
             orgs.push(id, lin, gen, x, y, e, event, deadline, (id % k_eval) as u32, g);
         }
 
@@ -1173,6 +1252,20 @@ impl World {
             prof.stop_other(OtherPart::Publish, ps);
         }
         let ps = prof.start();
+        // Commit the genome column: survivors keep their committed genomes (moved,
+        // not cloned), then this tick's children.
+        {
+            let mut column = std::mem::take(&mut self.orgs.genome);
+            let mut i = 0;
+            column.retain(|_| {
+                let k = keep[i];
+                i += 1;
+                k
+            });
+            column.append(&mut orgs.genome);
+            orgs.genome = column;
+        }
+        self.genome_hot.0 = hot;
         self.org_scratch.0 = std::mem::replace(&mut self.orgs, orgs);
         self.sources = sources;
         self.tick = event;
@@ -1483,6 +1576,17 @@ pub trait ResidentBackend: SenseInferBackend {
     }
     /// Fills `out` and debits granted energy from the working field; returns total granted energy.
     fn uptake(&mut self, chemistry: &crate::config::ChemistryCfg, jobs: &[UptakeJob<'_>], out: &mut [UptakeOut]) -> Result<f64, String>;
+    /// Optional single-wait front half for a tick whose transport was already queued
+    /// with [`Self::submit_transport`]: sensing, inference, the uptake request
+    /// (`dt * umax * r / (K + r)` from the sensed level-0 density, evaluated on the
+    /// device) and the uptake exchange, all read back in one wait.
+    ///
+    /// `uptake_out[k]` belongs to `jobs[k]`. Returns the transport accounting and the
+    /// total granted energy. `None` (the default) means the backend does not offer it
+    /// and the caller uses `finish_transport`, `sense_and_infer` and `uptake`.
+    fn sense_uptake(&mut self, _cfg: &Config, _extra_levels: usize, _jobs: &[SenseJob<'_>], _sense_out: &mut [SenseOutput], _uptake_out: &mut [UptakeOut]) -> Option<Result<(FieldAccounting, f64), String>> {
+        None
+    }
     fn deposit(&mut self, deposits: &[FieldDeposit]) -> Result<(), String>;
     fn finish(&mut self, tiny: f64) -> Result<FinishReport, String>;
     fn commit(&mut self) -> Result<(), String>;
@@ -1723,9 +1827,10 @@ impl ControllerBackend for ReferenceBackend {
 }
 
 
-fn sense_one<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, i: usize, n: u64, scratch: &mut [f32], infer: bool, sense_ns: &mut u64, net_ns: &mut u64) -> Sense {
+#[allow(clippy::too_many_arguments)]
+fn sense_one<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, genomes: &[Arc<Genome>], i: usize, n: u64, scratch: &mut [f32], infer: bool, sense_ns: &mut u64, net_ns: &mut u64) -> Sense {
     let t_sense = Stamp::capture::<PROFILE>();
-    let g = &orgs.genome[i];
+    let g = &genomes[i];
     let raw = pyr.sample(orgs.x[i], orgs.y[i], g.scale());
     let obs = observe(&raw, &cfg.sensors);
     let density0 = pyr.density0(orgs.x[i], orgs.y[i]);
@@ -1760,7 +1865,8 @@ fn charge<const PROFILE: bool>(stamp: Stamp, acc: &mut u64) {
     }
 }
 
-fn sense_all<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, dead: &[bool], n: u64, workers: usize, infer: bool) -> (Vec<Sense>, u64, u64) {
+#[allow(clippy::too_many_arguments)]
+fn sense_all<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms, genomes: &[Arc<Genome>], dead: &[bool], n: u64, workers: usize, infer: bool) -> (Vec<Sense>, u64, u64) {
     let len = orgs.len();
     let run = |range: std::ops::Range<usize>| -> (Vec<Sense>, u64, u64) {
         let mut scratch = vec![0.0f32; 2 * MAX_HIDDEN];
@@ -1771,7 +1877,7 @@ fn sense_all<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms,
                 if dead[i] {
                     Sense::blank()
                 } else {
-                    sense_one::<PROFILE>(cfg, pyr, orgs, i, n, &mut scratch, infer, &mut sense_ns, &mut net_ns)
+                    sense_one::<PROFILE>(cfg, pyr, orgs, genomes, i, n, &mut scratch, infer, &mut sense_ns, &mut net_ns)
                 }
             })
             .collect();

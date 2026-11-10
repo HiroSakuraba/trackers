@@ -151,6 +151,54 @@ The 20k unprofiled run should keep population 19809 and hash
 2.46 ms/tick, and `sense_or_mlp_host_prep` should fall below the previous
 3.76 ms/tick.
 
+## Realtime at 5,000 organisms (`--backend gpu-realtime`)
+
+`gpu-realtime` is the resident path with the GPU waits and submissions of a
+tick cut down. Same rules and tick order. The one arithmetic difference from
+`gpu-resident`: the uptake request `dt * umax * r / (K + r)` is evaluated in
+f32 on the device (so uptake can follow sensing with no readback between),
+instead of f64 on the host. Runs therefore differ from `gpu-resident` at
+rounding level and then diverge the way any two rounding-different runs do.
+Two `gpu-realtime` runs on one machine are bit-identical, and resume
+reproduces the uninterrupted hash.
+
+What changed per tick:
+
+- One wait for the front half (field accounting, sensing, inference, uptake)
+  and one for the back half (deposits, finish), instead of four or more.
+- About four queue submissions instead of nine. Every topology group's sense
+  pass sits in one submission; the commit copy rides with the next tick.
+- Weight and affinity slots are remembered per organism in job order, so the
+  steady state does no hash lookups and does not touch the genomes.
+
+Host-side savings that apply to every backend (results unchanged bit for bit):
+the tick no longer clones every genome reference, and the per-organism upkeep
+rate and parameter count are cached instead of recomputed from the genome.
+
+`presets/target-5k-field-ecology.toml` is the 20k preset at one quarter area:
+128 by 128 field, 5,000 founders, cap 6,000, sources scaled to match.
+
+```powershell
+cargo run --release -- run --config presets\target-5k-field-ecology.toml --backend gpu-realtime --seconds 30 --frame-every 0 --out runs\rt5
+cargo run --release -- run --config presets\target-5k-field-ecology.toml --backend gpu-realtime --seconds 6 --frame-every 0 --profile --out runs\rt5-profile
+```
+
+Measured on the GTX 1080 (driver 582.78), simulation only, 2026-11-09, steady
+ticks at about 5,000 organisms; real time is 7.81 ms per step:
+
+| backend | ms per step | steps/s |
+| --- | --- | --- |
+| `gpu-resident` before this change | 7.0 to 8.0 | 124 to 142 |
+| `gpu-realtime` | 5.0 to 5.2 | 192 to 198 |
+
+A 30 simulated second run finished in 17.6 s of wall time. With `--profile`
+the step is about 0.3 ms slower, because the pyramid and deposits go back to
+their own submissions so their timestamp spans stay readable.
+
+A one-pass sensor pyramid (every level straight from the field) was tried and
+removed: bit-identical, but its span on this card was 2.2 ms against 0.44 ms
+for the level-by-level passes.
+
 ## Other runs
 
 The full 80,000-organism target world:
