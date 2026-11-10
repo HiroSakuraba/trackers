@@ -568,16 +568,18 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 impl GpuBackend {
     /// Open the highest-performance adapter (`WGPU_BACKEND=vulkan|dx12|metal` overrides the choice).
     pub fn new() -> Result<GpuBackend, String> {
-        pollster::block_on(Self::open(None))
+        pollster::block_on(Self::open(None, 0))
     }
 
     /// A new backend with no organism or field state, on the same device, so a window that draws with this
-    /// device keeps working (the viewer swaps worlds with it). The pipelines are built again.
+    /// device keeps working (the viewer swaps worlds with it). The pipelines are built again. Field
+    /// generations continue from this backend's, so a painter that caches by generation never mistakes the
+    /// new world's field buffers for the old ones.
     pub fn fresh(&self) -> Result<GpuBackend, String> {
-        pollster::block_on(Self::open(Some((self.instance.clone(), self.adapter.clone(), self.device.clone(), self.queue.clone()))))
+        pollster::block_on(Self::open(Some((self.instance.clone(), self.adapter.clone(), self.device.clone(), self.queue.clone())), self.field_gen))
     }
 
-    async fn open(existing: Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)>) -> Result<GpuBackend, String> {
+    async fn open(existing: Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)>, field_gen: u64) -> Result<GpuBackend, String> {
         let (instance, adapter, device, queue, limits, ts_ok) = match existing {
             Some((instance, adapter, device, queue)) => {
                 let limits = device.limits();
@@ -840,7 +842,7 @@ impl GpuBackend {
             profiling: false,
             field_resident: false,
             field_gpu: None,
-            field_gen: 0,
+            field_gen,
             res_pipes,
             resident: None,
             sense_io: None,
@@ -2859,6 +2861,7 @@ mod tests {
         let mut cfg = recurrent_small();
         cfg.population.initial_count = 450;
         cfg.population.maximum_count = 900;
+        let old_gen = old.field_gen;
         let mut reused = old.fresh().unwrap();
         reused.set_single_wait(true);
         let mut a = fl_core::World::new(cfg.clone()).unwrap();
@@ -2870,6 +2873,7 @@ mod tests {
             b.step_inference(fl_core::Inference::Resident(&mut other)).unwrap();
         }
         assert!(a.orgs.len() > 400, "the new world has its own, larger population");
+        assert!(old_gen >= 1 && reused.field_gen > old_gen, "field generations keep counting up across a fresh backend ({} after {old_gen})", reused.field_gen);
         assert_eq!(a.state_hash(), b.state_hash(), "a fresh backend steps like a new one");
     }
 

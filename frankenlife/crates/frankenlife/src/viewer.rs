@@ -407,6 +407,8 @@ struct Session {
     launch_cfg: Config,
     /// Digits typed so far while the organism count is being entered (`None` when it is not).
     count_entry: Option<String>,
+    /// How many times the run has been restarted with a typed count.
+    restarts: u32,
     /// Last message about a count that could not be applied, shown on the HUD until the next key.
     notice: Option<String>,
     #[cfg(feature = "gpu")]
@@ -487,6 +489,7 @@ impl Session {
             wall0: Instant::now(),
             launch_cfg,
             count_entry: None,
+            restarts: 0,
             notice: None,
             #[cfg(feature = "gpu")]
             device_planes: None,
@@ -527,11 +530,21 @@ impl Session {
         tune.log = std::mem::take(&mut self.tune.log);
         self.tune = tune;
         self.tune.record(self.world.tick, serde_json::json!({ "restart_with_organisms": n }));
+        // Timing, checkpoints and pacing belong to the new run: the manifest's rates must not mix in the old
+        // one, and checkpoints at low ticks must not be pruned in favour of the old run's higher ones.
+        self.restarts += 1;
+        if self.ckpt_every.is_some() {
+            self.ckpt_dir = self.args.out.join("checkpoints").join(format!("restart-{}", self.restarts));
+            std::fs::create_dir_all(&self.ckpt_dir).ok();
+        }
+        let (speed, paused) = (self.pace.speed, if self.done { false } else { self.pace.paused });
+        self.pace = Pace::new();
+        self.pace.speed = speed;
+        self.pace.paused = paused;
+        self.wall0 = Instant::now();
         self.done = false;
         self.stop_reason = "window closed".into();
         self.inspect = None;
-        self.pace.accum = 0.0;
-        self.pace.last = Instant::now();
         Ok(())
     }
 
@@ -1411,6 +1424,8 @@ impl winit::application::ApplicationHandler for WindowApp<'_> {
                 let session = &mut *self.session;
                 session.notice = None;
                 if session.count_key(&event.logical_key) {
+                    // A run that ended and was restarted shows its final frame again when it ends.
+                    self.showed_final = false;
                     if let Some(w) = self.swap.as_ref() {
                         w.window.request_redraw();
                     }
@@ -1758,6 +1773,29 @@ mod tests {
         assert!(s.world.cfg.population.maximum_count >= 301, "room for the larger count");
         s.step_one().unwrap();
         assert_eq!(s.world.tick, 1);
+    }
+
+    #[test]
+    fn a_restart_starts_timing_and_checkpoints_afresh() {
+        use clap::Parser;
+        let out = std::env::temp_dir().join(format!("fl-restart-test-{}", std::process::id()));
+        let args = ViewArgs::parse_from(["view", "--out", out.to_str().unwrap(), "--checkpoint-every", "0.01"]);
+        let world = World::new(tiny_config()).unwrap();
+        let report = world.cfg.validate().unwrap();
+        let mut s = Session::from_prepared(args, Prepared { world, #[cfg(feature = "gpu")] gpu: None, ts_supported: None, report, start_tick: 0 });
+        for _ in 0..4 {
+            s.step_one().unwrap();
+        }
+        s.pace.frames = 9;
+        s.pace.present_ms = 3.0;
+        s.pace.speed = Speed::Realtime(2.0);
+        let before = s.ckpt_dir.clone();
+        s.restart_with_count(40).unwrap();
+        assert!(s.pace.sim_ms == 0.0 && s.pace.frames == 0 && s.pace.present_ms == 0.0, "timing counters start over");
+        assert!(matches!(s.pace.speed, Speed::Realtime(m) if m == 2.0), "the chosen speed stays");
+        assert_ne!(s.ckpt_dir, before, "the new run writes its checkpoints in its own folder");
+        assert!(s.ckpt_dir.is_dir());
+        std::fs::remove_dir_all(&out).ok();
     }
 
     #[test]
