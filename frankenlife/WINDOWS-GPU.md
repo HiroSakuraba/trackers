@@ -229,14 +229,36 @@ versus real time).
 | drag | pan the torus |
 | wheel | zoom, keeping the cursor's point fixed |
 | click | name the nearest organism (does not change the world) |
+| click a source's ring | pick that source for the chemistry keys (click it again, or empty space, to clear) |
+| `Q` / `W` | energy: source power down / up (×1.25 per press) |
+| `A` / `S` | source movement speed down / up (×1.25) |
+| `D` / `F` | diffusion (how fast energy spreads) down / up (×1.25) |
+| `C` / `V` | decay (how fast uneaten energy fades) down / up (×1.25) |
+| `Z` / `X` | mutation rate down / up (×1.5; scales all five mutation settings together) |
+| `J` / `K` | drift the picked source's chemistry by 5° / 25° toward a random new direction (every source when none is picked) |
+| `R` | put energy, speed, diffusion, decay and mutation back to their launch values (chemistry drift is not undone) |
 | Esc | quit and write `manifest.json` |
 
 Drawing samples the GPU-resident field between ticks and does not read it
-back. It does not change the tick. A run you do not pause, single-step, or
-erase finishes with the same population and state hash as `run` for the same
-config, seed, backend and `--seconds`. The manifest records
+back. It does not change the tick. A run you do not pause, single-step,
+erase, or tune finishes with the same population and state hash as `run` for
+the same config, seed, backend and `--seconds`. The manifest records
 `simulation_mean_step_ms` (the tick only) and `wall_steps_per_second` (tick
 plus drawing). Compare the title's steps/s with a `--frame-every 0` run.
+
+### Live tuning
+
+The Q–X keys change the running world. Each press is a command at the next tick
+boundary, so it takes effect cleanly and is kept in the world's configuration
+(checkpoints save it). The second HUD line shows the requested values, and the
+small rings mark where the sources are. Sources that change speed stay where
+they are; they do not jump. Every change is also appended to
+`controls.jsonl` in the run folder and listed under `live_changes` in
+`manifest.json`, because a tuned run no longer matches a `run` of the same config.
+
+For scripted runs and screenshots, `--press TICK:KEYS` presses keys at a tick
+(`@N` picks source N), for example
+`view --press 0:wwww --press 600:@2kk --screenshot shot.png --seconds 10`.
 
 ## Other runs
 

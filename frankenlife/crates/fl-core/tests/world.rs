@@ -447,3 +447,106 @@ fn resident_capacity_pause_keeps_committed_field() {
     f2.clone_from(&w.field);
     assert_eq!(f1, f2);
 }
+
+// ── Live tuning commands ─────────────────────────────────────────────────
+
+use fl_core::world::Param;
+
+#[test]
+fn live_source_power_takes_effect_on_the_next_tick_and_stays() {
+    let mut w = World::new(small()).unwrap();
+    for _ in 0..5 {
+        w.step().unwrap();
+    }
+    let before = w.step().unwrap().ledger.injected_sources;
+    w.schedule(w.tick, Command::SetParam { param: Param::SourcePower, value: 40.0 }).unwrap();
+    let after = w.step().unwrap().ledger.injected_sources;
+    assert!((after / before - 2.0).abs() < 1e-6, "20 -> 40 per source doubles the injection: {before} -> {after}");
+    assert_eq!(w.cfg.sources.power_per_source, 40.0);
+    let later = w.step().unwrap().ledger.injected_sources;
+    assert!((later / after - 1.0).abs() < 1e-6, "the change persists");
+    let l = &w.ledger;
+    let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+    assert!((w.total_energy() - expected).abs() / l.transferred.max(1.0) < 1e-5, "the ledger still closes");
+}
+
+#[test]
+fn live_tuning_does_not_change_a_run_that_has_none() {
+    let a = run(small(), 60, 1);
+    let mut b = World::new(small()).unwrap();
+    // Setting a parameter to the value it already has is a no-op for the science.
+    b.schedule(10, Command::SetParam { param: Param::Decay, value: b.cfg.world.decay_per_second }).unwrap();
+    for _ in 0..60 {
+        b.step().unwrap();
+    }
+    assert_eq!(a.state_hash(), b.state_hash());
+}
+
+#[test]
+fn live_chemistry_drift_moves_only_the_chosen_source() {
+    let mut a = World::new(small()).unwrap();
+    let mut b = World::new(small()).unwrap();
+    let chem0: Vec<_> = a.sources.iter().map(|s| s.chem).collect();
+    for w in [&mut a, &mut b] {
+        w.schedule(3, Command::DriftChemistry { source: Some(1), degrees: 20.0 }).unwrap();
+        for _ in 0..4 {
+            w.step().unwrap();
+        }
+    }
+    assert_eq!(a.sources[0].chem, chem0[0]);
+    assert_eq!(a.sources[2].chem, chem0[2]);
+    let dot: f64 = (0..32).map(|k| a.sources[1].chem[k] as f64 * chem0[1][k] as f64).sum();
+    assert!((dot - 20f64.to_radians().cos()).abs() < 1e-5, "rotated by 20 degrees, dot {dot}");
+    assert_eq!(a.sources, b.sources, "the drift is deterministic");
+    // All sources at once.
+    let mut c = World::new(small()).unwrap();
+    c.schedule(0, Command::DriftChemistry { source: None, degrees: 10.0 }).unwrap();
+    c.step().unwrap();
+    for (s, old) in c.sources.iter().zip(&chem0) {
+        let dot: f64 = (0..32).map(|k| s.chem[k] as f64 * old[k] as f64).sum();
+        assert!((dot - 10f64.to_radians().cos()).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn live_source_speed_change_does_not_jump_the_sources() {
+    let mut w = World::new(small()).unwrap();
+    for _ in 0..40 {
+        w.step().unwrap();
+    }
+    let centers = |w: &World, speed: f64| -> Vec<[f64; 2]> {
+        let mut cfg = w.cfg.clone();
+        cfg.sources.path_speed = speed;
+        w.sources
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                s.advance_to(w.tick, &cfg, &w.rng);
+                s.center_mid(w.tick, &cfg)
+            })
+            .collect()
+    };
+    let old = w.cfg.sources.path_speed;
+    let before = centers(&w, old);
+    w.schedule(w.tick, Command::SetParam { param: Param::SourceSpeed, value: old * 4.0 }).unwrap();
+    w.step().unwrap();
+    let after = centers(&w, old * 4.0);
+    let (ww, wh) = (w.field.width(), w.field.height());
+    for (a, b) in before.iter().zip(&after) {
+        let d = (fl_core::field::min_image(a[0] - b[0], ww).powi(2) + fl_core::field::min_image(a[1] - b[1], wh).powi(2)).sqrt();
+        assert!(d < old * 4.0 * w.cfg.dt() * 2.0, "source moved {d} units in one tick");
+    }
+}
+
+#[test]
+fn live_tuning_rejects_values_the_configuration_would_reject() {
+    let mut w = World::new(small()).unwrap();
+    assert!(w.schedule(0, Command::SetParam { param: Param::SourcePower, value: -1.0 }).is_err());
+    assert!(w.schedule(0, Command::SetParam { param: Param::SourceSpeed, value: f64::NAN }).is_err());
+    assert!(w.schedule(0, Command::SetParam { param: Param::MutationWeightProbability, value: 1.5 }).is_err());
+    assert!(w.schedule(0, Command::SetParam { param: Param::Diffusion, value: 1.0e6 }).is_err());
+    assert!(w.schedule(0, Command::DriftChemistry { source: Some(3), degrees: 5.0 }).is_err());
+    assert!(w.schedule(0, Command::DriftChemistry { source: None, degrees: 400.0 }).is_err());
+    assert!(w.pending.is_empty(), "nothing rejected is kept");
+    assert!(w.schedule(0, Command::SetParam { param: Param::Diffusion, value: 0.3 }).is_ok());
+}
