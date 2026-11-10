@@ -568,27 +568,43 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 impl GpuBackend {
     /// Open the highest-performance adapter (`WGPU_BACKEND=vulkan|dx12|metal` overrides the choice).
     pub fn new() -> Result<GpuBackend, String> {
-        pollster::block_on(Self::open())
+        pollster::block_on(Self::open(None))
     }
 
-    async fn open() -> Result<GpuBackend, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, force_fallback_adapter: false, compatible_surface: None, apply_limit_buckets: false })
-            .await
-            .map_err(|e| format!("no GPU adapter found: {e}"))?;
+    /// A new backend with no organism or field state, on the same device, so a window that draws with this
+    /// device keeps working (the viewer swaps worlds with it). The pipelines are built again.
+    pub fn fresh(&self) -> Result<GpuBackend, String> {
+        pollster::block_on(Self::open(Some((self.instance.clone(), self.adapter.clone(), self.device.clone(), self.queue.clone()))))
+    }
+
+    async fn open(existing: Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)>) -> Result<GpuBackend, String> {
+        let (instance, adapter, device, queue, limits, ts_ok) = match existing {
+            Some((instance, adapter, device, queue)) => {
+                let limits = device.limits();
+                let ts_ok = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+                (instance, adapter, device, queue, limits, ts_ok)
+            }
+            None => {
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, force_fallback_adapter: false, compatible_surface: None, apply_limit_buckets: false })
+                    .await
+                    .map_err(|e| format!("no GPU adapter found: {e}"))?;
+                let al = adapter.limits();
+                let mut limits = wgpu::Limits::default();
+                // Weight slabs are large: ask for everything the adapter offers here.
+                limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
+                limits.max_buffer_size = al.max_buffer_size;
+                let ts_ok = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+                let required_features = if ts_ok { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+                let (device, queue) = adapter
+                    .request_device(&wgpu::DeviceDescriptor { label: Some("frankenlife"), required_features, required_limits: limits.clone(), ..Default::default() })
+                    .await
+                    .map_err(|e| format!("could not open GPU device: {e}"))?;
+                (instance, adapter, device, queue, limits, ts_ok)
+            }
+        };
         let ai = adapter.get_info();
-        let al = adapter.limits();
-        let mut limits = wgpu::Limits::default();
-        // Weight slabs are large: ask for everything the adapter offers here.
-        limits.max_storage_buffer_binding_size = al.max_storage_buffer_binding_size;
-        limits.max_buffer_size = al.max_buffer_size;
-        let ts_ok = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let required_features = if ts_ok { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor { label: Some("frankenlife"), required_features, required_limits: limits.clone(), ..Default::default() })
-            .await
-            .map_err(|e| format!("could not open GPU device: {e}"))?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("mlp"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let uniform_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -2825,6 +2841,36 @@ mod tests {
             }
         }
         assert!(due > 10 && due < jobs.len(), "a mix of due and idle jobs: {due} of {}", jobs.len());
+    }
+
+    /// A fresh backend on the same device carries nothing over from the world that came before it: a new
+    /// world (organism ids start over) steps exactly as it does on a brand new backend.
+    #[test]
+    fn fresh_backend_forgets_the_previous_world() {
+        let Ok(mut old) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        old.set_single_wait(true);
+        let mut first = fl_core::World::new(recurrent_small()).unwrap();
+        for _ in 0..8 {
+            first.step_inference(fl_core::Inference::Resident(&mut old)).unwrap();
+        }
+        let mut cfg = recurrent_small();
+        cfg.population.initial_count = 450;
+        cfg.population.maximum_count = 900;
+        let mut reused = old.fresh().unwrap();
+        reused.set_single_wait(true);
+        let mut a = fl_core::World::new(cfg.clone()).unwrap();
+        let Ok(mut other) = GpuBackend::new() else { return };
+        other.set_single_wait(true);
+        let mut b = fl_core::World::new(cfg).unwrap();
+        for _ in 0..8 {
+            a.step_inference(fl_core::Inference::Resident(&mut reused)).unwrap();
+            b.step_inference(fl_core::Inference::Resident(&mut other)).unwrap();
+        }
+        assert!(a.orgs.len() > 400, "the new world has its own, larger population");
+        assert_eq!(a.state_hash(), b.state_hash(), "a fresh backend steps like a new one");
     }
 
     fn recurrent_half_small() -> Config {
