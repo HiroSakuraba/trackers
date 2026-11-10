@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::chemistry::{drag_force_coefficient, eta, grant_scale, rate_to_probability, settle, split_energy};
 use crate::config::{CapacityPolicy, Config};
 use crate::field::{min_image, wrap, Field, Stencil};
-use crate::genome::{founder, mutate, Genome, MutationRecord};
-use crate::nn::{forward, sigmoid, INPUT_WIDTH, MAX_HIDDEN, OUTPUT_WIDTH};
+use crate::genome::{founder, mutate, Genome, MutationRecord, Weights};
+use crate::nn::{forward, forward_state, is_recurrent, sigmoid, INPUT_WIDTH, MAX_HIDDEN, MEMORY_WIDTH, OUTPUT_WIDTH};
 use crate::profile::{proportion, CpuStage, OtherPart, StageProfiler, Stamp};
 use crate::rng::{Lane, SemanticRng};
 use crate::sensors::{intrinsic, observe, Pyramid, PLANES};
@@ -44,6 +44,9 @@ pub mod out {
     pub const EMIT_RATE: usize = 35;
 }
 
+/// Memory of a newborn, and the stand-in input of a memoryless world.
+pub const ZERO_MEMORY: [f32; MEMORY_WIDTH] = [0.0; MEMORY_WIDTH];
+
 /// Hot organism state, structure-of-arrays, always ordered by stable ID.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Organisms {
@@ -63,6 +66,9 @@ pub struct Organisms {
     pub held: Vec<[f32; OUTPUT_WIDTH]>,
     pub held_tick: Vec<u64>,
     pub held_valid: Vec<bool>,
+    /// Recurrent memory, updated at each evaluation. The column exists only in a world of recurrent
+    /// genomes (one entry per organism); in any other world it stays empty and costs nothing.
+    pub memory: Vec<[f32; MEMORY_WIDTH]>,
     pub genome: Vec<Arc<Genome>>,
 }
 
@@ -86,7 +92,7 @@ impl Organisms {
                 self.$f.retain(|_| { let k = keep[i]; i += 1; k });
             )*};
         }
-        r!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid, genome);
+        r!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid, memory, genome);
     }
 
     /// Copy every column of `src` except the genomes into `self`, keeping allocated
@@ -100,7 +106,7 @@ impl Organisms {
                 self.$f.extend_from_slice(&src.$f);
             )*};
         }
-        c!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid);
+        c!(id, lineage, generation, x, y, vx, vy, energy, birth_tick, cooldown_until, energy_change_rate, phase, held, held_tick, held_valid, memory);
         self.genome.clear();
     }
 
@@ -121,6 +127,9 @@ impl Organisms {
         self.held.push([0.0; OUTPUT_WIDTH]);
         self.held_tick.push(0);
         self.held_valid.push(false);
+        if is_recurrent(genome.hidden()) {
+            self.memory.push(ZERO_MEMORY);
+        }
         self.genome.push(genome);
     }
 }
@@ -391,6 +400,9 @@ struct Sense {
     density0: f64,
     out: [f32; OUTPUT_WIDTH],
     evaluated: bool,
+    /// Next recurrent memory of a due evaluation. Boxed so a memoryless world pays eight
+    /// bytes per organism, not sixty-four, in this table that every tick walks.
+    mem: Option<Box<[f32; MEMORY_WIDTH]>>,
     /// `Σ_k motion_k · ∂_k` (x, y) over the sensed physical gradients of `[q, Z_0..Z_31]`.
     motion_drive: [f64; 2],
     /// Controller input of a due evaluation, kept only for an external controller backend.
@@ -399,8 +411,32 @@ struct Sense {
 
 impl Sense {
     fn blank() -> Sense {
-        Sense { density0: 0.0, out: [0.0; OUTPUT_WIDTH], evaluated: false, motion_drive: [0.0; 2], input: None }
+        Sense { density0: 0.0, out: [0.0; OUTPUT_WIDTH], evaluated: false, mem: None, motion_drive: [0.0; 2], input: None }
     }
+}
+
+/// One organism's motion/emission/reproduction outcome, merged serially after the threaded pass.
+#[derive(Clone, Copy, Default, Debug)]
+struct MotionOut {
+    ran: bool,
+    dead: bool,
+    has_tiny: bool,
+    emitted: bool,
+    has_deposit: bool,
+    deaths: u8,
+    attempts: u8,
+    rejected_mutation: u8,
+    rejected_viability: u8,
+    x: f64,
+    y: f64,
+    vx: f64,
+    vy: f64,
+    energy: f64,
+    d_motion: f64,
+    tiny: f64,
+    d_emission: f64,
+    d_transferred: f64,
+    deposit_q: f64,
 }
 
 struct BirthProposal {
@@ -442,6 +478,9 @@ org_scratch: Reused<Organisms>,
     energy_scratch: Reused<Vec<f64>>,
     /// Reused per-organism sense table.
     sense_scratch: Reused<Vec<Sense>>,
+    outs_scratch: Reused<Vec<SenseOutput>>,
+    motion_scratch: Reused<Vec<MotionOut>>,
+    dir_scratch: Reused<Vec<[f32; CHANNELS]>>,
     /// Genome-derived per-organism constants, aligned with `orgs` (rebuilt when it is not).
     genome_hot: Reused<Vec<GenomeHot>>,
     /// The cost parameters `genome_hot` was computed with.
@@ -528,6 +567,9 @@ impl World {
             org_scratch: Reused::default(),
             energy_scratch: Reused::default(),
             sense_scratch: Reused::default(),
+            outs_scratch: Reused::default(),
+            motion_scratch: Reused::default(),
+            dir_scratch: Reused::default(),
             genome_hot: Reused::default(),
             genome_hot_key: Reused::default(),
         })
@@ -867,6 +909,7 @@ impl World {
 
         // ── Phase 3–4: sensing pyramid, sample organisms, evaluate due controllers ──
         let t_sense = Stopwatch::start();
+        let workers = self.workers;
         // Set by a device's single-wait front half: (organism index per job, uptake results, granted energy).
         let mut fused_uptake: Option<(Vec<usize>, Vec<UptakeOut>, f64)> = None;
         let sense_now = device.is_some() || resident.is_some() || fused.is_some();
@@ -874,22 +917,24 @@ impl World {
             let ps = prof.start();
             let k_eval = cfg.controller.evaluation_interval_ticks as u64;
             let idx: Vec<usize> = (0..orgs.len()).filter(|&i| !dead[i]).collect();
-            let jobs: Vec<SenseJob<'_>> = idx
-                .iter()
-                .map(|&i| {
-                    let age = (n - orgs.birth_tick[i]) as f64 * dt;
-                    SenseJob {
-                        organism: orgs.id[i],
-                        genome: &genomes[i],
-                        x: orgs.x[i],
-                        y: orgs.y[i],
-                        intrinsic: intrinsic(&cfg.sensors, orgs.energy[i], age, orgs.vx[i], orgs.vy[i], orgs.energy_change_rate[i]),
-                        due: !orgs.held_valid[i] || (n + 1) % k_eval == orgs.phase[i] as u64,
-                    }
-                })
-                .collect();
+            let jobs: Vec<SenseJob<'_>> = crate::par::map_collect(workers, idx.len(), |k| {
+                let i = idx[k];
+                let age = (n - orgs.birth_tick[i]) as f64 * dt;
+                SenseJob {
+                    organism: orgs.id[i],
+                    genome: &genomes[i],
+                    x: orgs.x[i],
+                    y: orgs.y[i],
+                    intrinsic: intrinsic(&cfg.sensors, orgs.energy[i], age, orgs.vx[i], orgs.vy[i], orgs.energy_change_rate[i]),
+                    due: !orgs.held_valid[i] || (n + 1) % k_eval == orgs.phase[i] as u64,
+                    memory: orgs.memory.get(i).unwrap_or(&ZERO_MEMORY),
+                }
+            });
             prof.stop(CpuStage::Sensing, ps);
-            let mut outs = vec![SenseOutput::default(); jobs.len()];
+            // Reused across ticks: a fresh megabyte every tick costs page faults.
+            let mut outs = std::mem::take(&mut self.outs_scratch.0);
+            outs.clear();
+            outs.resize(jobs.len(), SenseOutput::default());
             let mut front_done = false;
             if transport_open {
                 // Single-wait front half when the device offers it: transport accounting,
@@ -928,6 +973,7 @@ impl World {
                 (None, None) => fused,
             };
             let fb = fused.expect("fused backend");
+            let has_memory = !orgs.memory.is_empty();
             let mut senses_buf = std::mem::take(&mut self.sense_scratch.0);
             if senses_buf.len() != orgs.len() {
                 senses_buf.resize(orgs.len(), Sense::blank());
@@ -943,19 +989,70 @@ impl World {
                 res.map_err(|detail| TickError::NumericalFault { tick: event, detail: format!("backend {}: {detail}", fb.name()) })?;
             }
             let ps = prof.start();
-            for (k, &i) in idx.iter().enumerate() {
+            let scatter_one = |k: usize, i: usize, s: &mut Sense| -> bool {
                 let o = &outs[k];
                 let finite = o.motion_drive.iter().all(|v| v.is_finite()) && o.density0.is_finite() && (!jobs[k].due || o.logits.iter().all(|v| v.is_finite()));
                 if !finite {
-                    return Err(TickError::NumericalFault { tick: event, detail: format!("backend {} produced non-finite results for organism {}", fb.name(), orgs.id[i]) });
+                    return false;
                 }
-                senses_buf[i].density0 = o.density0.max(0.0);
-                senses_buf[i].motion_drive = o.motion_drive;
-                senses_buf[i].evaluated = jobs[k].due;
-                senses_buf[i].input = None;
-                senses_buf[i].out = if jobs[k].due { o.logits } else { orgs.held[i] };
+                s.density0 = o.density0.max(0.0);
+                s.motion_drive = o.motion_drive;
+                s.evaluated = jobs[k].due;
+                // The next memory goes straight into the organism column below, not into a boxed copy per organism.
+                s.mem = None;
+                s.input = None;
+                s.out = if jobs[k].due { o.logits } else { orgs.held[i] };
+                true
+            };
+            // Every organism is a job (nobody was removed by a command this tick): the rows line up one to one, so the loop can be split across threads.
+            let mut all_finite = true;
+            if idx.len() == orgs.len() && crate::par::threaded(workers, idx.len()) {
+                let ok = std::sync::atomic::AtomicBool::new(true);
+                crate::par::for_each_mut(workers, &mut senses_buf[..], |i, s| {
+                    if !scatter_one(i, i, s) {
+                        ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+                all_finite = ok.load(std::sync::atomic::Ordering::Relaxed);
+            } else {
+                for (k, &i) in idx.iter().enumerate() {
+                    if !scatter_one(k, i, &mut senses_buf[i]) {
+                        all_finite = false;
+                        break;
+                    }
+                }
+            }
+            if !all_finite {
+                // Name the first offender, as the serial loop would.
+                let k = (0..idx.len())
+                    .find(|&k| {
+                        let o = &outs[k];
+                        !(o.motion_drive.iter().all(|v| v.is_finite()) && o.density0.is_finite() && (!jobs[k].due || o.logits.iter().all(|v| v.is_finite())))
+                    })
+                    .unwrap_or(0);
+                return Err(TickError::NumericalFault { tick: event, detail: format!("backend {} produced non-finite results for organism {}", fb.name(), orgs.id[idx[k]]) });
+            }
+            if has_memory {
+                // The next memory of every organism evaluated this tick goes straight into its column (the held-output store
+                // below does not touch it in this path). The jobs hold the old memory by reference, so release them first.
+                let dues: Vec<bool> = jobs.iter().map(|j| j.due).collect();
+                drop(jobs);
+                if idx.len() == orgs.len() && crate::par::threaded(workers, idx.len()) {
+                    crate::par::for_each_mut(workers, &mut orgs.memory[..], |i, m| {
+                        if dues[i] {
+                            *m = outs[i].memory;
+                        }
+                    });
+                } else {
+                    for (k, &i) in idx.iter().enumerate() {
+                        if dues[k] {
+                            orgs.memory[i] = outs[k].memory;
+                        }
+                    }
+                }
             }
             prof.stop_other(OtherPart::SenseScatter, ps);
+            self.outs_scratch.0 = outs;
             senses_buf
         } else {
             let ps = prof.start();
@@ -1002,14 +1099,27 @@ impl World {
             prof.stop_other(OtherPart::SenseScatter, ps);
         }
         let ps = prof.start();
-        for (i, s) in senses.iter().enumerate() {
-            if s.evaluated {
-                orgs.held[i] = s.out;
-                orgs.held_tick[i] = event;
-                orgs.held_valid[i] = true;
-                counts.controller_evaluations += 1;
-                counts.parameter_evaluations += hot[i].params as u64;
+        {
+            let senses = &senses;
+            crate::par::for_each_mut3(workers, &mut orgs.held[..], &mut orgs.held_tick[..], &mut orgs.held_valid[..], |i, held, tick, valid| {
+                let s = &senses[i];
+                if s.evaluated {
+                    *held = s.out;
+                    *tick = event;
+                    *valid = true;
+                }
+            });
+            // Only the CPU-sensing path hands memory over here; the fused/device paths wrote it when they scattered.
+            if !sense_now && !orgs.memory.is_empty() {
+                crate::par::for_each_mut(workers, &mut orgs.memory[..], |i, m| {
+                    if let (true, Some(next)) = (senses[i].evaluated, &senses[i].mem) {
+                        *m = **next;
+                    }
+                });
             }
+            let (evals, params) = crate::par::sum2(workers, senses.len(), |i| if senses[i].evaluated { (1, hot[i].params as u64) } else { (0, 0) });
+            counts.controller_evaluations += evals as u32;
+            counts.parameter_evaluations += params;
         }
         prof.stop_other(OtherPart::HeldStore, ps);
         timing.sense_and_infer_ms = t_sense.ms();
@@ -1019,9 +1129,7 @@ impl World {
         let ch = &cfg.chemistry;
         let umax = ch.uptake_capacity_per_second;
         let ps = prof.start();
-        let demand: Vec<f64> = (0..orgs.len())
-            .map(|i| if dead[i] { 0.0 } else { let r = senses[i].density0; dt * umax * r / (ch.uptake_half_saturation_density + r) })
-            .collect();
+        let demand: Vec<f64> = crate::par::map_collect(workers, orgs.len(), |i| if dead[i] { 0.0 } else { let r = senses[i].density0; dt * umax * r / (ch.uptake_half_saturation_density + r) });
         prof.stop(CpuStage::ChemistryField, ps);
         let mut uptake_total = vec![0.0f64; orgs.len()];
         let mut settlements: Vec<crate::chemistry::Settlement> = Vec::with_capacity(orgs.len());
@@ -1043,18 +1151,41 @@ impl World {
             led.transferred += granted;
             let ps = prof.start();
             settlements = vec![Default::default(); orgs.len()];
-            for (k, &i) in idx.iter().enumerate() {
+            let settle_one = |k: usize, i: usize, st: &mut crate::chemistry::Settlement, total: &mut f64| -> bool {
                 let o = outs[k];
                 if !(o.absorbed.is_finite() && o.useful_gain.is_finite() && o.toxicity_requested.is_finite()) {
-                    return Err(TickError::NumericalFault { tick: event, detail: format!("resident uptake produced non-finite results for organism {}", orgs.id[i]) });
+                    return false;
                 }
-                settlements[i] = crate::chemistry::Settlement {
+                *st = crate::chemistry::Settlement {
                     absorbed: o.absorbed,
                     useful_gain: o.useful_gain,
                     toxicity_requested: o.toxicity_requested,
                     toxicity_paid: o.toxicity_requested.min(orgs.energy[i] + o.useful_gain),
                 };
-                uptake_total[i] = o.absorbed;
+                *total = o.absorbed;
+                true
+            };
+            let mut all_finite = true;
+            if idx.len() == orgs.len() && crate::par::threaded(workers, idx.len()) {
+                let ok = std::sync::atomic::AtomicBool::new(true);
+                crate::par::for_each_mut2(workers, &mut settlements[..], &mut uptake_total[..], |i, st, total| {
+                    if !settle_one(i, i, st, total) {
+                        ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+                all_finite = ok.load(std::sync::atomic::Ordering::Relaxed);
+            } else {
+                for (k, &i) in idx.iter().enumerate() {
+                    let (st, total) = (&mut settlements[i], &mut uptake_total[i]);
+                    if !settle_one(k, i, st, total) {
+                        all_finite = false;
+                        break;
+                    }
+                }
+            }
+            if !all_finite {
+                let k = (0..idx.len()).find(|&k| !(outs[k].absorbed.is_finite() && outs[k].useful_gain.is_finite() && outs[k].toxicity_requested.is_finite())).unwrap_or(0);
+                return Err(TickError::NumericalFault { tick: event, detail: format!("resident uptake produced non-finite results for organism {}", orgs.id[idx[k]]) });
             }
             prof.stop_other(OtherPart::UptakeScatter, ps);
         } else {
@@ -1113,42 +1244,59 @@ impl World {
         }
 
         // ── Phase 6: settle gain, toxicity, maintenance ───────────────────
+        // Per-organism work runs on threads; every shared total is then added up in organism
+        // order, exactly as the serial loop did, so the sums are bit-identical.
         let co = &cfg.costs;
         let ps = prof.start();
-        let exhaust = |e: &mut f64, dead: &mut bool, dis: &mut Dissipation, counts: &mut TickCounts| {
-            if *e <= tiny {
-                dis.tiny_reservoir += e.max(0.0);
-                *e = 0.0;
-                if !*dead {
-                    *dead = true;
-                    counts.deaths_exhaustion += 1;
-                }
-                true
-            } else {
-                false
+        #[derive(Clone, Copy, Default)]
+        struct Upkeep {
+            ran: bool,
+            ineff: f64,
+            tox: f64,
+            maint: f64,
+            tiny: f64,
+            has_tiny: bool,
+            died: bool,
+        }
+        let mut upkeep = vec![Upkeep::default(); orgs.len()];
+        crate::par::for_each_mut3(workers, &mut orgs.energy[..], &mut dead[..], &mut upkeep[..], |i, energy, dead_i, u| {
+            if *dead_i {
+                return;
             }
-        };
-        for i in 0..orgs.len() {
-            if dead[i] {
-                continue;
-            }
+            u.ran = true;
             let st = settlements[i];
-            orgs.energy[i] += st.net();
-            dis.uptake_inefficiency += st.absorbed - st.useful_gain;
-            dis.toxicity += st.toxicity_paid;
+            *energy += st.net();
+            u.ineff = st.absorbed - st.useful_gain;
+            u.tox = st.toxicity_paid;
             let cost = dt * hot[i].upkeep_rate + if senses[i].evaluated { co.neural_energy_per_parameter_evaluation * hot[i].params as f64 } else { 0.0 };
-            let paid = cost.min(orgs.energy[i].max(0.0));
-            orgs.energy[i] -= paid;
-            dis.maintenance += paid;
+            let paid = cost.min(energy.max(0.0));
+            *energy -= paid;
+            u.maint = paid;
             if paid < cost {
-                orgs.energy[i] = orgs.energy[i].max(0.0);
-                dis.tiny_reservoir += orgs.energy[i];
-                orgs.energy[i] = 0.0;
-                dead[i] = true;
-                counts.deaths_exhaustion += 1;
-                continue;
+                *energy = energy.max(0.0);
+                u.tiny = *energy;
+                u.has_tiny = true;
+                *energy = 0.0;
+                *dead_i = true;
+                u.died = true;
+                return;
             }
-            exhaust(&mut orgs.energy[i], &mut dead[i], &mut dis, &mut counts);
+            if *energy <= tiny {
+                u.tiny = energy.max(0.0);
+                u.has_tiny = true;
+                *energy = 0.0;
+                *dead_i = true;
+                u.died = true;
+            }
+        });
+        for u in upkeep.iter().filter(|u| u.ran) {
+            dis.uptake_inefficiency += u.ineff;
+            dis.toxicity += u.tox;
+            dis.maintenance += u.maint;
+            if u.has_tiny {
+                dis.tiny_reservoir += u.tiny;
+            }
+            counts.deaths_exhaustion += u.died as u32;
         }
         prof.stop(CpuStage::ChemistryField, ps);
         timing.exchange_ms = t.ms();
@@ -1161,105 +1309,175 @@ impl World {
         let em = &cfg.emission;
         let rp = &cfg.reproduction;
         let (w, h) = (field.width(), field.height());
-        let mut proposals: Vec<BirthProposal> = Vec::new();
-        for i in 0..orgs.len() {
-            if dead[i] {
-                continue;
-            }
-            // Motion (field-mediated chemotaxis; no pairwise forces).
-            // Genome bytes are immutable here; a shared reference avoids an Arc clone per organism.
-            let g = &*genomes[i];
-            let s = &senses[i];
-            let gu = if umax > 0.0 { (uptake_total[i] / (dt * umax)).clamp(0.0, 1.0) } else { 0.0 };
-            let (mut fx, mut fy) = (s.motion_drive[0], s.motion_drive[1]);
-            fx *= gu;
-            fy *= gu;
-            let fn_ = (fx * fx + fy * fy).sqrt();
-            if fn_ > ch.maximum_acceleration {
-                let f = ch.maximum_acceleration / fn_;
-                fx *= f;
-                fy *= f;
-            }
-            let mut vx = drag_keep * orgs.vx[i] + drag_coef * fx;
-            let mut vy = drag_keep * orgs.vy[i] + drag_coef * fy;
-            let sp = (vx * vx + vy * vy).sqrt();
-            if sp > ch.maximum_speed {
-                let f = ch.maximum_speed / sp;
-                vx *= f;
-                vy *= f;
-            }
-            let mut cost = co.motion_energy_per_speed_squared_second * (vx * vx + vy * vy) * dt;
-            if cost > orgs.energy[i] {
-                let f = (orgs.energy[i] / cost).sqrt();
-                vx *= f;
-                vy *= f;
-                cost = orgs.energy[i];
-            }
-            orgs.energy[i] -= cost;
-            dis.motion += cost;
-            orgs.vx[i] = vx;
-            orgs.vy[i] = vy;
-            orgs.x[i] = wrap(orgs.x[i] + dt * vx, w);
-            orgs.y[i] = wrap(orgs.y[i] + dt * vy, h);
-            if exhaust(&mut orgs.energy[i], &mut dead[i], &mut dis, &mut counts) {
-                continue;
-            }
-
-            // Paid emission at the post-motion position, visible next tick.
-            let o = &s.out;
-            if sigmoid(o[out::EMIT_GATE] as f64) > em.gate_threshold {
-                let raw: [f64; CHANNELS] = std::array::from_fn(|k| o[out::EMIT_DIR + k] as f64);
-                let rn = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if rn >= em.direction_zero_threshold {
-                    if let Some(dir) = isotropic_unit(&raw) {
-                        let frac = rate_to_probability(em.maximum_fractional_rate_per_second * sigmoid(o[out::EMIT_RATE] as f64), dt);
-                        let spend = orgs.energy[i] * frac;
-                        if spend > 0.0 {
-                            orgs.energy[i] -= spend;
-                            if is_resident {
-                                dep_list.push(FieldDeposit::Stencil { x: orgs.x[i], y: orgs.y[i], q: em.transfer_efficiency * spend, dir });
-                            } else {
-                                let st = field.stencil(orgs.x[i], orgs.y[i]);
-                                deposits.deposit(&st, em.transfer_efficiency * spend, &dir);
-                            }
-                            dis.emission += (1.0 - em.transfer_efficiency) * spend;
-                            led.transferred += spend;
-                            counts.emitting += 1;
-                            if exhaust(&mut orgs.energy[i], &mut dead[i], &mut dis, &mut counts) {
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Reproduction proposal (one Bernoulli attempt per eligible tick).
-            if n >= orgs.cooldown_until[i] && orgs.energy[i] >= rp.minimum_parent_energy_before_attempt {
-                let lambda = rp.maximum_attempt_rate_per_second * sigmoid(o[out::SPLIT] as f64);
-                let p = rate_to_probability(lambda, dt);
-                let u = self.rng.uniform(Lane::ReproductionAttempt, orgs.id[i], event, 0, 0);
-                if u < p {
-                    counts.reproduction_attempts += 1;
-                    let beta = rp.minimum_child_fraction + (rp.maximum_child_fraction - rp.minimum_child_fraction) * sigmoid(o[out::SHARE] as f64);
-                    let (ce, pe) = split_energy(orgs.energy[i], co.birth_energy, beta);
-                    if ce >= rp.minimum_child_energy && pe >= rp.minimum_parent_energy_after_split {
-                        match mutate(cfg, &self.rng, g, orgs.id[i], event, 0) {
-                            Ok(genome) => proposals.push(BirthProposal { parent: i, genome, child_energy: ce, parent_energy: pe }),
-                            Err(_) => counts.rejected_births_mutation += 1,
-                        }
-                    } else {
-                        counts.rejected_births_viability += 1;
-                    }
-                }
-            }
+        let mut proposals: Vec<BirthProposal>;
+        // One organism's motion, emission and reproduction attempt run on threads; its new state and its
+        // contributions to the shared totals are recorded, then merged below in organism order.
+        let tr0 = std::time::Instant::now();
+        let mut mo = std::mem::take(&mut self.motion_scratch.0);
+        mo.clear();
+        mo.resize(orgs.len(), MotionOut::default());
+        let mut dirs = std::mem::take(&mut self.dir_scratch.0);
+        if dirs.len() < orgs.len() {
+            dirs.resize(orgs.len(), [0.0; CHANNELS]);
         }
+        let new_births = std::sync::Mutex::new(Vec::<BirthProposal>::new());
+        let rng = &self.rng;
+        crate::par::for_each_mut2(workers, &mut mo[..], &mut dirs[..orgs.len()], |i, r, dir_slot| {
+            if dead[i] {
+                return;
+            }
+            r.ran = true;
+            let (mut x, mut y, mut energy) = (orgs.x[i], orgs.y[i], orgs.energy[i]);
+            r.dead = false;
+            'organism: {
+                // Motion (field-mediated chemotaxis; no pairwise forces).
+                // Genome bytes are immutable here; a shared reference avoids an Arc clone per organism.
+                let g = &*genomes[i];
+                let s = &senses[i];
+                let gu = if umax > 0.0 { (uptake_total[i] / (dt * umax)).clamp(0.0, 1.0) } else { 0.0 };
+                let (mut fx, mut fy) = (s.motion_drive[0], s.motion_drive[1]);
+                fx *= gu;
+                fy *= gu;
+                let fn_ = (fx * fx + fy * fy).sqrt();
+                if fn_ > ch.maximum_acceleration {
+                    let f = ch.maximum_acceleration / fn_;
+                    fx *= f;
+                    fy *= f;
+                }
+                let mut vx = drag_keep * orgs.vx[i] + drag_coef * fx;
+                let mut vy = drag_keep * orgs.vy[i] + drag_coef * fy;
+                let sp = (vx * vx + vy * vy).sqrt();
+                if sp > ch.maximum_speed {
+                    let f = ch.maximum_speed / sp;
+                    vx *= f;
+                    vy *= f;
+                }
+                let mut cost = co.motion_energy_per_speed_squared_second * (vx * vx + vy * vy) * dt;
+                if cost > energy {
+                    let f = (energy / cost).sqrt();
+                    vx *= f;
+                    vy *= f;
+                    cost = energy;
+                }
+                energy -= cost;
+                r.d_motion = cost;
+                r.vx = vx;
+                r.vy = vy;
+                x = wrap(x + dt * vx, w);
+                y = wrap(y + dt * vy, h);
+                if energy <= tiny {
+                    r.tiny = energy.max(0.0);
+                    r.has_tiny = true;
+                    energy = 0.0;
+                    r.dead = true;
+                    r.deaths += 1;
+                    break 'organism;
+                }
+
+                // Paid emission at the post-motion position, visible next tick.
+                let o = &s.out;
+                if sigmoid(o[out::EMIT_GATE] as f64) > em.gate_threshold {
+                    let raw: [f64; CHANNELS] = std::array::from_fn(|k| o[out::EMIT_DIR + k] as f64);
+                    let rn = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+                    if rn >= em.direction_zero_threshold {
+                        if let Some(dir) = isotropic_unit(&raw) {
+                            let frac = rate_to_probability(em.maximum_fractional_rate_per_second * sigmoid(o[out::EMIT_RATE] as f64), dt);
+                            let spend = energy * frac;
+                            if spend > 0.0 {
+                                energy -= spend;
+                                *dir_slot = dir;
+                                r.has_deposit = true;
+                                r.deposit_q = em.transfer_efficiency * spend;
+                                r.d_emission = (1.0 - em.transfer_efficiency) * spend;
+                                r.d_transferred = spend;
+                                r.emitted = true;
+                                if energy <= tiny {
+                                    r.tiny = energy.max(0.0);
+                                    r.has_tiny = true;
+                                    energy = 0.0;
+                                    r.dead = true;
+                                    r.deaths += 1;
+                                    break 'organism;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Reproduction proposal (one Bernoulli attempt per eligible tick).
+                if n >= orgs.cooldown_until[i] && energy >= rp.minimum_parent_energy_before_attempt {
+                    let lambda = rp.maximum_attempt_rate_per_second * sigmoid(o[out::SPLIT] as f64);
+                    let p = rate_to_probability(lambda, dt);
+                    let u = rng.uniform(Lane::ReproductionAttempt, orgs.id[i], event, 0, 0);
+                    if u < p {
+                        r.attempts += 1;
+                        let beta = rp.minimum_child_fraction + (rp.maximum_child_fraction - rp.minimum_child_fraction) * sigmoid(o[out::SHARE] as f64);
+                        let (ce, pe) = split_energy(energy, co.birth_energy, beta);
+                        if ce >= rp.minimum_child_energy && pe >= rp.minimum_parent_energy_after_split {
+                            match mutate(cfg, rng, g, orgs.id[i], event, 0) {
+                                Ok(genome) => new_births.lock().expect("births lock").push(BirthProposal { parent: i, genome, child_energy: ce, parent_energy: pe }),
+                                Err(_) => r.rejected_mutation += 1,
+                            }
+                        } else {
+                            r.rejected_viability += 1;
+                        }
+                    }
+                }
+            }
+            r.x = x;
+            r.y = y;
+            r.energy = energy;
+        });
+        let tr2 = std::time::Instant::now();
+        // In organism order, as the serial loop did.
+        for (i, r) in mo.iter().enumerate() {
+            if !r.ran {
+                continue;
+            }
+            dis.motion += r.d_motion;
+            if r.has_tiny {
+                dis.tiny_reservoir += r.tiny;
+            }
+            if r.has_deposit {
+                if is_resident {
+                    dep_list.push(FieldDeposit::Stencil { x: r.x, y: r.y, q: r.deposit_q, dir: dirs[i] });
+                } else {
+                    let st = field.stencil(r.x, r.y);
+                    deposits.deposit(&st, r.deposit_q, &dirs[i]);
+                }
+            }
+            if r.emitted {
+                dis.emission += r.d_emission;
+                led.transferred += r.d_transferred;
+                counts.emitting += 1;
+            }
+            counts.deaths_exhaustion += r.deaths as u32;
+            counts.reproduction_attempts += r.attempts as u32;
+            counts.rejected_births_mutation += r.rejected_mutation as u32;
+            counts.rejected_births_viability += r.rejected_viability as u32;
+            orgs.x[i] = r.x;
+            orgs.y[i] = r.y;
+            orgs.vx[i] = r.vx;
+            orgs.vy[i] = r.vy;
+            orgs.energy[i] = r.energy;
+            dead[i] = r.dead;
+        }
+        proposals = new_births.into_inner().expect("births lock");
+        proposals.sort_by_key(|p| p.parent);
+        if profiling && n % 128 == 0 {
+            let tr3 = std::time::Instant::now();
+            eprintln!("trace motion n={} setup {:.2} par {:.2} merge {:.2} ms (row {} B)", orgs.len(), 0.0, (tr2 - tr0).as_secs_f64() * 1e3, (tr3 - tr2).as_secs_f64() * 1e3, std::mem::size_of::<MotionOut>());
+        }
+        self.motion_scratch.0 = mo;
+        self.dir_scratch.0 = dirs;
         prof.stop_other(OtherPart::LifecycleMotion, ps);
         let ps = prof.start();
 
         // ── Phase 8: capacities, births, deaths ───────────────────────────
         let survivors: Vec<usize> = (0..orgs.len()).filter(|&i| !dead[i]).collect();
-        let live_bytes: u64 = survivors.iter().map(|&i| hot[i].params as u64 * 4).sum();
-        let birth_bytes: u64 = proposals.iter().map(|p| p.genome.param_count() as u64 * 4).sum();
+        let wb = cfg.controller.weight_dtype().bytes();
+        let live_bytes: u64 = survivors.iter().map(|&i| hot[i].params as u64 * wb).sum();
+        let birth_bytes: u64 = proposals.iter().map(|p| p.genome.param_count() as u64 * wb).sum();
         let max_count = cfg.population.maximum_count as usize;
         let quota = cfg.execution.maximum_logical_genome_bytes;
         let mut accepted = proposals.len();
@@ -1505,8 +1723,22 @@ impl World {
             for v in &o.held[i] {
                 eat(v.to_bits() as u64);
             }
-            for v in &o.genome[i].params {
-                eat(v.to_bits() as u64);
+            match &o.genome[i].params {
+                Weights::F32(w) => {
+                    for v in w {
+                        eat(v.to_bits() as u64);
+                    }
+                }
+                Weights::F16(w) => {
+                    for &v in w {
+                        eat(v as u64);
+                    }
+                }
+            }
+            if let Some(m) = o.memory.get(i) {
+                for v in m {
+                    eat(v.to_bits() as u64);
+                }
             }
         }
         h
@@ -1918,6 +2150,8 @@ pub struct SenseJob<'a> {
     pub intrinsic: [f32; 5],
     /// Whether the controller must be evaluated this tick.
     pub due: bool,
+    /// The organism's recurrent memory going in (ignored by memoryless genomes).
+    pub memory: &'a [f32; MEMORY_WIDTH],
 }
 
 /// What a fused backend returns per organism.
@@ -1930,11 +2164,13 @@ pub struct SenseOutput {
     pub motion_drive: [f64; 2],
     /// Local level-0 energy density (uptake request input).
     pub density0: f64,
+    /// Next recurrent memory (meaningful only for a recurrent genome when the job was `due`).
+    pub memory: [f32; MEMORY_WIDTH],
 }
 
 impl Default for SenseOutput {
     fn default() -> Self {
-        SenseOutput { logits: [0.0; OUTPUT_WIDTH], motion_drive: [0.0; 2], density0: 0.0 }
+        SenseOutput { logits: [0.0; OUTPUT_WIDTH], motion_drive: [0.0; 2], density0: 0.0, memory: [0.0; MEMORY_WIDTH] }
     }
 }
 
@@ -1976,7 +2212,7 @@ impl SenseInferBackend for ReferenceSenseInfer {
                 let mut input = [0.0f32; INPUT_WIDTH];
                 input[..99].copy_from_slice(&obs.field_inputs);
                 input[99..].copy_from_slice(&j.intrinsic);
-                forward(j.genome.hidden(), &j.genome.params, &input, &mut scratch, &mut o.logits);
+                forward_state(j.genome.hidden(), &j.genome.params.to_f32(), &input, j.memory, &mut scratch, &mut o.logits, &mut o.memory);
             }
         }
         Ok(())
@@ -1992,9 +2228,12 @@ impl ControllerBackend for ReferenceBackend {
         "cpu-reference-scalar"
     }
     fn evaluate(&mut self, jobs: &[InferenceJob<'_>], out: &mut [[f32; OUTPUT_WIDTH]]) -> Result<(), String> {
+        if jobs.iter().any(|j| is_recurrent(j.genome.hidden())) {
+            return Err("this controller-only backend has no memory; recurrent networks need the CPU path or a fused GPU backend".into());
+        }
         let mut scratch = vec![0.0f32; 2 * MAX_HIDDEN];
         for (j, o) in jobs.iter().zip(out.iter_mut()) {
-            forward(j.genome.hidden(), &j.genome.params, j.input, &mut scratch, o);
+            forward(j.genome.hidden(), &j.genome.params.to_f32(), j.input, &mut scratch, o);
         }
         Ok(())
     }
@@ -2011,6 +2250,8 @@ fn sense_one<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms,
     let k = cfg.controller.evaluation_interval_ticks as u64;
     let due = !orgs.held_valid[i] || (n + 1) % k == orgs.phase[i] as u64;
     let mut out = orgs.held[i];
+    let mem_in = orgs.memory.get(i).unwrap_or(&ZERO_MEMORY);
+    let has_memory = !orgs.memory.is_empty();
     if due {
         let age = (n - orgs.birth_tick[i]) as f64 * cfg.dt();
         let intr = intrinsic(&cfg.sensors, orgs.energy[i], age, orgs.vx[i], orgs.vy[i], orgs.energy_change_rate[i]);
@@ -2021,15 +2262,16 @@ fn sense_one<const PROFILE: bool>(cfg: &Config, pyr: &Pyramid, orgs: &Organisms,
         charge::<PROFILE>(t_sense, sense_ns);
         if infer {
             let t_net = Stamp::capture::<PROFILE>();
-            forward(g.hidden(), &g.params, &input, scratch, &mut out);
+            let mut mem = *mem_in;
+            forward_state(g.hidden(), &g.params.to_f32(), &input, mem_in, scratch, &mut out, &mut mem);
             charge::<PROFILE>(t_net, net_ns);
-            return Sense { density0, out, evaluated: true, motion_drive: [dx, dy], input: None };
+            return Sense { density0, out, evaluated: true, mem: has_memory.then(|| Box::new(mem)), motion_drive: [dx, dy], input: None };
         }
-        return Sense { density0, out, evaluated: true, motion_drive: [dx, dy], input: Some(Box::new(input)) };
+        return Sense { density0, out, evaluated: true, mem: None, motion_drive: [dx, dy], input: Some(Box::new(input)) };
     }
     let (dx, dy) = motion_drive(&g.motion, &obs.grad_x, &obs.grad_y);
     charge::<PROFILE>(t_sense, sense_ns);
-    Sense { density0, out, evaluated: false, motion_drive: [dx, dy], input: None }
+    Sense { density0, out, evaluated: false, mem: None, motion_drive: [dx, dy], input: None }
 }
 
 #[inline(always)]

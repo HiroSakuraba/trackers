@@ -8,7 +8,7 @@
 //    sensitivities dotted with the physical gradients of [q, Z_0..Z_31].
 // 3. Run the organism's own MLP from workgroup memory (as mlp.wgsl).
 //
-// Outputs per job (stride 40): 36 logits, motion drive x, y, level-0 density.
+// Outputs per job (stride 56): 36 logits, motion drive x, y, level-0 density, pad, 16 memory.
 // The MLP runs for every job; logits of jobs that were not due are ignored on
 // the CPU (barriers cannot sit under data-dependent branches).
 
@@ -25,14 +25,17 @@ struct SenseDims {
 @group(0) @binding(2) var<storage, read> pyr: array<f32>;
 @group(0) @binding(3) var<storage, read> traits: array<f32>;
 @group(0) @binding(4) var<storage, read> w0: array<f32>;
+// The same binding read as packed 16-bit floats (two per word) by `main_deep_h`.
+@group(0) @binding(4) var<storage, read> w0h: array<u32>;
 @group(0) @binding(5) var<storage, read> w1: array<f32>;
 @group(0) @binding(6) var<storage, read> w2: array<f32>;
 @group(0) @binding(7) var<storage, read_write> outputs: array<f32>;
 
 const WG: u32 = 64u;
 const PL: u32 = 33u;
-const JS: u32 = 12u;   // job stride: slot bits, x, y, scale, due, 5 intrinsic, 2 pad
-const OS: u32 = 40u;   // output stride
+// Row strides come from the uniform (lu[1].w and lu[2].w): 12 and 40 without memory, 28 and 56 with it.
+// Job row: slot bits, x, y, scale, due, 5 intrinsic, 2 pad, 16 memory.
+// Output row: 36 logits, drive x/y, density, pad, 16 memory (+40).
 const TS: u32 = 36u;   // traits stride: 33 motion sensitivities + pad
 const OUT_W: u32 = 36u;
 
@@ -43,6 +46,7 @@ var<workgroup> rdx: array<f32, 33>;
 var<workgroup> rdy: array<f32, 33>;
 var<workgroup> gqx: array<f32, 33>;
 var<workgroup> gqy: array<f32, 33>;
+var<workgroup> due_wg: u32;
 
 fn wrap_index(i: i32, n: u32) -> u32 {
     let m = i32(n);
@@ -76,16 +80,9 @@ fn sample(l: u32, x: f32, y: f32, k: u32) -> vec3<f32> {
     return vec3<f32>(v, dx, dy);
 }
 
-@compute @workgroup_size(64)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-    let local = wg.y * dims.b.z + wg.x;
-    if (local >= dims.a.x) {
-        return;
-    }
-    // Row of this group's first job in the job and output buffers (0 unless
-    // several groups share one submission).
-    let job = dims.lu[0].w + local;
-    let jb = job * JS;
+// Steps 1 and 2, shared by the shallow and the recurrent kernel: sample the field, build
+// the 104 normalized inputs in `a`, and write the motion drive and density of this job.
+fn prepare(t: u32, job: u32, jb: u32) {
     let slot = bitcast<u32>(jobs[jb]);
     let x = jobs[jb + 1u];
     let y = jobs[jb + 2u];
@@ -149,10 +146,25 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             fx += m * gqx[k];
             fy += m * gqy[k];
         }
-        outputs[job * OS + 36u] = fx;
-        outputs[job * OS + 37u] = fy;
-        outputs[job * OS + 38u] = max(sample(0u, x, y, 0u).x, 0.0);
+        outputs[job * dims.lu[2].w + 36u] = fx;
+        outputs[job * dims.lu[2].w + 37u] = fy;
+        outputs[job * dims.lu[2].w + 38u] = max(sample(0u, x, y, 0u).x, 0.0);
     }
+
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let local = wg.y * dims.b.z + wg.x;
+    if (local >= dims.a.x) {
+        return;
+    }
+    // Row of this group's first job in the job and output buffers (0 unless
+    // several groups share one submission).
+    let job = dims.lu[0].w + local;
+    let jb = job * dims.lu[1].w;
+    let slot = bitcast<u32>(jobs[jb]);
+    prepare(t, job, jb);
 
     // 3. The organism's own MLP, from workgroup memory.
     {
@@ -190,7 +202,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
 
     if (last1) {
         for (var o = t; o < OUT_W; o += WG) {
-            outputs[job * OS + o] = a[o];
+            outputs[job * dims.lu[2].w + o] = a[o];
         }
         return;
     }
@@ -204,7 +216,282 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t
             for (var i = 0u; i < n_in; i++) {
                 acc += w2[base + i * n_out + o] * a[i];
             }
-            outputs[job * OS + o] = acc;
+            outputs[job * dims.lu[2].w + o] = acc;
+        }
+    }
+}
+
+// The 8-layer recurrent network. All nine affine layers of an organism sit back to back
+// in one packed buffer (w0), each transposed to [in][out] with its biases after it.
+// Inputs are the 104 sensor/intrinsic values plus 16 memory values; outputs are 36 logits
+// plus 16 raw memory values, which leave as tanh (the next memory) at output offset 40.
+const D_TOTAL: u32 = 12980u;   // floats per organism: 3872 + 7 * 1056 + 1716
+const D_L1: u32 = 3872u;       // first 32 -> 32 layer
+const D_HB: u32 = 1056u;       // one 32 -> 32 layer: 32*32 + 32
+const D_LAST: u32 = 11264u;    // output layer, 32 -> 52
+const D_H: u32 = 32u;
+const D_OUTW: u32 = 52u;
+const D_IN0: u32 = 120u;       // 104 + 16
+
+@compute @workgroup_size(64)
+fn main_deep(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let local = wg.y * dims.b.z + wg.x;
+    if (local >= dims.a.x) {
+        return;
+    }
+    let job = dims.lu[0].w + local;
+    let jb = job * dims.lu[1].w;
+    let slot = bitcast<u32>(jobs[jb]);
+    prepare(t, job, jb);
+    if (t < 16u) {
+        a[104u + t] = jobs[jb + 12u + t];
+    }
+    if (t == 0u) {
+        due_wg = select(0u, 1u, jobs[jb + 4u] > 0.5);
+    }
+    workgroupBarrier();
+    // A job that is not due keeps its sensing outputs (motion drive, density) but skips the network:
+    // the whole group agrees, so the barriers below stay uniform.
+    if (workgroupUniformLoad(&due_wg) == 0u) {
+        return;
+    }
+
+    // Each thread owns one output column and walks the layer's inputs in order (bias first, then
+    // input 0, 1, 2, ...). Eight weights are read at a time so the loads overlap instead of
+    // waiting one after another; the additions keep their order, so the answers are unchanged.
+    let base = slot * D_TOTAL;
+    if (t < D_H) {
+            var acc = w0[base + D_IN0 * D_H + t];
+            for (var i = 0u; i < 120u; i += 8u) {
+                let p0 = w0[base + (i + 0u) * D_H + t];
+                let p1 = w0[base + (i + 1u) * D_H + t];
+                let p2 = w0[base + (i + 2u) * D_H + t];
+                let p3 = w0[base + (i + 3u) * D_H + t];
+                let p4 = w0[base + (i + 4u) * D_H + t];
+                let p5 = w0[base + (i + 5u) * D_H + t];
+                let p6 = w0[base + (i + 6u) * D_H + t];
+                let p7 = w0[base + (i + 7u) * D_H + t];
+                acc += p0 * a[i + 0u];
+                acc += p1 * a[i + 1u];
+                acc += p2 * a[i + 2u];
+                acc += p3 * a[i + 3u];
+                acc += p4 * a[i + 4u];
+                acc += p5 * a[i + 5u];
+                acc += p6 * a[i + 6u];
+                acc += p7 * a[i + 7u];
+            }
+        b[t] = tanh(acc);
+    }
+    workgroupBarrier();
+    for (var l = 1u; l < 8u; l++) {
+        let bb = base + D_L1 + (l - 1u) * D_HB;
+        if (t < D_H) {
+            if ((l & 1u) == 1u) {
+            var acc = w0[bb + D_H * D_H + t];
+            for (var i = 0u; i < 32u; i += 8u) {
+                let p0 = w0[bb + (i + 0u) * D_H + t];
+                let p1 = w0[bb + (i + 1u) * D_H + t];
+                let p2 = w0[bb + (i + 2u) * D_H + t];
+                let p3 = w0[bb + (i + 3u) * D_H + t];
+                let p4 = w0[bb + (i + 4u) * D_H + t];
+                let p5 = w0[bb + (i + 5u) * D_H + t];
+                let p6 = w0[bb + (i + 6u) * D_H + t];
+                let p7 = w0[bb + (i + 7u) * D_H + t];
+                acc += p0 * b[i + 0u];
+                acc += p1 * b[i + 1u];
+                acc += p2 * b[i + 2u];
+                acc += p3 * b[i + 3u];
+                acc += p4 * b[i + 4u];
+                acc += p5 * b[i + 5u];
+                acc += p6 * b[i + 6u];
+                acc += p7 * b[i + 7u];
+            }
+                a[t] = tanh(acc);
+            } else {
+            var acc = w0[bb + D_H * D_H + t];
+            for (var i = 0u; i < 32u; i += 8u) {
+                let p0 = w0[bb + (i + 0u) * D_H + t];
+                let p1 = w0[bb + (i + 1u) * D_H + t];
+                let p2 = w0[bb + (i + 2u) * D_H + t];
+                let p3 = w0[bb + (i + 3u) * D_H + t];
+                let p4 = w0[bb + (i + 4u) * D_H + t];
+                let p5 = w0[bb + (i + 5u) * D_H + t];
+                let p6 = w0[bb + (i + 6u) * D_H + t];
+                let p7 = w0[bb + (i + 7u) * D_H + t];
+                acc += p0 * a[i + 0u];
+                acc += p1 * a[i + 1u];
+                acc += p2 * a[i + 2u];
+                acc += p3 * a[i + 3u];
+                acc += p4 * a[i + 4u];
+                acc += p5 * a[i + 5u];
+                acc += p6 * a[i + 6u];
+                acc += p7 * a[i + 7u];
+            }
+                b[t] = tanh(acc);
+            }
+        }
+        workgroupBarrier();
+    }
+    if (t < D_OUTW) {
+        let bb = base + D_LAST;
+            var acc = w0[bb + D_H * D_OUTW + t];
+            for (var i = 0u; i < 32u; i += 8u) {
+                let p0 = w0[bb + (i + 0u) * D_OUTW + t];
+                let p1 = w0[bb + (i + 1u) * D_OUTW + t];
+                let p2 = w0[bb + (i + 2u) * D_OUTW + t];
+                let p3 = w0[bb + (i + 3u) * D_OUTW + t];
+                let p4 = w0[bb + (i + 4u) * D_OUTW + t];
+                let p5 = w0[bb + (i + 5u) * D_OUTW + t];
+                let p6 = w0[bb + (i + 6u) * D_OUTW + t];
+                let p7 = w0[bb + (i + 7u) * D_OUTW + t];
+                acc += p0 * a[i + 0u];
+                acc += p1 * a[i + 1u];
+                acc += p2 * a[i + 2u];
+                acc += p3 * a[i + 3u];
+                acc += p4 * a[i + 4u];
+                acc += p5 * a[i + 5u];
+                acc += p6 * a[i + 6u];
+                acc += p7 * a[i + 7u];
+            }
+        if (t < OUT_W) {
+            outputs[job * dims.lu[2].w + t] = acc;
+        } else {
+            outputs[job * dims.lu[2].w + 40u + (t - OUT_W)] = tanh(acc);
+        }
+    }
+}
+
+// One 16-bit weight of the packed recurrent slab (element index `i`, low half first).
+fn wh(i: u32) -> f32 {
+    let p = unpack2x16float(w0h[i >> 1u]);
+    return select(p.x, p.y, (i & 1u) == 1u);
+}
+
+// `main_deep` with the weights stored as 16-bit floats: half the memory traffic, the same f32 arithmetic.
+@compute @workgroup_size(64)
+fn main_deep_h(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let local = wg.y * dims.b.z + wg.x;
+    if (local >= dims.a.x) {
+        return;
+    }
+    let job = dims.lu[0].w + local;
+    let jb = job * dims.lu[1].w;
+    let slot = bitcast<u32>(jobs[jb]);
+    prepare(t, job, jb);
+    if (t < 16u) {
+        a[104u + t] = jobs[jb + 12u + t];
+    }
+    if (t == 0u) {
+        due_wg = select(0u, 1u, jobs[jb + 4u] > 0.5);
+    }
+    workgroupBarrier();
+    // A job that is not due keeps its sensing outputs (motion drive, density) but skips the network:
+    // the whole group agrees, so the barriers below stay uniform.
+    if (workgroupUniformLoad(&due_wg) == 0u) {
+        return;
+    }
+
+    // Each thread owns one output column and walks the layer's inputs in order (bias first, then
+    // input 0, 1, 2, ...). Eight weights are read at a time so the loads overlap instead of
+    // waiting one after another; the additions keep their order, so the answers are unchanged.
+    let base = slot * D_TOTAL;
+    if (t < D_H) {
+            var acc = wh(base + D_IN0 * D_H + t);
+            for (var i = 0u; i < 120u; i += 8u) {
+                let p0 = wh(base + (i + 0u) * D_H + t);
+                let p1 = wh(base + (i + 1u) * D_H + t);
+                let p2 = wh(base + (i + 2u) * D_H + t);
+                let p3 = wh(base + (i + 3u) * D_H + t);
+                let p4 = wh(base + (i + 4u) * D_H + t);
+                let p5 = wh(base + (i + 5u) * D_H + t);
+                let p6 = wh(base + (i + 6u) * D_H + t);
+                let p7 = wh(base + (i + 7u) * D_H + t);
+                acc += p0 * a[i + 0u];
+                acc += p1 * a[i + 1u];
+                acc += p2 * a[i + 2u];
+                acc += p3 * a[i + 3u];
+                acc += p4 * a[i + 4u];
+                acc += p5 * a[i + 5u];
+                acc += p6 * a[i + 6u];
+                acc += p7 * a[i + 7u];
+            }
+        b[t] = tanh(acc);
+    }
+    workgroupBarrier();
+    for (var l = 1u; l < 8u; l++) {
+        let bb = base + D_L1 + (l - 1u) * D_HB;
+        if (t < D_H) {
+            if ((l & 1u) == 1u) {
+            var acc = wh(bb + D_H * D_H + t);
+            for (var i = 0u; i < 32u; i += 8u) {
+                let p0 = wh(bb + (i + 0u) * D_H + t);
+                let p1 = wh(bb + (i + 1u) * D_H + t);
+                let p2 = wh(bb + (i + 2u) * D_H + t);
+                let p3 = wh(bb + (i + 3u) * D_H + t);
+                let p4 = wh(bb + (i + 4u) * D_H + t);
+                let p5 = wh(bb + (i + 5u) * D_H + t);
+                let p6 = wh(bb + (i + 6u) * D_H + t);
+                let p7 = wh(bb + (i + 7u) * D_H + t);
+                acc += p0 * b[i + 0u];
+                acc += p1 * b[i + 1u];
+                acc += p2 * b[i + 2u];
+                acc += p3 * b[i + 3u];
+                acc += p4 * b[i + 4u];
+                acc += p5 * b[i + 5u];
+                acc += p6 * b[i + 6u];
+                acc += p7 * b[i + 7u];
+            }
+                a[t] = tanh(acc);
+            } else {
+            var acc = wh(bb + D_H * D_H + t);
+            for (var i = 0u; i < 32u; i += 8u) {
+                let p0 = wh(bb + (i + 0u) * D_H + t);
+                let p1 = wh(bb + (i + 1u) * D_H + t);
+                let p2 = wh(bb + (i + 2u) * D_H + t);
+                let p3 = wh(bb + (i + 3u) * D_H + t);
+                let p4 = wh(bb + (i + 4u) * D_H + t);
+                let p5 = wh(bb + (i + 5u) * D_H + t);
+                let p6 = wh(bb + (i + 6u) * D_H + t);
+                let p7 = wh(bb + (i + 7u) * D_H + t);
+                acc += p0 * a[i + 0u];
+                acc += p1 * a[i + 1u];
+                acc += p2 * a[i + 2u];
+                acc += p3 * a[i + 3u];
+                acc += p4 * a[i + 4u];
+                acc += p5 * a[i + 5u];
+                acc += p6 * a[i + 6u];
+                acc += p7 * a[i + 7u];
+            }
+                b[t] = tanh(acc);
+            }
+        }
+        workgroupBarrier();
+    }
+    if (t < D_OUTW) {
+        let bb = base + D_LAST;
+            var acc = wh(bb + D_H * D_OUTW + t);
+            for (var i = 0u; i < 32u; i += 8u) {
+                let p0 = wh(bb + (i + 0u) * D_OUTW + t);
+                let p1 = wh(bb + (i + 1u) * D_OUTW + t);
+                let p2 = wh(bb + (i + 2u) * D_OUTW + t);
+                let p3 = wh(bb + (i + 3u) * D_OUTW + t);
+                let p4 = wh(bb + (i + 4u) * D_OUTW + t);
+                let p5 = wh(bb + (i + 5u) * D_OUTW + t);
+                let p6 = wh(bb + (i + 6u) * D_OUTW + t);
+                let p7 = wh(bb + (i + 7u) * D_OUTW + t);
+                acc += p0 * a[i + 0u];
+                acc += p1 * a[i + 1u];
+                acc += p2 * a[i + 2u];
+                acc += p3 * a[i + 3u];
+                acc += p4 * a[i + 4u];
+                acc += p5 * a[i + 5u];
+                acc += p6 * a[i + 6u];
+                acc += p7 * a[i + 7u];
+            }
+        if (t < OUT_W) {
+            outputs[job * dims.lu[2].w + t] = acc;
+        } else {
+            outputs[job * dims.lu[2].w + 40u + (t - OUT_W)] = tanh(acc);
         }
     }
 }
