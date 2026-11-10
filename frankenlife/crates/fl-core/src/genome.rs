@@ -1,11 +1,13 @@
 //! Heritable genomes, random initialization and bounded strict mutation (plan §7.1–7.3, A.3).
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use serde::Serialize;
 
-use crate::config::Config;
-use crate::nn::{catalog_index, fan_in_table, map_topology, param_count, CATALOG};
+use crate::config::{Config, WeightDtype};
+use crate::half::{f16_to_f32, f32_to_f16, round_f16};
+use crate::nn::{catalog_index, fan_in_table, is_recurrent, map_topology, param_count, CATALOG};
 use crate::rng::{Lane, SemanticRng};
 use crate::sources::isotropic_unit;
 use crate::CHANNELS;
@@ -21,13 +23,66 @@ pub struct MutationRecord {
     pub rejected_candidates: u32,
 }
 
+/// Controller weights as stored in a genome: 32-bit floats, or 16-bit floats (half the memory,
+/// on the CPU, in checkpoints and in GPU slabs). Both hold plain parameter values in the
+/// `nn` layout; the network arithmetic is f32 either way.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Weights {
+    F32(Vec<f32>),
+    F16(Vec<u16>),
+}
+
+impl Weights {
+    /// Store `v` in the requested type; `F16` rounds every value to the nearest 16-bit float.
+    pub fn from_f32(dtype: WeightDtype, v: Vec<f32>) -> Weights {
+        match dtype {
+            WeightDtype::F32 => Weights::F32(v),
+            WeightDtype::F16 => Weights::F16(v.iter().map(|&x| f32_to_f16(x)).collect()),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Weights::F32(v) => v.len(),
+            Weights::F16(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn dtype(&self) -> WeightDtype {
+        match self {
+            Weights::F32(_) => WeightDtype::F32,
+            Weights::F16(_) => WeightDtype::F16,
+        }
+    }
+
+    /// The values as f32 (borrowed for `F32`, widened exactly for `F16`).
+    pub fn to_f32(&self) -> Cow<'_, [f32]> {
+        match self {
+            Weights::F32(v) => Cow::Borrowed(v),
+            Weights::F16(v) => Cow::Owned(v.iter().map(|&h| f16_to_f32(h)).collect()),
+        }
+    }
+
+    /// The raw 16-bit patterns, rounding to f16 first when the weights are stored as f32.
+    pub fn to_f16_bits(&self) -> Cow<'_, [u16]> {
+        match self {
+            Weights::F16(v) => Cow::Borrowed(v),
+            Weights::F32(v) => Cow::Owned(v.iter().map(|&x| f32_to_f16(x)).collect()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Genome {
     pub id: u64,
     pub parent: Option<u64>,
     /// Index into `nn::CATALOG`.
     pub topology: u8,
-    pub params: Vec<f32>,
+    pub params: Weights,
     /// Unit chemical affinity direction `a_i`.
     pub affinity: [f32; CHANNELS],
     /// Energy/composition gradient sensitivities, Euclidean norm within the fixed budget.
@@ -63,6 +118,7 @@ pub fn founder(cfg: &Config, rng: &SemanticRng, org_id: u64, genome_id: u64) -> 
     let n = param_count(&hidden);
     let fans = fan_in_table(&hidden);
     let mut params = vec![0.0f32; n];
+    let dtype = cfg.controller.weight_dtype();
     let mut layer = 0;
     let offsets = crate::nn::layer_offsets(&hidden);
     let dims = crate::nn::layer_dims(&hidden);
@@ -76,6 +132,7 @@ pub fn founder(cfg: &Config, rng: &SemanticRng, org_id: u64, genome_id: u64) -> 
             params[p] = uniform_symmetric(u, fans[layer].1);
         }
     }
+    let params = Weights::from_f32(dtype, params);
     let mut z = [0.0f64; CHANNELS];
     let mut attempt = 0;
     let affinity = loop {
@@ -134,6 +191,8 @@ pub fn mutate(cfg: &Config, rng: &SemanticRng, parent: &Genome, parent_org: u64,
     let mc = &cfg.mutation;
     let am = &cfg.architecture_mutation;
     let max_abs = cfg.controller.maximum_absolute_parameter;
+    let dtype = cfg.controller.weight_dtype();
+    let parent_params = parent.params.to_f32();
     let mut rejected = 0u32;
     for cand in 0..mc.maximum_candidate_proposals_per_birth as u64 {
         let key = |lane: Lane, draw: u64| rng.words(lane, parent_org, event_tick, cand, draw);
@@ -144,7 +203,7 @@ pub fn mutate(cfg: &Config, rng: &SemanticRng, parent: &Genome, parent_org: u64,
         let u_topo = crate::rng::unit_open(key(Lane::MutationTopology, 0)[0]);
         if am.enabled && u_topo < am.probability_per_birth {
             let others: Vec<u8> = (0..CATALOG.len() as u8)
-                .filter(|&t| t != parent.topology && param_count(CATALOG[t as usize]) as u64 <= am.maximum_parameters)
+                .filter(|&t| t != parent.topology && is_recurrent(CATALOG[t as usize]) == is_recurrent(parent.hidden()) && param_count(CATALOG[t as usize]) as u64 <= am.maximum_parameters)
                 .collect();
             if !others.is_empty() {
                 let pick = crate::rng::unit_half_open(key(Lane::MutationTopology, 1)[0]);
@@ -154,12 +213,12 @@ pub fn mutate(cfg: &Config, rng: &SemanticRng, parent: &Genome, parent_org: u64,
         }
         if topology_changed {
             let new_h = CATALOG[topology as usize];
-            params = map_topology(parent.hidden(), &parent.params, new_h, |_, fan_in, k| {
+            params = map_topology(parent.hidden(), &parent_params, new_h, |_, fan_in, k| {
                 let u = crate::rng::unit_half_open(key(Lane::MutationNewNeuron, k as u64)[0]);
                 uniform_symmetric(u, fan_in)
             });
         } else {
-            params = parent.params.clone();
+            params = parent_params.to_vec();
         }
         // 2. Controller parameters (replacement takes priority over perturbation).
         let fans = fan_in_table(CATALOG[topology as usize]);
@@ -186,6 +245,8 @@ pub fn mutate(cfg: &Config, rng: &SemanticRng, parent: &Genome, parent_org: u64,
             } else {
                 continue;
             };
+            // Stored weights are f16: judge validity and change on the value that will be stored.
+            let new = if dtype == WeightDtype::F16 { round_f16(new) } else { new };
             if !new.is_finite() || (new as f64).abs() > max_abs {
                 valid = false;
                 break;
@@ -244,7 +305,7 @@ pub fn mutate(cfg: &Config, rng: &SemanticRng, parent: &Genome, parent_org: u64,
             id: child_genome_id,
             parent: Some(parent.id),
             topology,
-            params,
+            params: Weights::from_f32(dtype, params),
             affinity,
             motion,
             log_scale,
@@ -271,8 +332,9 @@ mod tests {
         let g = founder(&cfg, &rng, 3, 3);
         assert_eq!(g.params.len(), 9_988);
         let a = (3.0f64 / 104.0).sqrt() as f32;
-        assert!(g.params[..104 * 64].iter().all(|v| v.abs() <= a));
-        assert!(g.params[104 * 64..104 * 64 + 64].iter().all(|&v| v == 0.0));
+        let p = g.params.to_f32();
+        assert!(p[..104 * 64].iter().all(|v| v.abs() <= a));
+        assert!(p[104 * 64..104 * 64 + 64].iter().all(|&v| v == 0.0));
         let n: f64 = g.affinity.iter().map(|&v| v as f64 * v as f64).sum::<f64>().sqrt();
         assert!((n - 1.0).abs() < 1e-5);
         let nm: f64 = g.motion.iter().map(|&v| v as f64 * v as f64).sum::<f64>().sqrt();
@@ -294,6 +356,31 @@ mod tests {
         assert_ne!(c1.affinity, g.affinity);
         assert!(c1.scale() >= cfg.sensors.minimum_scale_world_units - 1e-6);
         assert!(c1.scale() <= cfg.sensors.maximum_scale_world_units + 1e-6);
+    }
+
+    #[test]
+    fn f16_genomes_hold_rounded_weights_and_inherit_exactly() {
+        let mut cfg = Config::reference();
+        cfg.controller.canonical_weight_dtype = "f16".into();
+        let rng = SemanticRng::new(cfg.seed);
+        let wide = founder(&Config::reference(), &rng, 3, 3);
+        let g = founder(&cfg, &rng, 3, 3);
+        let Weights::F16(bits) = &g.params else { panic!("f16 genome expected") };
+        assert_eq!(bits.len(), 9_988);
+        // The 16-bit founder is the 32-bit founder rounded, weight by weight.
+        let w = wide.params.to_f32();
+        for (h, x) in bits.iter().zip(w.iter()) {
+            assert_eq!(*h, f32_to_f16(*x));
+        }
+        // Children are f16 again, deterministic, and differ from the parent only in stored values.
+        let c1 = mutate(&cfg, &rng, &g, 3, 700, 9).unwrap();
+        let c2 = mutate(&cfg, &rng, &g, 3, 700, 9).unwrap();
+        assert_eq!(c1, c2);
+        assert!(matches!(c1.params, Weights::F16(_)));
+        assert_ne!(c1.params, g.params);
+        // Widening and re-narrowing changes nothing: everything stored is already representable.
+        let wide_again = c1.params.to_f32().into_owned();
+        assert_eq!(Weights::from_f32(WeightDtype::F16, wide_again), c1.params);
     }
 
     #[test]

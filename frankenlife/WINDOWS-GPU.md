@@ -288,3 +288,19 @@ Compare with `--backend cpu`.
   80,000-organism target needs about 3 GB of F32 weights at 9,988 parameters
   each, which fits the 1080's 8 GB; roughly 150,000 such organisms is the ceiling.
 - If anything fails, send the full `gpu-check` output.
+
+## Recurrent (memory) network
+
+`presets\lively-recurrent-field-ecology.toml` is the lively evolving preset with every
+organism running an 8-layer, 32-wide recurrent network (12,980 weights). Each
+evaluation reads 16 memory values from the last one and writes 16 new ones.
+Memory starts empty at birth, is not inherited, and is saved in checkpoints.
+
+```powershell
+cargo run --release -- view --config presets\lively-recurrent-field-ecology.toml --backend gpu-realtime --seconds 0 --out runs\rec-live
+```
+
+Weights and memory for this network live in the same resident slabs as the others
+(about 52 KB per organism). `--backend gpu` (the controller-only kernel) refuses recurrent
+networks; the fused backends (`gpu-fused` and later) run them.
+

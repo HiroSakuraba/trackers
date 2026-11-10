@@ -24,8 +24,9 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::field::Field;
-use crate::genome::{Genome, MutationRecord, MOTION_WIDTH};
-use crate::nn::{param_count, CATALOG, OUTPUT_WIDTH};
+use crate::config::WeightDtype;
+use crate::genome::{Genome, MutationRecord, Weights, MOTION_WIDTH};
+use crate::nn::{is_recurrent, param_count, CATALOG, MEMORY_WIDTH, OUTPUT_WIDTH};
 use crate::rng::SemanticRng;
 use crate::sources::Source;
 use crate::world::{Command, CumulativeLedger, Disposal, Dissipation, Organisms, ScheduledCommand, TickCounts, World};
@@ -63,6 +64,12 @@ impl W {
         self.u64(v.len() as u64);
         for x in v {
             self.0.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+    }
+    fn f16s(&mut self, v: &[u16]) {
+        self.u64(v.len() as u64);
+        for h in v {
+            self.0.extend_from_slice(&h.to_le_bytes());
         }
     }
     fn str(&mut self, s: &str) {
@@ -120,6 +127,11 @@ impl<'a> R<'a> {
         let n = self.len(max)?;
         let raw = self.take(n * 4)?;
         Ok(raw.chunks_exact(4).map(|c| f32::from_bits(u32::from_le_bytes(c.try_into().unwrap()))).collect())
+    }
+    fn f16s(&mut self, max: usize) -> Res<Vec<u16>> {
+        let n = self.len(max)?;
+        let raw = self.take(n * 2)?;
+        Ok(raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
     }
     fn f32_array<const N: usize>(&mut self) -> Res<[f32; N]> {
         let v = self.f32s(N)?;
@@ -290,7 +302,11 @@ fn put_genome(w: &mut W, g: &Genome) {
     w.u64(g.id);
     w.opt_u64(g.parent);
     w.u8(g.topology);
-    w.f32s(&g.params);
+    // The weight type comes from the configuration stored in the checkpoint, so no tag is written.
+    match &g.params {
+        Weights::F32(v) => w.f32s(v),
+        Weights::F16(v) => w.f16s(v),
+    }
     w.f32s(&g.affinity);
     w.f32s(&g.motion);
     w.u32(g.log_scale.to_bits());
@@ -307,12 +323,15 @@ fn put_genome(w: &mut W, g: &Genome) {
     }
 }
 
-fn get_genome(r: &mut R) -> Res<Genome> {
+fn get_genome(r: &mut R, dtype: WeightDtype) -> Res<Genome> {
     let id = r.u64()?;
     let parent = r.opt_u64()?;
     let topology = r.u8()?;
     let hidden = CATALOG.get(topology as usize).ok_or(format!("unknown topology {topology}"))?;
-    let params = r.f32s(param_count(hidden))?;
+    let params = match dtype {
+        WeightDtype::F32 => Weights::F32(r.f32s(param_count(hidden))?),
+        WeightDtype::F16 => Weights::F16(r.f16s(param_count(hidden))?),
+    };
     if params.len() != param_count(hidden) {
         return Err(format!("genome {id}: {} params for topology {hidden:?}", params.len()));
     }
@@ -391,6 +410,9 @@ pub fn save(world: &World) -> Vec<u8> {
         w.u64(o.held_tick[i]);
         w.u8(o.held_valid[i] as u8);
         w.u64(index[&o.genome[i].id]);
+        if let Some(m) = o.memory.get(i) {
+            w.f32s(m);
+        }
     }
 
     w.u64(world.pending.len() as u64);
@@ -481,7 +503,7 @@ pub fn load(bytes: &[u8]) -> Result<World, String> {
     let nb = r.len(max_orgs)?;
     let mut bank: Vec<Arc<Genome>> = Vec::with_capacity(nb);
     for _ in 0..nb {
-        bank.push(Arc::new(get_genome(&mut r)?));
+        bank.push(Arc::new(get_genome(&mut r, cfg.controller.weight_dtype())?));
     }
     let no = r.len(max_orgs)?;
     let mut o = Organisms::default();
@@ -502,7 +524,11 @@ pub fn load(bytes: &[u8]) -> Result<World, String> {
         o.held_tick.push(r.u64()?);
         o.held_valid.push(r.u8()? != 0);
         let gi = r.u64()? as usize;
-        o.genome.push(bank.get(gi).ok_or(format!("genome index {gi} out of range"))?.clone());
+        let genome = bank.get(gi).ok_or(format!("genome index {gi} out of range"))?.clone();
+        if is_recurrent(genome.hidden()) {
+            o.memory.push(r.f32_array::<MEMORY_WIDTH>()?);
+        }
+        o.genome.push(genome);
     }
     if o.id.windows(2).any(|p| p[0] >= p[1]) {
         return Err("organisms are not in strictly increasing stable-ID order".into());

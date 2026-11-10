@@ -256,6 +256,9 @@ impl GpuBackend {
         }
         // lu[0].w: first row of this group in the shared job and output buffers.
         w[15] = base as u32;
+        let st = self.strides();
+        w[19] = st.job as u32;
+        w[23] = st.out as u32;
         let g = self.front.groups.get_mut(&(t, page)).expect("group");
         if g.words != Some(w) {
             self.queue.write_buffer(&g.uniform, 0, bytemuck::cast_slice(&w));
@@ -276,8 +279,10 @@ impl GpuBackend {
         self.call += 1;
         self.stats.calls += 1;
         self.stats.evaluations += jobs.iter().filter(|j| j.due).count() as u64;
+        self.mem_mode = jobs.first().is_some_and(|j| is_recurrent(j.genome.hidden()));
         let sensors = &cfg.sensors;
         let ch = &cfg.chemistry;
+        let workers = cfg.execution.cpu_workers as usize;
 
         // ---- pyramid of the observation field the queued field step leaves on the device ----
         // Queued first: it needs nothing from the jobs, so the GPU works through
@@ -328,22 +333,27 @@ impl GpuBackend {
         let mut hdr = std::mem::take(&mut self.front.hdr);
         let mut dynamic = std::mem::take(&mut self.front.dynamic);
         let mut statics = std::mem::take(&mut self.front.statics);
+        let (dyn_stride, mem_mode) = (self.strides().dynamic, self.mem_mode);
         hdr.clear();
+        hdr.resize(n * HDR_IN_STRIDE, 0.0);
         dynamic.clear();
+        dynamic.resize(n * dyn_stride, 0.0);
         statics.clear();
-        hdr.reserve(n * HDR_IN_STRIDE);
-        dynamic.reserve(n * DYN_STRIDE);
-        statics.reserve(n * STATIC_STRIDE);
-        for &k in &order {
-            let j = &jobs[k as usize];
-            let e = &placed[k as usize];
+        statics.resize(n * STATIC_STRIDE, 0.0);
+        let page_slots: Vec<usize> = self.slabs.iter().map(|s| s.page_slots).collect();
+        fl_core::par::for_each_rows3(cfg.execution.cpu_workers as usize, n, &mut hdr, HDR_IN_STRIDE, &mut dynamic, dyn_stride, &mut statics, STATIC_STRIDE, |row, h, d, st| {
+            let k = order[row] as usize;
+            let j = &jobs[k];
+            let e = &placed[k];
             let (cell, tx, ty) = stencil_base(gx, gy, hx, hy, j.x, j.y);
-            hdr.extend_from_slice(&[f32::from_bits(cell), tx, ty, f32::from_bits(e.affinity)]);
-            dynamic.extend_from_slice(&[j.x as f32, j.y as f32, if j.due { 1.0 } else { 0.0 }]);
-            dynamic.extend_from_slice(&j.intrinsic);
-            let ps = self.slabs[e.topology as usize].page_slots;
-            statics.extend_from_slice(&[f32::from_bits((e.slot as usize % ps) as u32), e.scale]);
-        }
+            h.copy_from_slice(&[f32::from_bits(cell), tx, ty, f32::from_bits(e.affinity)]);
+            d[..3].copy_from_slice(&[j.x as f32, j.y as f32, if j.due { 1.0 } else { 0.0 }]);
+            d[3..8].copy_from_slice(&j.intrinsic);
+            if mem_mode {
+                d[8..8 + MEMORY_WIDTH].copy_from_slice(j.memory);
+            }
+            st.copy_from_slice(&[f32::from_bits((e.slot as usize % page_slots[e.topology as usize]) as u32), e.scale]);
+        });
         self.queue.write_buffer(self.front.hdr_in.as_ref().expect("hdr in"), 0, f32_bytes(&hdr));
         self.queue.write_buffer(self.job_dyn.as_ref().expect("dynamic jobs"), 0, f32_bytes(&dynamic));
         let trust = self.call == self.front.prev_call + 1 && self.front.statics_cap == self.job_cap;
@@ -373,18 +383,26 @@ impl GpuBackend {
         }
         let items_grid = grid_for((n as u32).div_ceil(64));
         {
-            let dims = [n as u32, items_grid.0, 0, 0];
+            let st = self.strides();
+            let dims = [n as u32, items_grid.0, st.dynamic as u32, st.job as u32];
             self.queue.write_buffer(self.job_expand_uniform.as_ref().expect("job expand uniform"), 0, bytemuck::cast_slice(&dims));
             let (_, _, uniform) = self.front.pipe.as_ref().expect("demand pipeline");
             let dt_umax = (cfg.dt() * ch.uptake_capacity_per_second) as f32;
             let half = ch.uptake_half_saturation_density as f32;
-            let w: [u32; 8] = [n as u32, items_grid.0, 0, 0, dt_umax.to_bits(), half.to_bits(), 0, 0];
+            let w: [u32; 8] = [n as u32, items_grid.0, 0, st.out as u32, dt_umax.to_bits(), half.to_bits(), 0, 0];
             self.queue.write_buffer(uniform, 0, bytemuck::cast_slice(&w));
         }
         let sense_ts = self.timestamps.as_ref().filter(|_| stamp);
+        if stamp && self.pass_timer.is_none() && self.timestamps.is_some() {
+            self.pass_timer = Some(PassTimer::new(&self.device, &self.queue));
+        }
+        if let Some(pt) = &self.pass_timer {
+            pt.begin(stamp);
+        }
+        let pt = |name| self.pass_timer.as_ref().and_then(|t| t.tw(name));
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("front-sense") });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expand-jobs"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expand-jobs"), timestamp_writes: pt("expand_jobs") });
             pass.set_pipeline(self.job_expand_pipe.as_ref().expect("job expand"));
             pass.set_bind_group(0, self.job_expand_bind.as_ref().expect("job expand bind"), &[]);
             pass.dispatch_workgroups(items_grid.0, items_grid.1, 1);
@@ -397,19 +415,19 @@ impl GpuBackend {
             });
             let (grid_x, grid_y) = grid_for(ng as u32);
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("sense"), timestamp_writes: tw });
-            pass.set_pipeline(&self.sense.pipeline);
+            pass.set_pipeline(if self.slabs[t].half { &self.sense.deep_half } else if self.slabs[t].packed { &self.sense.deep } else { &self.sense.pipeline });
             pass.set_bind_group(0, &self.front.groups[&(t, page)].bind, &[]);
             pass.dispatch_workgroups(grid_x, grid_y, 1);
         }
         {
             let io = self.sense_io.as_ref().expect("sense io");
-            enc.copy_buffer_to_buffer(&io.outputs, 0, &io.staging, 0, (n * SENSE_OUT_STRIDE * 4) as u64);
+            enc.copy_buffer_to_buffer(&io.outputs, 0, &io.staging, 0, (n * self.strides().out * 4) as u64);
             if let Some(ts) = sense_ts {
                 enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
                 enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
             }
             let (pipe, _, _) = self.front.pipe.as_ref().expect("demand pipeline");
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("make-headers"), timestamp_writes: None });
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("make-headers"), timestamp_writes: pt("make_headers") });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &self.front.bind.as_ref().expect("demand bind").1, &[]);
             pass.dispatch_workgroups(items_grid.0, items_grid.1, 1);
@@ -424,7 +442,7 @@ impl GpuBackend {
             self.queue.write_buffer(&self.res_pipes.expand_uniform, 0, bytemuck::cast_slice(&dims));
             {
                 let st = self.resident.as_ref().expect("resident");
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expand-items"), timestamp_writes: None });
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expand-items"), timestamp_writes: pt("expand_items") });
                 pass.set_pipeline(&self.res_pipes.expand);
                 pass.set_bind_group(0, st.expand_bind.as_ref().expect("expand bind"), &[]);
                 pass.dispatch_workgroups(items_grid.0, items_grid.1, 1);
@@ -433,10 +451,13 @@ impl GpuBackend {
             let st = self.resident.as_ref().expect("resident");
             let p = &self.res_pipes;
             let cells_grid = grid_for((st.cells as u32).div_ceil(64));
-            dispatch_resident(st, &mut enc, &p.uptake_demand, cells_grid, None);
-            dispatch_resident(st, &mut enc, &p.uptake_org, items_grid, None);
-            dispatch_resident(st, &mut enc, &p.uptake_debit, cells_grid, None);
+            dispatch_resident(st, &mut enc, &p.uptake_demand, cells_grid, pt("uptake_demand"));
+            dispatch_resident(st, &mut enc, &p.uptake_org, items_grid, pt("uptake_org"));
+            dispatch_resident(st, &mut enc, &p.uptake_debit, cells_grid, pt("uptake_debit"));
             enc.copy_buffer_to_buffer(&st.outv, 0, &st.staging, 0, (n * 16) as u64);
+            if let Some(t) = &self.pass_timer {
+                t.resolve(&mut enc);
+            }
             self.queue.submit([enc.finish()]);
             sense_ts.map(|ts| {
                 let (ttx, trx) = mpsc::channel();
@@ -449,10 +470,11 @@ impl GpuBackend {
         self.stats.last.host_prep_ms = total.elapsed().as_secs_f64() * 1e3;
 
         // ---- the one wait ----
+        let out_stride = self.strides().out;
         let round = std::time::Instant::now();
         let io = self.sense_io.as_ref().expect("sense io");
         let st = self.resident.as_ref().expect("resident");
-        let sense_slice = io.staging.slice(0..(n * SENSE_OUT_STRIDE * 4) as u64);
+        let sense_slice = io.staging.slice(0..(n * out_stride * 4) as u64);
         let up_slice = st.staging.slice(0..(n * 16) as u64);
         let (stx, srx) = mpsc::channel();
         sense_slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -466,7 +488,7 @@ impl GpuBackend {
         self.field_resident = false;
         let io = self.sense_io.as_ref().expect("sense io");
         let st = self.resident.as_ref().expect("resident");
-        let sense_slice = io.staging.slice(0..(n * SENSE_OUT_STRIDE * 4) as u64);
+        let sense_slice = io.staging.slice(0..(n * out_stride * 4) as u64);
         let up_slice = st.staging.slice(0..(n * 16) as u64);
         srx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU sense readback: {e}"))?;
         urx.recv().map_err(|e| format!("GPU map callback: {e}"))?.map_err(|e| format!("GPU uptake readback: {e}"))?;
@@ -476,25 +498,46 @@ impl GpuBackend {
         if let (Some(ts), Some(rx)) = (&self.pyramid_timestamps, pyr_rx) {
             self.stats.last.pyramid_ms = read_timestamps(&self.device, ts, rx);
         }
+        if let Some(t) = &self.pass_timer {
+            t.add("sense", self.stats.last.kernel_ms.unwrap_or(0.0));
+            t.add("pyramid", self.stats.last.pyramid_ms.unwrap_or(0.0));
+            t.collect(&self.device);
+        }
         self.stats.last.gpu_roundtrip_ms = round.elapsed().as_secs_f64() * 1e3;
         let bk = std::time::Instant::now();
         {
             let view = sense_slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             let rows: &[f32] = bytemuck::try_cast_slice(&view).map_err(|e| format!("sense readback alignment: {e:?}"))?;
-            for (g, &k) in order.iter().enumerate() {
-                let row = &rows[g * SENSE_OUT_STRIDE..(g + 1) * SENSE_OUT_STRIDE];
-                let o = &mut sense_out[k as usize];
+            let mem_mode = self.mem_mode;
+            let copy_row = |g: usize, o: &mut SenseOutput| {
+                let row = &rows[g * out_stride..(g + 1) * out_stride];
                 o.logits.copy_from_slice(&row[..OUTPUT_WIDTH]);
                 o.motion_drive = [row[36] as f64, row[37] as f64];
                 o.density0 = row[38] as f64;
+                if mem_mode {
+                    o.memory.copy_from_slice(&row[40..40 + MEMORY_WIDTH]);
+                }
+            };
+            if single {
+                // One weight group: item order is job order, so the rows can be copied on several threads.
+                fl_core::par::for_each_mut(workers, sense_out, |g, o| copy_row(g, o));
+            } else {
+                for (g, &k) in order.iter().enumerate() {
+                    copy_row(g, &mut sense_out[k as usize]);
+                }
             }
         }
         io.staging.unmap();
         {
             let view = up_slice.get_mapped_range().map_err(|e| format!("GPU map range: {e:?}"))?;
             let rows: &[f32] = bytemuck::try_cast_slice(&view).map_err(|e| format!("uptake readback alignment: {e:?}"))?;
-            for (g, &k) in order.iter().enumerate() {
-                uptake_out[k as usize] = UptakeOut { absorbed: rows[g * 4] as f64, useful_gain: rows[g * 4 + 1] as f64, toxicity_requested: rows[g * 4 + 2] as f64 };
+            let to_out = |g: usize| UptakeOut { absorbed: rows[g * 4] as f64, useful_gain: rows[g * 4 + 1] as f64, toxicity_requested: rows[g * 4 + 2] as f64 };
+            if single {
+                fl_core::par::for_each_mut(workers, uptake_out, |g, u| *u = to_out(g));
+            } else {
+                for (g, &k) in order.iter().enumerate() {
+                    uptake_out[k as usize] = to_out(g);
+                }
             }
         }
         st.staging.unmap();

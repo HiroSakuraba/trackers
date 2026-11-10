@@ -5,14 +5,14 @@
 // uptake exchange follow sensing in the same queue, with no readback between.
 //
 // hdr_in stride 4 (global item order): [base cell bits, tx, ty, affinity slot bits].
-// sense_out stride 40 (rows of the current sense group): density at +38.
+// sense_out stride 40, or 56 with memory (rows of the current sense group): density at +38.
 // headers stride 5 (global item order): [base cell bits, tx, ty, demand, affinity slot bits].
 
 struct D {
     n: u32,      // rows in this group
     grid_x: u32,
     base: u32,   // global item index of this group's first row
-    _p: u32,
+    out_stride: u32,   // sense output row: 40, or 56 with memory
     coef: f32,   // dt * umax
     half: f32,   // uptake half-saturation density K
     _a: f32,
@@ -31,7 +31,7 @@ fn make_headers(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let g = d.base + i;
-    let r = max(sense_out[i * 40u + 38u], 0.0);
+    let r = max(sense_out[i * d.out_stride + 38u], 0.0);
     let h = g * 5u;
     let s = g * 4u;
     headers[h] = hdr_in[s];

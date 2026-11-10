@@ -11,6 +11,24 @@ use serde::{Deserialize, Serialize};
 use crate::nn::{catalog_index, param_count, CATALOG, INPUT_WIDTH, OUTPUT_WIDTH};
 use crate::CHANNELS;
 
+/// How controller weights are stored (`controller.canonical_weight_dtype`). Arithmetic is always f32;
+/// with `F16` every weight is rounded to the nearest 16-bit float whenever a genome is created or
+/// mutated, so the stored genome, the checkpoint and the GPU copy all hold the same values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightDtype {
+    F32,
+    F16,
+}
+
+impl WeightDtype {
+    pub fn bytes(self) -> u64 {
+        match self {
+            WeightDtype::F32 => 4,
+            WeightDtype::F16 => 2,
+        }
+    }
+}
+
 pub const REFERENCE_PRESET: &str = include_str!("../../../presets/reference-field-ecology.toml");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -149,6 +167,17 @@ pub struct ControllerCfg {
     pub autograd: bool,
     pub initializer: String,
     pub maximum_absolute_parameter: f64,
+}
+
+impl ControllerCfg {
+    /// Storage type of the weights (validated to be `f32` or `f16`).
+    pub fn weight_dtype(&self) -> WeightDtype {
+        if self.canonical_weight_dtype == "f16" {
+            WeightDtype::F16
+        } else {
+            WeightDtype::F32
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -388,7 +417,7 @@ impl Config {
             id("controller.family", &self.controller.family, &["independent-dense-mlp-v1"]),
             id("controller.hidden_activation", &self.controller.hidden_activation, &["tanh"]),
             id("controller.output_activation", &self.controller.output_activation, &["linear"]),
-            id("controller.canonical_weight_dtype", &self.controller.canonical_weight_dtype, &["f32"]),
+            id("controller.canonical_weight_dtype", &self.controller.canonical_weight_dtype, &["f32", "f16"]),
             id("controller.accumulation_dtype", &self.controller.accumulation_dtype, &["f32"]),
             id("controller.phase_policy", &self.controller.phase_policy, &["stable-identity"]),
             id("controller.initializer", &self.controller.initializer, &["fan-in-scaled-symmetric-v1"]),
@@ -626,7 +655,7 @@ impl Config {
             dt_seconds: dt,
             default_parameter_count: default_p,
             largest_catalog_parameter_count: largest,
-            worst_case_live_genome_bytes: p.maximum_count as u64 * largest as u64 * 4,
+            worst_case_live_genome_bytes: p.maximum_count as u64 * largest as u64 * self.controller.weight_dtype().bytes(),
             logical_genome_quota_bytes: self.execution.maximum_logical_genome_bytes,
             transport_subcycles: subcycles,
             sensor_pyramid_levels: levels + 1,
@@ -649,7 +678,7 @@ impl Config {
         if catalog_index(&hidden).is_none() {
             return 0;
         }
-        self.population.initial_count as u64 * param_count(&hidden) as u64 * 4
+        self.population.initial_count as u64 * param_count(&hidden) as u64 * self.controller.weight_dtype().bytes()
     }
 
     fn all_floats(&self) -> Vec<(String, f64)> {

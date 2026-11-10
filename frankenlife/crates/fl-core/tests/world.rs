@@ -339,7 +339,7 @@ fn c15_integer_ticks_keep_aging_past_f32_horizon() {
 
 #[test]
 fn shipped_presets_validate() {
-    for p in ["reference-field-ecology.toml", "vivid-field-ecology.toml", "target-10k-field-ecology.toml", "target-20k-field-ecology.toml", "target-80k-field-ecology.toml"] {
+    for p in ["reference-field-ecology.toml", "vivid-field-ecology.toml", "target-10k-field-ecology.toml", "target-20k-field-ecology.toml", "target-80k-field-ecology.toml", "lively-field-ecology.toml", "lively-evolving-field-ecology.toml", "lively-recurrent-field-ecology.toml"] {
         let path = format!("{}/../../presets/{p}", env!("CARGO_MANIFEST_DIR"));
         let c = Config::from_toml(&std::fs::read_to_string(&path).unwrap()).unwrap();
         c.validate().unwrap_or_else(|e| panic!("{p}: {e:?}"));
@@ -549,4 +549,160 @@ fn live_tuning_rejects_values_the_configuration_would_reject() {
     assert!(w.schedule(0, Command::DriftChemistry { source: None, degrees: 400.0 }).is_err());
     assert!(w.pending.is_empty(), "nothing rejected is kept");
     assert!(w.schedule(0, Command::SetParam { param: Param::Diffusion, value: 0.3 }).is_ok());
+}
+
+fn recurrent() -> Config {
+    let mut c = small();
+    c.controller.hidden_widths = vec![32; 8];
+    c.population.initial_count = 128;
+    c.architecture_mutation.maximum_parameters = 40_000;
+    c
+}
+
+#[test]
+fn recurrent_world_keeps_memory_and_stays_deterministic() {
+    let a = run(recurrent(), 80, 1);
+    let b = run(recurrent(), 80, 1);
+    let c = run(recurrent(), 80, 4);
+    assert_eq!(a.state_hash(), b.state_hash());
+    assert_eq!(a.state_hash(), c.state_hash(), "worker split must not change recurrent science");
+    assert_eq!(a.orgs, c.orgs);
+    let o = &a.orgs;
+    assert!(o.len() > 0);
+    assert!(o.memory.iter().any(|m| m.iter().any(|&v| v != 0.0)), "evaluated organisms carry memory");
+    assert!(o.memory.iter().all(|m| m.iter().all(|v| v.abs() < 1.0)), "memory is squashed by tanh");
+    let l = &a.ledger;
+    let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+    assert!((a.total_energy() - expected).abs() / l.transferred.max(1.0) < 1e-5, "ledger closes with memory networks");
+}
+
+#[test]
+fn recurrent_memory_changes_what_the_network_decides() {
+    let mut a = run(recurrent(), 20, 1);
+    let mut b = a.clone();
+    for m in b.orgs.memory.iter_mut() {
+        *m = [0.0; 16];
+    }
+    assert!(a.orgs.memory.iter().any(|m| m.iter().any(|&v| v != 0.0)));
+    for _ in 0..4 {
+        a.step().unwrap();
+        b.step().unwrap();
+    }
+    assert_ne!(a.orgs.held, b.orgs.held, "memory feeds back into the logits");
+}
+
+#[test]
+fn newborns_start_with_empty_memory() {
+    let mut w = World::new(recurrent()).unwrap();
+    let mut seen = 0;
+    for _ in 0..200 {
+        w.step().unwrap();
+        for i in 0..w.orgs.len() {
+            if w.orgs.birth_tick[i] == w.tick && w.orgs.generation[i] > 0 {
+                seen += 1;
+                assert_eq!(w.orgs.memory[i], [0.0; 16]);
+            }
+        }
+    }
+    assert!(seen > 0, "some births happened");
+}
+
+#[test]
+fn recurrent_world_survives_a_checkpoint() {
+    let mut a = run(recurrent(), 30, 1);
+    let bytes = fl_core::checkpoint::save(&a);
+    let mut b = fl_core::checkpoint::load(&bytes).unwrap();
+    assert_eq!(a.state_hash(), b.state_hash());
+    assert_eq!(a.orgs.memory, b.orgs.memory);
+    for _ in 0..20 {
+        a.step().unwrap();
+        b.step().unwrap();
+    }
+    assert_eq!(a.state_hash(), b.state_hash());
+}
+
+#[test]
+fn controller_only_backends_refuse_recurrent_networks() {
+    let mut w = World::new(recurrent()).unwrap();
+    let mut be = fl_core::ReferenceBackend;
+    match w.step_with(Some(&mut be)) {
+        Err(TickError::NumericalFault { detail, .. }) => assert!(detail.contains("memory"), "{detail}"),
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    }
+}
+
+fn recurrent_f16() -> Config {
+    let mut c = recurrent();
+    c.controller.canonical_weight_dtype = "f16".into();
+    c
+}
+
+#[test]
+fn half_precision_world_is_deterministic_and_stores_sixteen_bit_weights() {
+    use fl_core::genome::Weights;
+    let a = run(recurrent_f16(), 80, 1);
+    let b = run(recurrent_f16(), 80, 4);
+    assert_eq!(a.state_hash(), b.state_hash(), "worker split must not change f16 science");
+    assert!(a.orgs.len() > 0);
+    assert!(a.orgs.genome.iter().all(|g| matches!(g.params, Weights::F16(_))));
+    // It really is a different run from the 32-bit one (rounded founders), and it still balances its books.
+    assert_ne!(a.state_hash(), run(recurrent(), 80, 1).state_hash());
+    let l = &a.ledger;
+    let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+    assert!((a.total_energy() - expected).abs() / l.transferred.max(1.0) < 1e-5);
+}
+
+#[test]
+fn half_precision_world_survives_a_checkpoint() {
+    let mut a = run(recurrent_f16(), 30, 1);
+    let bytes = fl_core::checkpoint::save(&a);
+    let wide = fl_core::checkpoint::save(&run(recurrent(), 30, 1));
+    assert!(bytes.len() < wide.len(), "16-bit genomes make a smaller checkpoint ({} vs {})", bytes.len(), wide.len());
+    let mut b = fl_core::checkpoint::load(&bytes).unwrap();
+    assert_eq!(a.state_hash(), b.state_hash());
+    for _ in 0..20 {
+        a.step().unwrap();
+        b.step().unwrap();
+    }
+    assert_eq!(a.state_hash(), b.state_hash());
+}
+
+#[test]
+fn half_precision_is_accepted_for_the_memoryless_networks_too() {
+    let mut c = small();
+    c.controller.canonical_weight_dtype = "f16".into();
+    let a = run(c.clone(), 40, 1);
+    assert_eq!(a.state_hash(), run(c, 40, 2).state_hash());
+}
+
+/// Big enough (more than the parallel loops' minimum chunk) to take the threaded paths.
+fn crowd() -> Config {
+    let mut c = small();
+    c.controller.hidden_widths = vec![8];
+    c.population.initial_count = 3000;
+    c.population.maximum_count = 12_000;
+    c.architecture_mutation.enabled = false;
+    c.population.initial_energy = 6.0;
+    c
+}
+
+fn crowd_recurrent() -> Config {
+    let mut c = recurrent();
+    c.population.initial_count = 2200;
+    c.population.maximum_count = 12_000;
+    c.population.initial_energy = 6.0;
+    c
+}
+
+/// The threaded per-organism loops give bit-identical worlds to the serial ones.
+#[test]
+fn threaded_loops_match_serial_loops() {
+    for (name, cfg, ticks) in [("crowd", crowd(), 60u64), ("crowd-recurrent", crowd_recurrent(), 25)] {
+        let serial = run(cfg.clone(), ticks, 1);
+        let threaded = run(cfg, ticks, 4);
+        println!("hash {name} {:016x} pop {} births {}", serial.state_hash(), serial.orgs.len(), serial.totals.births);
+        assert_eq!(serial.state_hash(), threaded.state_hash(), "{name}: threads changed the science");
+        assert_eq!(serial.ledger.dissipated.total().to_bits(), threaded.ledger.dissipated.total().to_bits(), "{name}: ledger sums are order-exact");
+        assert_eq!(serial.ledger.transferred.to_bits(), threaded.ledger.transferred.to_bits());
+    }
 }

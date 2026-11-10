@@ -9,9 +9,27 @@
 pub const INPUT_WIDTH: usize = 104;
 pub const OUTPUT_WIDTH: usize = 36;
 pub const MAX_HIDDEN: usize = 128;
+/// Units of recurrent memory: extra inputs (last tick's memory) and extra outputs (next memory).
+pub const MEMORY_WIDTH: usize = 16;
+/// Hidden layers of the recurrent topology.
+pub const RECURRENT_DEPTH: usize = 8;
 
-/// `dense-104-36-catalog-v1`.
-pub const CATALOG: [&[usize]; 5] = [&[8], &[32], &[64, 32], &[96, 64], &[128, 96]];
+/// `dense-104-36-catalog-v1` plus the recurrent `8 x 32` network (last entry).
+///
+/// The recurrent network reads the 104 sensor/intrinsic inputs plus [`MEMORY_WIDTH`] memory
+/// values and writes the 36 logits plus [`MEMORY_WIDTH`] new memory values (squashed by
+/// `tanh` and kept per organism until its next evaluation).
+pub const CATALOG: [&[usize]; 6] = [&[8], &[32], &[64, 32], &[96, 64], &[128, 96], &[32; RECURRENT_DEPTH]];
+
+/// Whether `hidden` is the recurrent topology (it carries memory).
+pub fn is_recurrent(hidden: &[usize]) -> bool {
+    hidden.len() == RECURRENT_DEPTH
+}
+
+/// Memory units a topology carries between evaluations.
+pub fn memory_width(hidden: &[usize]) -> usize {
+    if is_recurrent(hidden) { MEMORY_WIDTH } else { 0 }
+}
 
 pub fn catalog_index(hidden: &[usize]) -> Option<u8> {
     CATALOG.iter().position(|h| *h == hidden).map(|i| i as u8)
@@ -19,13 +37,14 @@ pub fn catalog_index(hidden: &[usize]) -> Option<u8> {
 
 /// `(fan_in, fan_out)` for each affine layer.
 pub fn layer_dims(hidden: &[usize]) -> Vec<(usize, usize)> {
+    let mem = memory_width(hidden);
     let mut dims = Vec::with_capacity(hidden.len() + 1);
-    let mut prev = INPUT_WIDTH;
+    let mut prev = INPUT_WIDTH + mem;
     for &h in hidden {
         dims.push((prev, h));
         prev = h;
     }
-    dims.push((prev, OUTPUT_WIDTH));
+    dims.push((prev, OUTPUT_WIDTH + mem));
     dims
 }
 
@@ -78,29 +97,57 @@ fn dot(w: &[f32], x: &[f32]) -> f32 {
     ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
 }
 
-/// Scalar reference forward pass. `scratch` must hold `2 * MAX_HIDDEN` floats.
+/// Scalar reference forward pass of a memoryless topology. `scratch` must hold `2 * MAX_HIDDEN` floats.
 pub fn forward(hidden: &[usize], params: &[f32], input: &[f32; INPUT_WIDTH], scratch: &mut [f32], out: &mut [f32; OUTPUT_WIDTH]) {
+    debug_assert!(!is_recurrent(hidden), "recurrent networks need forward_state");
+    forward_core(hidden, params, &input[..], scratch, &mut out[..]);
+}
+
+/// Shared layer loop: `x` is the full input (sensors, plus memory when recurrent) and `out`
+/// receives the final linear layer (logits, plus raw memory when recurrent).
+fn forward_core(hidden: &[usize], params: &[f32], x: &[f32], scratch: &mut [f32], out: &mut [f32]) {
     debug_assert_eq!(params.len(), param_count(hidden));
     let (a, b) = scratch.split_at_mut(MAX_HIDDEN);
     let mut cur: &mut [f32] = a;
     let mut nxt: &mut [f32] = b;
     let mut off = 0;
-    let mut in_w = INPUT_WIDTH;
+    let mut in_w = x.len();
     for (li, &h) in hidden.iter().enumerate() {
         let w = &params[off..off + in_w * h];
         let bias = &params[off + in_w * h..off + in_w * h + h];
         for o in 0..h {
-            let x: &[f32] = if li == 0 { &input[..] } else { &cur[..in_w] };
-            nxt[o] = (bias[o] + dot(&w[o * in_w..(o + 1) * in_w], x)).tanh();
+            let xin: &[f32] = if li == 0 { x } else { &cur[..in_w] };
+            nxt[o] = (bias[o] + dot(&w[o * in_w..(o + 1) * in_w], xin)).tanh();
         }
         off += in_w * h + h;
         in_w = h;
         std::mem::swap(&mut cur, &mut nxt);
     }
-    let w = &params[off..off + in_w * OUTPUT_WIDTH];
-    let bias = &params[off + in_w * OUTPUT_WIDTH..];
-    for o in 0..OUTPUT_WIDTH {
+    let ow = out.len();
+    let w = &params[off..off + in_w * ow];
+    let bias = &params[off + in_w * ow..];
+    for o in 0..ow {
         out[o] = bias[o] + dot(&w[o * in_w..(o + 1) * in_w], &cur[..in_w]);
+    }
+}
+
+/// Forward pass with per-organism memory. A memoryless topology ignores `mem_in` and returns
+/// it unchanged; the recurrent one reads it as 16 extra inputs and returns
+/// `tanh` of its 16 extra outputs as the next memory.
+pub fn forward_state(hidden: &[usize], params: &[f32], input: &[f32; INPUT_WIDTH], mem_in: &[f32; MEMORY_WIDTH], scratch: &mut [f32], out: &mut [f32; OUTPUT_WIDTH], mem_out: &mut [f32; MEMORY_WIDTH]) {
+    if !is_recurrent(hidden) {
+        forward(hidden, params, input, scratch, out);
+        *mem_out = *mem_in;
+        return;
+    }
+    let mut x = [0.0f32; INPUT_WIDTH + MEMORY_WIDTH];
+    x[..INPUT_WIDTH].copy_from_slice(input);
+    x[INPUT_WIDTH..].copy_from_slice(mem_in);
+    let mut raw = [0.0f32; OUTPUT_WIDTH + MEMORY_WIDTH];
+    forward_core(hidden, params, &x, scratch, &mut raw);
+    out.copy_from_slice(&raw[..OUTPUT_WIDTH]);
+    for k in 0..MEMORY_WIDTH {
+        mem_out[k] = raw[OUTPUT_WIDTH + k].tanh();
     }
 }
 
@@ -120,6 +167,10 @@ pub fn sigmoid(x: f64) -> f64 {
 /// for added incoming connections; outgoing influence of added neurons is zero and takes
 /// precedence. Biases of added neurons are zero; overlapping biases are copied.
 pub fn map_topology(old_h: &[usize], old: &[f32], new_h: &[usize], mut init: impl FnMut(usize, usize, usize) -> f32) -> Vec<f32> {
+    assert_eq!(is_recurrent(old_h), is_recurrent(new_h), "topologies with and without memory are not interchangeable");
+    if old_h == new_h {
+        return old.to_vec();
+    }
     let od = layer_dims(old_h);
     let nd = layer_dims(new_h);
     let oo = layer_offsets(old_h);
@@ -202,7 +253,7 @@ mod tests {
     #[test]
     fn catalog_parameter_counts() {
         let counts: Vec<usize> = CATALOG.iter().map(|h| param_count(h)).collect();
-        assert_eq!(counts, vec![1_164, 4_548, 9_988, 18_628, 29_316]);
+        assert_eq!(counts, vec![1_164, 4_548, 9_988, 18_628, 29_316, 12_980]);
     }
 
     fn rand_params(h: &[usize], seed: u32) -> Vec<f32> {
@@ -262,8 +313,8 @@ mod tests {
     #[test]
     fn c16_every_directed_transition_maps_deterministically() {
         let mut scratch = vec![0.0; 2 * MAX_HIDDEN];
-        for a in 0..CATALOG.len() {
-            for b in 0..CATALOG.len() {
+        for a in 0..CATALOG.len() - 1 {
+            for b in 0..CATALOG.len() - 1 {
                 if a == b {
                     continue;
                 }
@@ -284,5 +335,40 @@ mod tests {
         // An identity tanh bridge is not function preserving.
         assert!((1.0f64.tanh() - 0.76159416).abs() < 1e-8);
         assert!((1.0f64.tanh().tanh() - 0.64201499).abs() < 1e-8);
+    }
+
+    #[test]
+    fn recurrent_network_reads_and_writes_memory() {
+        let h = CATALOG[5];
+        assert!(is_recurrent(h) && !is_recurrent(CATALOG[4]));
+        let dims = layer_dims(h);
+        assert_eq!(dims.first(), Some(&(INPUT_WIDTH + MEMORY_WIDTH, 32)));
+        assert_eq!(dims.last(), Some(&(32, OUTPUT_WIDTH + MEMORY_WIDTH)));
+        assert_eq!(dims.len(), RECURRENT_DEPTH + 1);
+        let p = rand_params(h, 5);
+        let mut scratch = vec![0.0; 2 * MAX_HIDDEN];
+        let x = input(2);
+        let (mut o0, mut o1, mut o2) = ([0.0; OUTPUT_WIDTH], [0.0; OUTPUT_WIDTH], [0.0; OUTPUT_WIDTH]);
+        let (mut m0, mut m1, mut m2) = ([0.0; MEMORY_WIDTH], [0.0; MEMORY_WIDTH], [0.0; MEMORY_WIDTH]);
+        let zero = [0.0; MEMORY_WIDTH];
+        forward_state(h, &p, &x, &zero, &mut scratch, &mut o0, &mut m0);
+        // Deterministic.
+        forward_state(h, &p, &x, &zero, &mut scratch, &mut o1, &mut m1);
+        assert_eq!(o0, o1);
+        assert_eq!(m0, m1);
+        // Memory is bounded by tanh and changes the output when it changes.
+        assert!(m0.iter().all(|v| v.abs() < 1.0) && m0.iter().any(|&v| v != 0.0));
+        forward_state(h, &p, &x, &m0, &mut scratch, &mut o2, &mut m2);
+        assert_ne!(o0, o2, "memory input must influence the logits");
+        assert_ne!(m0, m2);
+        // A memoryless topology passes memory through untouched.
+        let q = rand_params(CATALOG[1], 5);
+        let keep = [0.25; MEMORY_WIDTH];
+        let mut mo = [0.0; MEMORY_WIDTH];
+        forward_state(CATALOG[1], &q, &x, &keep, &mut scratch, &mut o0, &mut mo);
+        assert_eq!(mo, keep);
+        let mut plain = [0.0; OUTPUT_WIDTH];
+        forward(CATALOG[1], &q, &x, &mut scratch, &mut plain);
+        assert_eq!(plain, o0);
     }
 }
