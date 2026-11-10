@@ -208,7 +208,12 @@ $env:WGPU_BACKEND = "vulkan"
 cargo run --release -- view --config presets\target-5k-field-ecology.toml --backend gpu-realtime --seconds 86400 --out runs\rt5-live
 ```
 
-`--seconds 0` runs until you close the window. Real time for this preset is
+`--seconds 0` runs until you close the window. At startup the viewer prints
+one line: surface format, color space, present mode, pixel size, and DPI
+scale. Present mode is mailbox or fifo. Immediate present is not used: on
+Windows, Vulkan immediate present skips the desktop compositor and the client
+area stays the window's white background while the title bar keeps updating.
+Real time for this preset is
 128 ticks per simulated second. The window title and the overlay show tick,
 sim time, population, achieved steps/s, and that rate divided by 128 (speed
 versus real time).
