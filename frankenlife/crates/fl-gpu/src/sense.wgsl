@@ -16,7 +16,7 @@ struct SenseDims {
     a: vec4<u32>,                // n_jobs, n_layers, d0 (104), d1
     b: vec4<u32>,                // d2, d3, grid_x, n_levels
     c: vec4<f32>,                // s0, composition floor density, energy density scale, gradient length
-    lu: array<vec4<u32>, 8>,     // per level: gx, gy, offset (cells), 0
+    lu: array<vec4<u32>, 8>,     // per level: gx, gy, offset (cells), 0 (level 0: first row of the group)
     lf: array<vec4<f32>, 8>,     // per level: hx, hy, 0, 0
 }
 
@@ -78,10 +78,13 @@ fn sample(l: u32, x: f32, y: f32, k: u32) -> vec3<f32> {
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-    let job = wg.y * dims.b.z + wg.x;
-    if (job >= dims.a.x) {
+    let local = wg.y * dims.b.z + wg.x;
+    if (local >= dims.a.x) {
         return;
     }
+    // Row of this group's first job in the job and output buffers (0 unless
+    // several groups share one submission).
+    let job = dims.lu[0].w + local;
     let jb = job * JS;
     let slot = bitcast<u32>(jobs[jb]);
     let x = jobs[jb + 1u];

@@ -51,6 +51,8 @@ const MAX_LEVELS: usize = 8;
 const EVICT_AFTER_CALLS: u64 = 64;
 const MAX_LAYERS: usize = 3;
 
+mod front;
+
 /// What was found when the GPU was opened.
 #[derive(Debug, Clone)]
 pub struct GpuInfo {
@@ -268,6 +270,8 @@ struct Io {
 }
 
 pub struct GpuBackend {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -326,8 +330,40 @@ pub struct GpuBackend {
     sense_bind: Option<SenseBind>,
     sense_words: Option<[u32; 76]>,
     sense_static_sig: Vec<(u64, u32, u32)>,
+    /// Queue the whole front half of a resident tick and wait once (see `front.rs`).
+    single_wait: bool,
+    front: front::FrontState,
+    /// Scratch copies of a CPU field, used only when a viewer samples a field that is not resident.
+    /// Never aliases the simulation buffers.
+    preview_scratch: Option<PreviewScratch>,
     pub info: GpuInfo,
     pub stats: GpuStats,
+}
+
+/// CPU-field upload target for the live viewer. Not part of a tick.
+struct PreviewScratch {
+    cells: usize,
+    generation: u64,
+    energy: wgpu::Buffer,
+    moment: wgpu::Buffer,
+}
+
+/// Planes the viewer can color without changing simulation state.
+///
+/// When `on_device` is set, `energy` and `moment` are the working field buffers
+/// (`fe` / `fm`). Between ticks those hold the committed field: the resident
+/// commit copies them into the committed buffers at the start of the next tick,
+/// and this borrow does not flush that copy or map anything.
+#[derive(Clone)]
+pub struct FieldPlanes {
+    pub energy: wgpu::Buffer,
+    pub moment: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+    /// `hx * hy`, the cell area `fl-view` divides energy by.
+    pub cell_area: f32,
+    /// Changes when the underlying buffers are reallocated.
+    pub generation: u64,
 }
 
 struct PendingField {
@@ -577,6 +613,8 @@ impl GpuBackend {
             max_buffer_bytes: limits.max_buffer_size,
         };
         Ok(GpuBackend {
+            instance,
+            adapter,
             device,
             queue,
             pipeline,
@@ -622,8 +660,67 @@ impl GpuBackend {
             sense_bind: None,
             sense_words: None,
             sense_static_sig: Vec::new(),
+            single_wait: false,
+            front: front::FrontState::default(),
+            preview_scratch: None,
             info,
             stats: GpuStats::default(),
+        })
+    }
+
+    pub fn instance(&self) -> &wgpu::Instance {
+        &self.instance
+    }
+
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Buffers holding field planes for a display sample.
+    ///
+    /// `on_device`: return the resident working field. Does not submit, wait, or
+    /// modify those buffers. `!on_device`: upload `field` into scratch buffers
+    /// that the tick never reads.
+    pub fn field_planes(&mut self, field: &Field, on_device: bool) -> Result<FieldPlanes, String> {
+        let width = field.gx as u32;
+        let height = field.gy as u32;
+        let cell_area = (field.hx * field.hy) as f32;
+        if on_device {
+            let fg = self.field_gpu.as_ref().ok_or("the resident field is not on the device yet")?;
+            return Ok(FieldPlanes { energy: fg.fe.clone(), moment: fg.fm.clone(), width, height, cell_area, generation: self.field_gen });
+        }
+        let cells = field.cells();
+        let needs = self.preview_scratch.as_ref().is_none_or(|s| s.cells < cells);
+        if needs {
+            use wgpu::BufferUsages as U;
+            let mk = |label, floats: usize| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: (floats * 4) as u64,
+                    usage: U::STORAGE | U::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            };
+            self.preview_scratch = Some(PreviewScratch { cells, generation: self.field_gen.wrapping_add(1).max(1), energy: mk("preview-e", cells), moment: mk("preview-m", cells * 32) });
+        }
+        let scratch = self.preview_scratch.as_ref().expect("scratch");
+        self.queue.write_buffer(&scratch.energy, 0, f32_bytes(&field.e));
+        self.queue.write_buffer(&scratch.moment, 0, f32_bytes(&field.m));
+        Ok(FieldPlanes {
+            energy: scratch.energy.clone(),
+            moment: scratch.moment.clone(),
+            width,
+            height,
+            cell_area,
+            generation: scratch.generation,
         })
     }
 
@@ -1099,10 +1196,43 @@ impl GpuBackend {
     /// same 12-float records the CPU used to write.
     fn submit_sense_group(&mut self, t: usize, page: usize, n: usize, dynamic: &[f32], statics: &[f32], statics_changed: bool, sensors: &fl_core::config::SensorsCfg) -> Result<SenseInflight, String> {
         let prep = std::time::Instant::now();
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sense") });
+        let stamp = self.timestamps.is_some();
+        self.encode_sense_group(&mut enc, t, page, n, dynamic, statics, statics_changed, sensors, stamp)?;
+        let io = self.sense_io.as_ref().expect("sense io");
+        let bytes = (n * SENSE_OUT_STRIDE * 4) as u64;
+        enc.copy_buffer_to_buffer(&io.outputs, 0, &io.staging, 0, bytes);
+        if let Some(ts) = &self.timestamps {
+            enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
+            enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
+        }
+        self.queue.submit([enc.finish()]);
+        self.stats.last.host_prep_ms += prep.elapsed().as_secs_f64() * 1e3;
+        self.stats.dispatches += 1;
+        self.stats.last.dispatches += 1;
+        let slice = io.staging.slice(0..bytes);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let ts_rx = self.timestamps.as_ref().map(|ts| {
+            let (ttx, trx) = mpsc::channel();
+            ts.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                let _ = ttx.send(r);
+            });
+            trx
+        });
+        Ok(SenseInflight { rx, ts_rx, bytes })
+    }
+
+    /// Record the job-expand and fused sense passes of one (topology, page) group
+    /// into `enc`. Uploads the group's dynamic (and, when changed, static) job words.
+    /// `stamp` writes the sense timestamp pair; the caller resolves and reads it.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_sense_group(&mut self, enc: &mut wgpu::CommandEncoder, t: usize, page: usize, n: usize, dynamic: &[f32], statics: &[f32], statics_changed: bool, sensors: &fl_core::config::SensorsCfg, stamp: bool) -> Result<(), String> {
         self.ensure_sense_io(n);
         self.ensure_job_expand_bind();
         self.ensure_sense_bind(t, page);
-        let io = self.sense_io.as_ref().expect("sense io");
         let fg = self.field_gpu.as_ref().expect("field resources");
         let slab = &self.slabs[t];
         let (grid_x, grid_y) = grid_for(n as u32);
@@ -1140,10 +1270,8 @@ impl GpuBackend {
         let dims = [n as u32, expand_grid.0, 0, 0];
         let uniform = self.job_expand_uniform.as_ref().expect("job expand uniform");
         self.queue.write_buffer(uniform, 0, bytemuck::cast_slice(&dims));
-        let bytes = (n * SENSE_OUT_STRIDE * 4) as u64;
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sense") });
         {
-            let tw = self.timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+            let tw = self.timestamps.as_ref().filter(|_| stamp).map(|ts| wgpu::ComputePassTimestampWrites {
                 query_set: &ts.set,
                 beginning_of_pass_write_index: Some(0),
                 end_of_pass_write_index: None,
@@ -1154,7 +1282,7 @@ impl GpuBackend {
             pass.dispatch_workgroups(expand_grid.0, expand_grid.1, 1);
         }
         {
-            let tw = self.timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
+            let tw = self.timestamps.as_ref().filter(|_| stamp).map(|ts| wgpu::ComputePassTimestampWrites {
                 query_set: &ts.set,
                 beginning_of_pass_write_index: None,
                 end_of_pass_write_index: Some(1),
@@ -1164,28 +1292,7 @@ impl GpuBackend {
             pass.set_bind_group(0, &self.sense_bind.as_ref().expect("sense bind").group, &[]);
             pass.dispatch_workgroups(grid_x, grid_y, 1);
         }
-        enc.copy_buffer_to_buffer(&io.outputs, 0, &io.staging, 0, bytes);
-        if let Some(ts) = &self.timestamps {
-            enc.resolve_query_set(&ts.set, 0..2, &ts.resolve, 0);
-            enc.copy_buffer_to_buffer(&ts.resolve, 0, &ts.readback, 0, 16);
-        }
-        self.queue.submit([enc.finish()]);
-        self.stats.last.host_prep_ms += prep.elapsed().as_secs_f64() * 1e3;
-        self.stats.dispatches += 1;
-        self.stats.last.dispatches += 1;
-        let slice = io.staging.slice(0..bytes);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        let ts_rx = self.timestamps.as_ref().map(|ts| {
-            let (ttx, trx) = mpsc::channel();
-            ts.readback.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                let _ = ttx.send(r);
-            });
-            trx
-        });
-        Ok(SenseInflight { rx, ts_rx, bytes })
+        Ok(())
     }
 
     fn finish_sense_group(&mut self, inflight: SenseInflight, mine: Option<&[usize]>, out: &mut [SenseOutput]) -> Result<(), String> {
@@ -1374,6 +1481,8 @@ impl GpuBackend {
         self.stats.field_last = FieldTiming::default();
         let host = std::time::Instant::now();
         self.ensure_field(field, cfg.pyramid_levels(), sources.len())?;
+        self.front.pyr_done = false;
+        let with_pyramid = self.single_wait && resident && defer && !self.profiling;
         let dt = cfg.dt();
         let diffusion = cfg.world.diffusion;
         let rx = diffusion * dt / (field.hx * field.hx);
@@ -1426,7 +1535,10 @@ impl GpuBackend {
             self.queue.write_buffer(&fg.fm, 0, f32_bytes(&field.m));
         }
         let fp = &self.field_pipes;
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("field") });
+        let mut enc = match self.front.open_enc.take() {
+            Some(enc) => enc,
+            None => self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("field") }),
+        };
         enc.clear_buffer(&fg.acct, 0, None);
         let mut passes: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32), u32)> = Vec::new();
         if diffusion > 0.0 {
@@ -1491,6 +1603,11 @@ impl GpuBackend {
         if !resident {
             enc.copy_buffer_to_buffer(&fg.fe, 0, &fg.fstaging, 0, cells * 4);
             enc.copy_buffer_to_buffer(&fg.fm, 0, &fg.fstaging, cells * 4, cells * 32 * 4);
+        }
+        if with_pyramid {
+            // The sensor pyramid of the observation field, in the same submission.
+            self.encode_pyramid(&mut enc, None);
+            self.front.pyr_done = true;
         }
         enc.copy_buffer_to_buffer(&fg.acct, 0, &fg.fstaging, cells * 33 * 4, cells * 3 * 4);
         if let Some(ts) = &self.field_timestamps {
@@ -1907,12 +2024,16 @@ impl ResidentBackend for GpuBackend {
         };
         self.queue.write_buffer(&st.ce, 0, f32_bytes(&field.e));
         self.queue.write_buffer(&st.cm, 0, f32_bytes(&field.m));
+        self.front.commit_pending = false;
+        self.front.open_enc = None;
+        self.front.deps_n = None;
         self.resident = Some(st);
         self.ensure_res_work(1)?;
         Ok(())
     }
 
     fn download_committed(&mut self, field: &mut Field) -> Result<(), String> {
+        self.flush_commit();
         let st = self.resident.as_ref().ok_or("nothing uploaded")?;
         let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
         let cells = st.cells as u64;
@@ -1952,11 +2073,25 @@ impl ResidentBackend for GpuBackend {
         let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
         let cells = st.cells as u64;
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("begin") });
-        enc.copy_buffer_to_buffer(&st.ce, 0, &fg.fe, 0, cells * 4);
-        enc.copy_buffer_to_buffer(&st.cm, 0, &fg.fm, 0, cells * 32 * 4);
+        if self.front.commit_pending {
+            // The previous tick's commit, folded in here: the working field already
+            // is the committed one, so it is copied out instead of copied in.
+            enc.copy_buffer_to_buffer(&fg.fe, 0, &st.ce, 0, cells * 4);
+            enc.copy_buffer_to_buffer(&fg.fm, 0, &st.cm, 0, cells * 32 * 4);
+            self.front.commit_pending = false;
+        } else {
+            enc.copy_buffer_to_buffer(&st.ce, 0, &fg.fe, 0, cells * 4);
+            enc.copy_buffer_to_buffer(&st.cm, 0, &fg.fm, 0, cells * 32 * 4);
+        }
         self.deposit_ts_armed = false;
+        self.front.deps_n = None;
         self.encode_deposits(&mut enc, ops, false)?;
-        self.queue.submit([enc.finish()]);
+        if self.single_wait {
+            // Rides with the first field-step submission.
+            self.front.open_enc = Some(enc);
+        } else {
+            self.queue.submit([enc.finish()]);
+        }
         self.stats.resident_last.begin_ms = t.elapsed().as_secs_f64() * 1e3;
         Ok(())
     }
@@ -2072,8 +2207,23 @@ impl ResidentBackend for GpuBackend {
         Ok(granted)
     }
 
+    fn sense_uptake(&mut self, cfg: &Config, extra_levels: usize, jobs: &[SenseJob<'_>], sense_out: &mut [SenseOutput], uptake_out: &mut [UptakeOut]) -> Option<Result<(FieldAccounting, f64), String>> {
+        if !self.single_wait {
+            return None;
+        }
+        Some(self.sense_uptake_impl(cfg, extra_levels, jobs, sense_out, uptake_out))
+    }
+
     fn deposit(&mut self, deposits: &[FieldDeposit]) -> Result<(), String> {
         let t = std::time::Instant::now();
+        if self.single_wait && !self.profiling {
+            // Packed now, queued with the finish pass: one submission for the back half.
+            let (_, _, hx, hy) = self.res_geom()?;
+            self.front.deps_items = self.deposit_items(deposits, hx, hy);
+            self.front.deps_n = Some(deposits.len());
+            self.stats.resident_last.deposit_ms = t.elapsed().as_secs_f64() * 1e3;
+            return Ok(());
+        }
         let stamp = self.profiling && self.deposit_timestamps.is_some() && !deposits.is_empty();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("deposit") });
         self.encode_deposits(&mut enc, deposits, stamp)?;
@@ -2090,6 +2240,18 @@ impl ResidentBackend for GpuBackend {
         let cells = st.cells;
         let stamp = self.profiling && self.resident_timestamps.is_some();
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("finish") });
+        if let Some(n_dep) = self.front.deps_n.take() {
+            if n_dep > 0 {
+                self.ensure_res_work(n_dep)?;
+                let st = self.resident.as_ref().expect("resident");
+                self.queue.write_buffer(&st.items, 0, f32_bytes(&self.front.deps_items));
+                // One uniform serves both: the deposit kernels read the item count, finish reads `tiny`.
+                self.write_res_uniform(n_dep, None, tiny);
+                self.encode_binning(&mut enc, n_dep, BinStamp::Off, false);
+                dispatch_resident(st, &mut enc, &self.res_pipes.deposit_gather, grid_for((st.cells as u32).div_ceil(64)), None);
+            }
+        }
+        let st = self.resident.as_ref().expect("resident");
         let pipe = &self.res_pipes.finish;
         let tw = if stamp {
             self.resident_timestamps.as_ref().map(|ts| wgpu::ComputePassTimestampWrites {
@@ -2144,10 +2306,16 @@ impl ResidentBackend for GpuBackend {
         let st = self.resident.as_mut().ok_or("nothing uploaded")?;
         let fg = self.field_gpu.as_ref().ok_or("resident field not initialized")?;
         let cells = st.cells as u64;
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("commit") });
-        enc.copy_buffer_to_buffer(&fg.fe, 0, &st.ce, 0, cells * 4);
-        enc.copy_buffer_to_buffer(&fg.fm, 0, &st.cm, 0, cells * 32 * 4);
-        self.queue.submit([enc.finish()]);
+        if self.single_wait {
+            // The copy rides with the next tick's first submission (or is flushed
+            // by a download or an abort, whichever comes first).
+            self.front.commit_pending = true;
+        } else {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("commit") });
+            enc.copy_buffer_to_buffer(&fg.fe, 0, &st.ce, 0, cells * 4);
+            enc.copy_buffer_to_buffer(&fg.fm, 0, &st.cm, 0, cells * 32 * 4);
+            self.queue.submit([enc.finish()]);
+        }
         st.committed_energy = st.pending_energy;
         self.field_resident = false;
         self.stats.resident_last.commit_ms = t.elapsed().as_secs_f64() * 1e3;
@@ -2156,6 +2324,13 @@ impl ResidentBackend for GpuBackend {
 
     fn abort(&mut self) {
         // The working field is simply discarded; the next begin_tick recopies the committed field.
+        // An encoder left open by begin_tick may carry the previous tick's commit: submit it.
+        if let Some(enc) = self.front.open_enc.take() {
+            self.queue.submit([enc.finish()]);
+        }
+        self.flush_commit();
+        self.front.deps_n = None;
+        self.front.pyr_done = false;
         self.field_resident = false;
     }
 }
@@ -2486,6 +2661,85 @@ mod tests {
         assert!(rel < 1e-5);
         assert!(a.totals.births > 0 && a.totals.deaths_user > 0);
         assert!(a.orgs.len() > 500);
+    }
+
+    /// The single-wait path (`--backend gpu-realtime`) against the classic resident path.
+    /// Only the uptake request differs (f32 on the device instead of f64 on the host), so
+    /// a short run stays close; two single-wait runs are bit-identical; the ledger closes
+    /// through commands, births, deaths and several topology groups; and a field copied
+    /// back mid-run (which flushes the folded commit) matches a run that never looked.
+    #[test]
+    fn single_wait_world_matches_resident_and_closes_its_ledger() {
+        let Ok(mut classic) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut g1 = GpuBackend::new().unwrap();
+        let mut g2 = GpuBackend::new().unwrap();
+        g1.set_single_wait(true);
+        g2.set_single_wait(true);
+        let cfg = || {
+            let mut c = vivid_small();
+            // Topology changes at most births: several (topology, page) groups per tick.
+            c.architecture_mutation.probability_per_birth = 0.5;
+            c
+        };
+        let mut r = fl_core::World::new(cfg()).unwrap();
+        let mut a = fl_core::World::new(cfg()).unwrap();
+        let mut b = fl_core::World::new(cfg()).unwrap();
+        for w in [&mut r, &mut a, &mut b] {
+            w.schedule(50, fl_core::Command::EraseDisk { x: 60.0, y: 60.0, radius: 12.0, disposal: fl_core::Disposal::Recycle }).unwrap();
+        }
+        for _ in 0..24 {
+            r.step_inference(fl_core::Inference::Resident(&mut classic)).unwrap();
+            a.step_inference(fl_core::Inference::Resident(&mut g1)).unwrap();
+            b.step_inference(fl_core::Inference::Resident(&mut g2)).unwrap();
+        }
+        // Early agreement with the classic path, before chaos amplifies rounding.
+        let rel = |x: f64, y: f64| (x - y).abs() / x.abs().max(y.abs()).max(1e-30);
+        assert_eq!(r.orgs.len(), a.orgs.len());
+        let worst_e = (0..r.orgs.len()).map(|i| rel(r.orgs.energy[i], a.orgs.energy[i])).fold(0.0, f64::max);
+        let worst_x = (0..r.orgs.len()).map(|i| (r.orgs.x[i] - a.orgs.x[i]).abs()).fold(0.0, f64::max);
+        eprintln!("single-wait vs classic after 24 ticks: organism energy {worst_e:.2e} rel, position {worst_x:.2e}, transferred {:.2e} rel", rel(r.ledger.transferred, a.ledger.transferred));
+        assert!(worst_e < 1e-4 && worst_x < 1e-4);
+        assert!(rel(r.ledger.transferred, a.ledger.transferred) < 1e-5);
+        for k in 24..640 {
+            a.step_inference(fl_core::Inference::Resident(&mut g1)).unwrap();
+            b.step_inference(fl_core::Inference::Resident(&mut g2)).unwrap();
+            if k % 97 == 0 {
+                // Looking at the field must not change the run.
+                a.sync_field(&mut g1).unwrap();
+            }
+        }
+        a.sync_field(&mut g1).unwrap();
+        b.sync_field(&mut g2).unwrap();
+        assert_eq!(a.state_hash(), b.state_hash(), "two single-wait runs are bit-identical");
+        let l = &a.ledger;
+        let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+        let relres = (a.total_energy() - expected).abs() / l.transferred.max(1.0);
+        let topologies: std::collections::BTreeSet<u8> = a.orgs.genome.iter().map(|g| g.topology).collect();
+        eprintln!("single-wait world: births {}, user deaths {}, population {}, topologies {}, residual {:.2e} ({relres:.2e} of transfers)", a.totals.births, a.totals.deaths_user, a.orgs.len(), topologies.len(), l.residual);
+        assert!(relres < 1e-5);
+        assert!(a.totals.births > 0 && a.totals.deaths_user > 0);
+        assert!(topologies.len() > 1, "the run exercised several topology groups");
+        assert!(a.orgs.len() > 500);
+    }
+
+    /// Sensing and inference are the same kernels on both paths: after one tick from
+    /// the same world, every held output is equal bit for bit.
+    #[test]
+    fn single_wait_sensing_is_bit_identical_on_the_first_tick() {
+        let Ok(mut classic) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        let mut fast = GpuBackend::new().unwrap();
+        fast.set_single_wait(true);
+        let mut a = fl_core::World::new(vivid_small()).unwrap();
+        let mut b = fl_core::World::new(vivid_small()).unwrap();
+        a.step_inference(fl_core::Inference::Resident(&mut classic)).unwrap();
+        b.step_inference(fl_core::Inference::Resident(&mut fast)).unwrap();
+        assert_eq!(a.orgs.held, b.orgs.held, "identical sensing and inference on the first tick");
     }
 
     fn tiny_world() -> Config {

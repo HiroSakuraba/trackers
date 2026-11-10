@@ -221,9 +221,9 @@ fn draw_text(rgb: &mut [u8], n: usize, x0: usize, y0: usize, s: usize, text: &st
     }
 }
 
-pub fn write_png(path: &std::path::Path, rgb: &[u8], n: usize) -> std::io::Result<()> {
+pub fn write_png(path: &std::path::Path, rgb: &[u8], width: usize, height: usize) -> std::io::Result<()> {
     let file = std::fs::File::create(path)?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), n as u32, n as u32);
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     let mut wr = enc.write_header().map_err(std::io::Error::other)?;

@@ -24,7 +24,7 @@ frankenlife/
     ├── fl-gpu/        # wgpu GPU inference backend (fused MLP shader, GPU-resident weight slabs)
     ├── fl-view/       # declared display mappings (lineage / chemistry / field colors) shared by all views
     ├── fl-wasm/       # WebAssembly boundary for the browser Studio
-    └── frankenlife/   # CLI: validate, run, inspect, metrics, headless renderer
+    └── frankenlife/   # CLI: validate, run, view, inspect, metrics, headless renderer
 studio/
     studio.template.html, build.sh   # single-file browser Studio (wasm inlined)
 ```
@@ -77,6 +77,29 @@ works. `--backend gpu-field` runs only the field step on the GPU;
 `--backend gpu-fused` also moves the sensor pyramid and per-organism sensing to
 the GPU (inputs never leave it); it agrees with CPU sensing to ~1e-5 on logits
 and ~6e-5 relative on the motion drive and density.
+
+`--backend gpu-realtime` is that path with one GPU wait for the front half of
+a tick and one for the back half; on a GTX 1080 it runs the 5,000-organism
+preset at about 190 steps/s (128 is real time). See
+[WINDOWS-GPU.md](WINDOWS-GPU.md).
+
+## Live viewer
+
+`view` opens a desktop window on the same tick as `run`, including
+`gpu-realtime`. It draws the committed world with the `fl-view` lineage,
+chemistry and field colors. Frames are not saved. Pause, single-step, or
+clicking an organism are the ways a watched run can diverge; left alone for
+the same config, seed and tick count, the final state hash matches `run`.
+
+```bash
+cargo run --release -- view --config presets/target-5k-field-ecology.toml \
+    --backend gpu-realtime --seconds 86400 --out runs/rt5-live
+```
+
+`--seconds 0` (the default) runs until the window closes. The Windows command,
+controls, and what the title bar is counting are in
+[WINDOWS-GPU.md](WINDOWS-GPU.md). `--screenshot frame.png` draws one frame
+headlessly and exits, for a machine with no display.
 
 Performance targets from the revised plan: **20,000 organisms first**
 (`presets/target-20k-field-ecology.toml`, 256² field), 80,000 as the stretch goal.
