@@ -92,6 +92,12 @@ live-tuning keys (energy, source speed, diffusion, decay, mutation rate, source
 chemistry) are the ways a watched run can diverge; left alone for the same
 config, seed and tick count, the final state hash matches `run`.
 
+Press `P`, type a number and press Enter to restart the run with that many
+organisms (Backspace edits, Esc cancels). The restart builds a fresh world from
+the launch settings and seed, so it discards the current run and any live
+tuning; the window, camera and speed stay. Counts the config cannot hold (for
+example over its memory budget) are refused with a message on screen.
+
 ```bash
 cargo run --release -- view --config presets/target-5k-field-ecology.toml \
     --backend gpu-realtime --seconds 86400 --out runs/rt5-live
