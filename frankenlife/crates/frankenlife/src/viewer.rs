@@ -758,11 +758,20 @@ impl WindowApp<'_> {
         let painter = Painter::new(link.device.clone(), link.queue.clone())?;
         let size = window.inner_size();
         let (surface, adapter, device, queue, same) = attach_surface(&link, window.clone())?;
-        let mut config = surface.get_default_config(&adapter, size.width.max(1), size.height.max(1)).ok_or("this adapter cannot configure the window surface")?;
-        config.present_mode = wgpu::PresentMode::AutoNoVsync;
-        config.desired_maximum_frame_latency = 2;
+        let config = surface_config(&surface, &adapter, size.width, size.height)?;
         surface.configure(&device, &config);
-        let encode_srgb = !matches!(config.format, wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb);
+        let encode_srgb = !is_srgb(config.format);
+        eprintln!(
+            "viewer surface: format {:?} | color space {:?} | present {:?} | alpha {:?} | {}x{} px | scale {:.2} | {}",
+            config.format,
+            config.color_space,
+            config.present_mode,
+            config.alpha_mode,
+            config.width,
+            config.height,
+            window.scale_factor(),
+            if same { "simulation device presents" } else { "separate present device" }
+        );
         let (tonemap, hud) = painter.pipelines_for(config.format);
         // pipelines_for uses painter.device. If the surface device differs, those pipelines
         // cannot draw to the surface. Rebuild them on the surface device when needed.
@@ -788,15 +797,26 @@ impl WindowApp<'_> {
             swap.config.height = size.height;
             swap.surface.configure(&swap.device, &swap.config);
         }
-        let frame = match swap.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+        let (frame, suboptimal) = match swap.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 swap.surface.configure(&swap.device, &swap.config);
+                swap.window.request_redraw();
                 return Ok(());
             }
             wgpu::CurrentSurfaceTexture::Validation => return Err("surface validation error".into()),
         };
+        let frame_size = frame.texture.size();
+        if (frame_size.width != size.width || frame_size.height != size.height) && (swap.config.width != size.width || swap.config.height != size.height) {
+            drop(frame);
+            swap.config.width = size.width;
+            swap.config.height = size.height;
+            swap.surface.configure(&swap.device, &swap.config);
+            swap.window.request_redraw();
+            return Ok(());
+        }
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let screen = (size.width, size.height);
         let orgs = self.session.organism_instances(screen);
@@ -837,10 +857,24 @@ impl WindowApp<'_> {
         if same {
             let painter = self.painter.as_mut().expect("painter");
             let stats = painter.draw(&scene, &view, screen, encode, &tonemap, &hud)?;
+            // The view holds the swapchain image. Drop it before present or the
+            // image stays in use and Windows shows the untouched window.
+            drop(view);
             let _ = painter.device.poll(wgpu::PollType::Poll);
+            if let Some(swap) = self.swap.as_ref() {
+                swap.window.pre_present_notify();
+            }
             queue.present(frame);
             self.session.pace.present_ms += stats.cpu_ms;
             self.session.pace.frames += 1;
+            if suboptimal {
+                if let Some(swap) = self.swap.as_mut() {
+                    let size = swap.window.inner_size();
+                    swap.config.width = size.width.max(1);
+                    swap.config.height = size.height.max(1);
+                    swap.surface.configure(&swap.device, &swap.config);
+                }
+            }
         } else {
             drop(view);
             drop(frame);
@@ -868,6 +902,67 @@ impl WindowApp<'_> {
         }
         Ok(())
     }
+}
+
+fn is_srgb(format: wgpu::TextureFormat) -> bool {
+    matches!(format, wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb)
+}
+
+fn choose_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
+    const PREFERRED: [wgpu::TextureFormat; 4] = [
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ];
+    for format in PREFERRED {
+        if formats.contains(&format) {
+            return format;
+        }
+    }
+    formats.first().copied().unwrap_or(wgpu::TextureFormat::Bgra8Unorm)
+}
+
+/// Mailbox if the adapter has it, otherwise FIFO.
+///
+/// `PresentMode::AutoNoVsync` resolves to immediate when the driver offers it.
+/// On Windows, Vulkan immediate present does not go through DWM, so the client
+/// area stays the window's white background while the title bar (drawn by DWM)
+/// keeps updating.
+fn choose_present(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    if modes.contains(&wgpu::PresentMode::Mailbox) {
+        wgpu::PresentMode::Mailbox
+    } else {
+        wgpu::PresentMode::Fifo
+    }
+}
+
+fn surface_config(surface: &wgpu::Surface<'_>, adapter: &wgpu::Adapter, width: u32, height: u32) -> Result<wgpu::SurfaceConfiguration, String> {
+    let caps = surface.get_capabilities(adapter);
+    if caps.formats.is_empty() {
+        return Err("this adapter cannot present to the window".into());
+    }
+    let format = choose_format(&caps.formats);
+    let color_space = match wgpu::SurfaceColorSpace::Srgb.to_color_spaces() {
+        Some(bit) if caps.color_spaces(format).contains(bit) => wgpu::SurfaceColorSpace::Srgb,
+        _ => wgpu::SurfaceColorSpace::Auto,
+    };
+    let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+        wgpu::CompositeAlphaMode::Opaque
+    } else {
+        wgpu::CompositeAlphaMode::Auto
+    };
+    Ok(wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        color_space,
+        width: width.max(1),
+        height: height.max(1),
+        present_mode: choose_present(&caps.present_modes),
+        desired_maximum_frame_latency: 2,
+        alpha_mode,
+        view_formats: vec![],
+    })
 }
 
 fn attach_surface(link: &painter::GpuLink, window: Arc<winit::window::Window>) -> Result<(wgpu::Surface<'static>, wgpu::Adapter, wgpu::Device, wgpu::Queue, bool), String> {
@@ -925,6 +1020,22 @@ impl winit::application::ApplicationHandler for WindowApp<'_> {
         use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
         use winit::keyboard::{Key, NamedKey};
         match event {
+            WindowEvent::Resized(size) => {
+                if let Some(swap) = self.swap.as_mut() {
+                    if size.width > 0 && size.height > 0 && (swap.config.width != size.width || swap.config.height != size.height) {
+                        swap.config.width = size.width;
+                        swap.config.height = size.height;
+                        swap.surface.configure(&swap.device, &swap.config);
+                    }
+                    swap.window.request_redraw();
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                eprintln!("viewer surface: scale factor is now {scale_factor:.2}");
+                if let Some(swap) = self.swap.as_ref() {
+                    swap.window.request_redraw();
+                }
+            }
             WindowEvent::CloseRequested => {
                 self.wrote = true;
                 let code_unused = self.session.finish();
@@ -1110,6 +1221,15 @@ impl Pace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_mode_skips_immediate_even_when_the_driver_offers_it() {
+        use wgpu::PresentMode::{Fifo, Immediate, Mailbox};
+        assert_eq!(choose_present(&[Immediate, Mailbox, Fifo]), Mailbox);
+        assert_eq!(choose_present(&[Immediate, Fifo]), Fifo);
+        assert_eq!(choose_present(&[Fifo]), Fifo);
+        assert_eq!(choose_format(&[wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Bgra8UnormSrgb]), wgpu::TextureFormat::Bgra8UnormSrgb);
+    }
 
     #[test]
     fn camera_roundtrips_the_center_and_wraps() {
