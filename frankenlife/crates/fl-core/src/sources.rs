@@ -93,6 +93,44 @@ impl Source {
         }
     }
 
+    /// Change the path speed at tick `n` without moving the source: shifts the
+    /// segment anchor so the center stays continuous across the change.
+    /// Requires `advance_to(n)` (with the old speed) first.
+    pub fn reanchor_for_speed(&mut self, n: u64, cfg: &Config, old_speed: f64, new_speed: f64) {
+        let seg = segment_ticks(cfg);
+        debug_assert_eq!(self.ordinal, n / seg);
+        let u = (n % seg) as f64 / seg as f64;
+        let t_seg = cfg.sources.path_direction_interval_seconds;
+        let before = displacement(old_speed, t_seg, self.start_dir, self.end_dir, u);
+        let after = displacement(new_speed, t_seg, self.start_dir, self.end_dir, u);
+        self.anchor = [wrap(self.anchor[0] + before[0] - after[0], cfg.world.width), wrap(self.anchor[1] + before[1] - after[1], cfg.world.height)];
+    }
+
+    /// Rotate the chemical direction by `degrees` toward a deterministic random
+    /// direction perpendicular to it, addressed by `(source, tick, command seq)`.
+    pub fn drift_chemistry(&mut self, rng: &SemanticRng, tick: u64, seq: u64, degrees: f64) {
+        let mut z = [0.0f64; CHANNELS];
+        rng.normals(Lane::SourceChemistryDrift, self.id as u64, tick, seq, &mut z);
+        let c: [f64; CHANNELS] = std::array::from_fn(|k| self.chem[k] as f64);
+        let dot: f64 = (0..CHANNELS).map(|k| z[k] * c[k]).sum();
+        let mut u = [0.0f64; CHANNELS];
+        for k in 0..CHANNELS {
+            u[k] = z[k] - dot * c[k];
+        }
+        let norm = u.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if !(norm > 1e-12) {
+            return;
+        }
+        let (s, co) = degrees.to_radians().sin_cos();
+        let mut next = [0.0f64; CHANNELS];
+        for k in 0..CHANNELS {
+            next[k] = c[k] * co + u[k] / norm * s;
+        }
+        if let Some(unit) = isotropic_unit(&next) {
+            self.chem = unit;
+        }
+    }
+
     /// Center at the midpoint time `(n + 1/2) dt` of the advance `n -> n+1`.
     /// Requires `advance_to(n)` first.
     pub fn center_mid(&self, n: u64, cfg: &Config) -> [f64; 2] {
@@ -169,6 +207,53 @@ pub fn inject(field: &mut Field, sources: &[Source], n: u64, cfg: &Config) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_speed_mid_segment_does_not_move_the_source() {
+        let mut cfg = Config::reference();
+        cfg.sources.path_speed = 2.0;
+        let rng = SemanticRng::new(cfg.seed);
+        let seg = segment_ticks(&cfg);
+        for n in [3, seg / 2 + 7, seg - 1, seg + seg / 3] {
+            let mut s = init_sources(&cfg, &rng).remove(0);
+            s.advance_to(n, &cfg, &rng);
+            let before = s.center_mid(n, &cfg);
+            let mut fast = cfg.clone();
+            fast.sources.path_speed = 9.0;
+            let mut kept = s.clone();
+            kept.reanchor_for_speed(n, &cfg, 2.0, 9.0);
+            let after = kept.center_mid(n, &fast);
+            let jump = |a: [f64; 2], b: [f64; 2]| (min_image(a[0] - b[0], cfg.world.width).powi(2) + min_image(a[1] - b[1], cfg.world.height).powi(2)).sqrt();
+            // Only the half tick of extra travel at the new speed remains.
+            assert!(jump(before, after) < 9.0 * cfg.dt(), "tick {n}: moved {}", jump(before, after));
+            // Without the re-anchor the same change teleports the source.
+            let teleport = s.center_mid(n, &fast);
+            assert!(jump(before, teleport) > 0.5 || n < 100, "tick {n}: teleport only {}", jump(before, teleport));
+        }
+    }
+
+    #[test]
+    fn chemistry_drift_rotates_by_the_requested_angle_deterministically() {
+        let cfg = Config::reference();
+        let rng = SemanticRng::new(cfg.seed);
+        let s0 = init_sources(&cfg, &rng).remove(0);
+        for deg in [5.0f64, 25.0, 90.0] {
+            let mut a = s0.clone();
+            a.drift_chemistry(&rng, 40, 7, deg);
+            let mut b = s0.clone();
+            b.drift_chemistry(&rng, 40, 7, deg);
+            assert_eq!(a.chem, b.chem, "same address, same drift");
+            let norm: f64 = a.chem.iter().map(|&v| v as f64 * v as f64).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-5);
+            let dot: f64 = (0..CHANNELS).map(|k| a.chem[k] as f64 * s0.chem[k] as f64).sum();
+            assert!((dot - deg.to_radians().cos()).abs() < 1e-5, "angle {deg}: dot {dot}");
+        }
+        let mut c = s0.clone();
+        c.drift_chemistry(&rng, 41, 7, 25.0);
+        let mut d = s0.clone();
+        d.drift_chemistry(&rng, 40, 7, 25.0);
+        assert_ne!(c.chem, d.chem, "a later press drifts somewhere else");
+    }
 
     #[test]
     fn c17_kernel_normalizes_at_any_resolution() {

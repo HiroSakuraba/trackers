@@ -142,6 +142,122 @@ pub enum Command {
     EraseDisk { x: f64, y: f64, radius: f64, disposal: Disposal },
     /// Inject `amount` energy uniformly over the cells whose centers lie in the disk.
     EnergyBrush { x: f64, y: f64, radius: f64, amount: f64, direction: Option<[f32; CHANNELS]> },
+    /// Set one live tuning parameter. It takes effect for the tick that starts at
+    /// the command's boundary and stays in the configuration (and checkpoints).
+    SetParam { param: Param, value: f64 },
+    /// Rotate the chemical direction of one source (or every source) by `degrees`
+    /// toward a deterministic random perpendicular direction.
+    DriftChemistry { source: Option<u32>, degrees: f64 },
+}
+
+/// Configuration values that can be changed while a world runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Param {
+    /// `sources.power_per_source` (energy per second per source).
+    SourcePower,
+    /// `sources.path_speed` (world units per second).
+    SourceSpeed,
+    /// `world.diffusion`.
+    Diffusion,
+    /// `world.decay_per_second`.
+    Decay,
+    /// `mutation.weight_probability`.
+    MutationWeightProbability,
+    /// `mutation.weight_standard_deviation`.
+    MutationWeightSd,
+    /// `mutation.replacement_probability`.
+    MutationReplacementProbability,
+    /// `mutation.chemistry_standard_deviation`.
+    MutationChemistrySd,
+    /// `mutation.sensing_log_scale_standard_deviation`.
+    MutationSensingSd,
+}
+
+impl Param {
+    pub const ALL: [Param; 9] = [
+        Param::SourcePower,
+        Param::SourceSpeed,
+        Param::Diffusion,
+        Param::Decay,
+        Param::MutationWeightProbability,
+        Param::MutationWeightSd,
+        Param::MutationReplacementProbability,
+        Param::MutationChemistrySd,
+        Param::MutationSensingSd,
+    ];
+
+    pub fn get(self, cfg: &Config) -> f64 {
+        match self {
+            Param::SourcePower => cfg.sources.power_per_source,
+            Param::SourceSpeed => cfg.sources.path_speed,
+            Param::Diffusion => cfg.world.diffusion,
+            Param::Decay => cfg.world.decay_per_second,
+            Param::MutationWeightProbability => cfg.mutation.weight_probability,
+            Param::MutationWeightSd => cfg.mutation.weight_standard_deviation,
+            Param::MutationReplacementProbability => cfg.mutation.replacement_probability,
+            Param::MutationChemistrySd => cfg.mutation.chemistry_standard_deviation,
+            Param::MutationSensingSd => cfg.mutation.sensing_log_scale_standard_deviation,
+        }
+    }
+
+    fn set(self, cfg: &mut Config, v: f64) {
+        match self {
+            Param::SourcePower => cfg.sources.power_per_source = v,
+            Param::SourceSpeed => cfg.sources.path_speed = v,
+            Param::Diffusion => cfg.world.diffusion = v,
+            Param::Decay => cfg.world.decay_per_second = v,
+            Param::MutationWeightProbability => cfg.mutation.weight_probability = v,
+            Param::MutationWeightSd => cfg.mutation.weight_standard_deviation = v,
+            Param::MutationReplacementProbability => cfg.mutation.replacement_probability = v,
+            Param::MutationChemistrySd => cfg.mutation.chemistry_standard_deviation = v,
+            Param::MutationSensingSd => cfg.mutation.sensing_log_scale_standard_deviation = v,
+        }
+    }
+
+    /// Stable one-byte tag used by checkpoints.
+    pub fn tag(self) -> u8 {
+        Param::ALL.iter().position(|&p| p == self).expect("listed") as u8
+    }
+
+    pub fn from_tag(t: u8) -> Option<Param> {
+        Param::ALL.get(t as usize).copied()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Param::SourcePower => "source power",
+            Param::SourceSpeed => "source speed",
+            Param::Diffusion => "diffusion",
+            Param::Decay => "decay",
+            Param::MutationWeightProbability => "mutation weight probability",
+            Param::MutationWeightSd => "mutation weight sd",
+            Param::MutationReplacementProbability => "mutation replacement probability",
+            Param::MutationChemistrySd => "mutation chemistry sd",
+            Param::MutationSensingSd => "mutation sensing sd",
+        }
+    }
+
+    /// Reject values the configuration would reject, plus a cap on diffusion
+    /// subcycles so one key press cannot stall the transport.
+    pub fn check(self, cfg: &Config, v: f64) -> Result<(), String> {
+        if !v.is_finite() || v < 0.0 {
+            return Err(format!("{} must be finite and >= 0", self.label()));
+        }
+        match self {
+            Param::MutationWeightProbability | Param::MutationReplacementProbability if v > 1.0 => Err(format!("{} must be in [0,1]", self.label())),
+            Param::Diffusion => {
+                let (hx, hy) = cfg.cell_size();
+                let dt = cfg.dt();
+                let sub = (v * dt / (hx * hx) + v * dt / (hy * hy)) / 0.5;
+                if sub > 256.0 {
+                    Err(format!("diffusion {v} needs more than 256 transport subcycles per tick"))
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -451,6 +567,20 @@ impl World {
         if self.pending.len() >= self.cfg.execution.command_queue_capacity as usize {
             return Err("command queue is full".into());
         }
+        match &command {
+            Command::SetParam { param, value } => param.check(&self.cfg, *value)?,
+            Command::DriftChemistry { source, degrees } => {
+                if let Some(k) = source {
+                    if *k >= self.cfg.sources.count {
+                        return Err(format!("source {k} does not exist ({} sources)", self.cfg.sources.count));
+                    }
+                }
+                if !degrees.is_finite() || degrees.abs() > 180.0 {
+                    return Err("chemistry drift must be within 180 degrees".into());
+                }
+            }
+            _ => {}
+        }
         let seq = self.next_command_seq;
         self.next_command_seq += 1;
         self.pending.push(ScheduledCommand { tick, seq, command });
@@ -518,9 +648,33 @@ impl World {
 
     fn step_core(&mut self, inference: Inference<'_>) -> Result<TickReport, TickError> {
         let t_start = Stopwatch::start();
-        let cfg = &self.cfg;
-        let dt = cfg.dt();
         let n = self.tick;
+        // Live tuning commands for this boundary change a candidate configuration,
+        // which replaces the committed one only when the tick commits. A tick that
+        // is rejected and retried therefore never applies them twice.
+        let tuned: Option<Config> = {
+            let mut params: Vec<(u64, Param, f64)> = self
+                .pending
+                .iter()
+                .filter(|c| c.tick == n)
+                .filter_map(|c| match &c.command {
+                    Command::SetParam { param, value } => Some((c.seq, *param, *value)),
+                    _ => None,
+                })
+                .collect();
+            if params.is_empty() {
+                None
+            } else {
+                params.sort_by_key(|p| p.0);
+                let mut c = self.cfg.clone();
+                for (_, p, v) in params {
+                    p.set(&mut c, v);
+                }
+                Some(c)
+            }
+        };
+        let cfg = tuned.as_ref().unwrap_or(&self.cfg);
+        let dt = cfg.dt();
         let event = n.checked_add(1).ok_or(TickError::Overflow { detail: "tick counter".into() })?;
         let tiny = cfg.world.tiny_energy_threshold;
         let mut timing = TickTiming::default();
@@ -589,8 +743,25 @@ impl World {
         // ── Phase 1: admit commands recorded for this boundary ────────────
         let mut due: Vec<&ScheduledCommand> = self.pending.iter().filter(|c| c.tick == n).collect();
         due.sort_by_key(|c| c.seq);
+        let mut speed_now = self.cfg.sources.path_speed;
         for sc in &due {
             match &sc.command {
+                // Already applied to the candidate configuration above.
+                Command::SetParam { param: Param::SourceSpeed, value } => {
+                    // Keep every source where it is: move the path anchor so the
+                    // center is continuous across the change of speed.
+                    for s in sources.iter_mut() {
+                        s.advance_to(n, &self.cfg, &self.rng);
+                        s.reanchor_for_speed(n, &self.cfg, speed_now, *value);
+                    }
+                    speed_now = *value;
+                }
+                Command::SetParam { .. } => {}
+                Command::DriftChemistry { source, degrees } => {
+                    for s in sources.iter_mut().filter(|s| source.is_none_or(|k| k == s.id)) {
+                        s.drift_chemistry(&self.rng, n, sc.seq, *degrees);
+                    }
+                }
                 Command::EraseDisk { x, y, radius, disposal } => {
                     for i in 0..orgs.len() {
                         if dead[i] {
@@ -1268,6 +1439,9 @@ impl World {
         self.genome_hot.0 = hot;
         self.org_scratch.0 = std::mem::replace(&mut self.orgs, orgs);
         self.sources = sources;
+        if tuned.is_some() {
+            self.cfg = cfg.clone();
+        }
         self.tick = event;
         self.next_org_id = next_org;
         self.next_genome_id = next_genome;

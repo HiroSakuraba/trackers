@@ -87,9 +87,10 @@ preset at about 190 steps/s (128 is real time). See
 
 `view` opens a desktop window on the same tick as `run`, including
 `gpu-realtime`. It draws the committed world with the `fl-view` lineage,
-chemistry and field colors. Frames are not saved. Pause, single-step, or
-clicking an organism are the ways a watched run can diverge; left alone for
-the same config, seed and tick count, the final state hash matches `run`.
+chemistry and field colors. Frames are not saved. Pause, single-step, and the
+live-tuning keys (energy, source speed, diffusion, decay, mutation rate, source
+chemistry) are the ways a watched run can diverge; left alone for the same
+config, seed and tick count, the final state hash matches `run`.
 
 ```bash
 cargo run --release -- view --config presets/target-5k-field-ecology.toml \
