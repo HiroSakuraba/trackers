@@ -270,6 +270,8 @@ struct Io {
 }
 
 pub struct GpuBackend {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -331,8 +333,37 @@ pub struct GpuBackend {
     /// Queue the whole front half of a resident tick and wait once (see `front.rs`).
     single_wait: bool,
     front: front::FrontState,
+    /// Scratch copies of a CPU field, used only when a viewer samples a field that is not resident.
+    /// Never aliases the simulation buffers.
+    preview_scratch: Option<PreviewScratch>,
     pub info: GpuInfo,
     pub stats: GpuStats,
+}
+
+/// CPU-field upload target for the live viewer. Not part of a tick.
+struct PreviewScratch {
+    cells: usize,
+    generation: u64,
+    energy: wgpu::Buffer,
+    moment: wgpu::Buffer,
+}
+
+/// Planes the viewer can color without changing simulation state.
+///
+/// When `on_device` is set, `energy` and `moment` are the working field buffers
+/// (`fe` / `fm`). Between ticks those hold the committed field: the resident
+/// commit copies them into the committed buffers at the start of the next tick,
+/// and this borrow does not flush that copy or map anything.
+#[derive(Clone)]
+pub struct FieldPlanes {
+    pub energy: wgpu::Buffer,
+    pub moment: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+    /// `hx * hy`, the cell area `fl-view` divides energy by.
+    pub cell_area: f32,
+    /// Changes when the underlying buffers are reallocated.
+    pub generation: u64,
 }
 
 struct PendingField {
@@ -582,6 +613,8 @@ impl GpuBackend {
             max_buffer_bytes: limits.max_buffer_size,
         };
         Ok(GpuBackend {
+            instance,
+            adapter,
             device,
             queue,
             pipeline,
@@ -629,8 +662,65 @@ impl GpuBackend {
             sense_static_sig: Vec::new(),
             single_wait: false,
             front: front::FrontState::default(),
+            preview_scratch: None,
             info,
             stats: GpuStats::default(),
+        })
+    }
+
+    pub fn instance(&self) -> &wgpu::Instance {
+        &self.instance
+    }
+
+    pub fn adapter(&self) -> &wgpu::Adapter {
+        &self.adapter
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Buffers holding field planes for a display sample.
+    ///
+    /// `on_device`: return the resident working field. Does not submit, wait, or
+    /// modify those buffers. `!on_device`: upload `field` into scratch buffers
+    /// that the tick never reads.
+    pub fn field_planes(&mut self, field: &Field, on_device: bool) -> Result<FieldPlanes, String> {
+        let width = field.gx as u32;
+        let height = field.gy as u32;
+        let cell_area = (field.hx * field.hy) as f32;
+        if on_device {
+            let fg = self.field_gpu.as_ref().ok_or("the resident field is not on the device yet")?;
+            return Ok(FieldPlanes { energy: fg.fe.clone(), moment: fg.fm.clone(), width, height, cell_area, generation: self.field_gen });
+        }
+        let cells = field.cells();
+        let needs = self.preview_scratch.as_ref().is_none_or(|s| s.cells < cells);
+        if needs {
+            use wgpu::BufferUsages as U;
+            let mk = |label, floats: usize| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: (floats * 4) as u64,
+                    usage: U::STORAGE | U::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            };
+            self.preview_scratch = Some(PreviewScratch { cells, generation: self.field_gen.wrapping_add(1).max(1), energy: mk("preview-e", cells), moment: mk("preview-m", cells * 32) });
+        }
+        let scratch = self.preview_scratch.as_ref().expect("scratch");
+        self.queue.write_buffer(&scratch.energy, 0, f32_bytes(&field.e));
+        self.queue.write_buffer(&scratch.moment, 0, f32_bytes(&field.m));
+        Ok(FieldPlanes {
+            energy: scratch.energy.clone(),
+            moment: scratch.moment.clone(),
+            width,
+            height,
+            cell_area,
+            generation: scratch.generation,
         })
     }
 

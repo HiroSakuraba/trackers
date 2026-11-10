@@ -2,8 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+mod painter;
 mod profile_cli;
 mod render;
+mod viewer;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -47,6 +49,8 @@ enum Cmd {
         #[arg(long, default_value_t = 3)]
         top: usize,
     },
+    /// Open a desktop window and watch the world live.
+    View(viewer::ViewArgs),
     /// Open the GPU, check it against the CPU reference, and benchmark inference.
     GpuCheck {
         /// Organisms (independent networks) per batch.
@@ -155,6 +159,7 @@ fn main() {
     let code = match cli.cmd {
         Cmd::Validate { config } => validate(&config),
         Cmd::Run(a) => run(a),
+        Cmd::View(a) => viewer::view(a),
         Cmd::Inspect { checkpoint, id, top } => inspect_checkpoint(&checkpoint, &id, top),
         Cmd::GpuCheck { organisms, hidden, iters, gap_ms } => gpu_check(organisms, &hidden, iters, gap_ms),
     };
@@ -331,13 +336,46 @@ fn write_checkpoint(world: &World, dir: &Path, retain: usize) {
     }
 }
 
-fn run(a: RunArgs) -> i32 {
+pub(crate) struct Launch {
+    pub config: Option<PathBuf>,
+    pub seed: Option<u64>,
+    pub exhibition: bool,
+    pub workers: Option<usize>,
+    pub resume: Option<PathBuf>,
+    pub erase: Vec<(u64, f64, f64, f64)>,
+    pub profile: bool,
+    pub backend: Backend,
+}
+
+pub(crate) struct Prepared {
+    pub world: World,
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<fl_gpu::GpuBackend>,
+    pub ts_supported: Option<bool>,
+    pub report: fl_core::config::ValidationReport,
+    pub start_tick: u64,
+}
+
+pub(crate) fn launch_of(a: &RunArgs) -> Launch {
+    Launch {
+        config: a.config.clone(),
+        seed: a.seed,
+        exhibition: a.exhibition,
+        workers: a.workers,
+        resume: a.resume.clone(),
+        erase: a.erase.clone(),
+        profile: a.profile,
+        backend: a.backend,
+    }
+}
+
+pub(crate) fn prepare(a: &Launch) -> Result<Prepared, i32> {
     let mut world = if let Some(path) = &a.resume {
         match std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| checkpoint::load(&b)) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("{}: {e}", path.display());
-                return 2;
+                return Err(2);
             }
         }
     } else {
@@ -345,7 +383,7 @@ fn run(a: RunArgs) -> i32 {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("{e}");
-                return 2;
+                return Err(2);
             }
         };
         if let Some(s) = a.seed {
@@ -360,7 +398,7 @@ fn run(a: RunArgs) -> i32 {
                 for e in errs {
                     eprintln!("invalid: {e}");
                 }
-                return 1;
+                return Err(1);
             }
         }
     };
@@ -374,7 +412,7 @@ fn run(a: RunArgs) -> i32 {
     }
     world.set_profiling(a.profile);
     #[cfg(feature = "gpu")]
-    let mut gpu = match a.backend {
+    let gpu = match a.backend {
         Backend::Gpu | Backend::GpuFused | Backend::GpuField | Backend::GpuResident | Backend::GpuRealtime => match fl_gpu::GpuBackend::new() {
             Ok(mut g) => {
                 g.set_profiling(a.profile);
@@ -390,7 +428,7 @@ fn run(a: RunArgs) -> i32 {
             }
             Err(e) => {
                 eprintln!("cannot use the GPU backend: {e}");
-                return 2;
+                return Err(2);
             }
         },
         Backend::Cpu => None,
@@ -402,14 +440,36 @@ fn run(a: RunArgs) -> i32 {
     #[cfg(not(feature = "gpu"))]
     if a.backend != Backend::Cpu {
         eprintln!("this build has no GPU support (rebuild with the default `gpu` feature)");
-        return 2;
+        return Err(2);
     }
     for &(t, x, y, r) in &a.erase {
         if let Err(e) = world.schedule(t, Command::EraseDisk { x, y, radius: r, disposal: Disposal::Recycle }) {
             eprintln!("cannot schedule erase: {e}");
-            return 2;
+            return Err(2);
         }
     }
+    Ok(Prepared {
+        world,
+        #[cfg(feature = "gpu")]
+        gpu,
+        ts_supported,
+        report,
+        start_tick,
+    })
+}
+
+fn run(a: RunArgs) -> i32 {
+    let prep = match prepare(&launch_of(&a)) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let mut world = prep.world;
+    #[cfg(feature = "gpu")]
+    let mut gpu = prep.gpu;
+    let report = prep.report;
+    let start_tick = prep.start_tick;
+    let ts_supported = prep.ts_supported;
+    let cfg = world.cfg.clone();
     let frames_dir = a.out.join("frames");
     if let Err(e) = std::fs::create_dir_all(&frames_dir) {
         eprintln!("{}: {e}", frames_dir.display());
@@ -459,16 +519,7 @@ fn run(a: RunArgs) -> i32 {
         frame_no += 1;
     }
     for _ in 0..ticks {
-        #[cfg(feature = "gpu")]
-        let stepped = match gpu.as_mut() {
-            Some(g) if a.backend == Backend::GpuFused => world.step_inference(fl_core::Inference::Fused(g)),
-            Some(g) if a.backend == Backend::GpuField => world.step_inference(fl_core::Inference::Device(g)),
-            Some(g) if matches!(a.backend, Backend::GpuResident | Backend::GpuRealtime) => world.step_inference(fl_core::Inference::Resident(g)),
-            Some(g) => world.step_with(Some(g as &mut dyn fl_core::ControllerBackend)),
-            None => world.step(),
-        };
-        #[cfg(not(feature = "gpu"))]
-        let stepped = world.step();
+        let stepped = step_world(&mut world, a.backend, #[cfg(feature = "gpu")] &mut gpu);
         let r = match stepped {
             Ok(r) => r,
             Err(e) => {
@@ -656,6 +707,24 @@ fn run(a: RunArgs) -> i32 {
     }
 }
 
+pub(crate) fn step_world(world: &mut World, backend: Backend, #[cfg(feature = "gpu")] gpu: &mut Option<fl_gpu::GpuBackend>) -> Result<fl_core::world::TickReport, TickError> {
+    #[cfg(feature = "gpu")]
+    {
+        return match gpu.as_mut() {
+            Some(g) if backend == Backend::GpuFused => world.step_inference(fl_core::Inference::Fused(g)),
+            Some(g) if backend == Backend::GpuField => world.step_inference(fl_core::Inference::Device(g)),
+            Some(g) if matches!(backend, Backend::GpuResident | Backend::GpuRealtime) => world.step_inference(fl_core::Inference::Resident(g)),
+            Some(g) => world.step_with(Some(g as &mut dyn fl_core::ControllerBackend)),
+            None => world.step(),
+        };
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = backend;
+        world.step()
+    }
+}
+
 fn save_frame(world: &World, base: &RenderOpts, dir: &Path, frame: usize, steps_per_s: f64) {
     let mut o = base.clone();
     o.telemetry = vec![
@@ -666,7 +735,7 @@ fn save_frame(world: &World, base: &RenderOpts, dir: &Path, frame: usize, steps_
     ];
     let rgb = render(world, &o);
     let path = dir.join(format!("frame_{frame:05}.png"));
-    if let Err(e) = write_png(&path, &rgb, o.size) {
+    if let Err(e) = write_png(&path, &rgb, o.size, o.size) {
         eprintln!("frame {}: {e}", path.display());
     }
 }
@@ -896,6 +965,27 @@ mod cli_tests {
                 assert!(a.out.to_string_lossy().contains("t20r-profile"));
             }
             _ => panic!("expected run"),
+        }
+        let cli = Cli::try_parse_from([
+            "frankenlife",
+            "view",
+            "--config",
+            r"presets\target-5k-field-ecology.toml",
+            "--backend",
+            "gpu-realtime",
+            "--seconds",
+            "86400",
+            "--out",
+            r"runs\rt5-live",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::View(a) => {
+                assert_eq!(a.backend, Backend::GpuRealtime);
+                assert_eq!(a.seconds, 86400.0);
+                assert!(a.screenshot.is_none());
+            }
+            _ => panic!("expected view"),
         }
     }
 }

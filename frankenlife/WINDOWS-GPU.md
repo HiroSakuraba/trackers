@@ -199,6 +199,40 @@ A one-pass sensor pyramid (every level straight from the field) was tried and
 removed: bit-identical, but its span on this card was 2.2 ms against 0.44 ms
 for the level-by-level passes.
 
+## Watch it live
+
+`view` is the same simulation as `run`, in a window. Vulkan on the GTX 1080:
+
+```powershell
+$env:WGPU_BACKEND = "vulkan"
+cargo run --release -- view --config presets\target-5k-field-ecology.toml --backend gpu-realtime --seconds 86400 --out runs\rt5-live
+```
+
+`--seconds 0` runs until you close the window. Real time for this preset is
+128 ticks per simulated second. The window title and the overlay show tick,
+sim time, population, achieved steps/s, and that rate divided by 128 (speed
+versus real time).
+
+| key / mouse | action |
+| --- | --- |
+| Space | pause / resume |
+| `.` or `N` | pause and advance one tick |
+| `1` | real time (1×) |
+| `2` / `4` | 2× / 4× real time |
+| `0` | as fast as possible |
+| Tab | composite → chemistry → field → raw |
+| drag | pan the torus |
+| wheel | zoom, keeping the cursor's point fixed |
+| click | name the nearest organism (does not change the world) |
+| Esc | quit and write `manifest.json` |
+
+Drawing samples the GPU-resident field between ticks and does not read it
+back. It does not change the tick. A run you do not pause, single-step, or
+erase finishes with the same population and state hash as `run` for the same
+config, seed, backend and `--seconds`. The manifest records
+`simulation_mean_step_ms` (the tick only) and `wall_steps_per_second` (tick
+plus drawing). Compare the title's steps/s with a `--frame-every 0` run.
+
 ## Other runs
 
 The full 80,000-organism target world:
@@ -216,9 +250,10 @@ Compare with `--backend cpu`.
 
 ## What to expect and current limits
 
-- Only controller inference runs on the GPU so far. Sensing, the field, uptake
-  and rendering are still on the CPU, so the whole tick gets faster by less than
-  inference alone does. Moving the field kernels over is the next step.
+- `--backend gpu` still does sensing, the field and uptake on the CPU.
+  `--backend gpu-realtime` (and `gpu-resident`) keep the field on the GPU;
+  `view` draws that copy without reading it back. The plain `gpu` backend
+  gets faster by less than inference alone.
 - A GPU run agrees with the CPU reference to about 1e-6 per logit, not bitwise,
   so its trajectory (and state hash) differs from a CPU run with the same seed.
 - Weights are split into pages that each fit one GPU storage binding, so
