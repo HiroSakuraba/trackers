@@ -11,8 +11,8 @@ use fl_view::{chem_basis, chem_color, lineage_color};
 use super::painter::{self, PaintStats, Painter, Planes, Scene};
 use super::render::View;
 use super::{download_field, prepare, step_world, write_checkpoint, Backend, Launch, Prepared};
-use fl_core::world::TickError;
-use fl_core::{World, MODEL_VERSION};
+use fl_core::world::{Command, Param, TickError};
+use fl_core::{Config, World, MODEL_VERSION};
 
 #[derive(clap::Parser, Debug)]
 pub struct ViewArgs {
@@ -52,6 +52,16 @@ pub struct ViewArgs {
     /// With `--seconds 0` this is the world at tick 0.
     #[arg(long)]
     pub screenshot: Option<PathBuf>,
+    /// Press keys at a tick, for scripted runs and screenshots: `TICK:KEYS`, e.g.
+    /// `--press 0:www --press 600:@2k`. Any control key works; `@N` selects source N
+    /// and `@` alone clears the selection. Repeatable.
+    #[arg(long = "press", value_parser = parse_press)]
+    pub press: Vec<(u64, String)>,
+}
+
+fn parse_press(s: &str) -> Result<(u64, String), String> {
+    let (tick, keys) = s.split_once(':').ok_or("expected TICK:KEYS")?;
+    Ok((tick.trim().parse().map_err(|e| format!("bad tick `{tick}`: {e}"))?, keys.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -168,6 +178,210 @@ impl Pace {
     }
 }
 
+/// How much one key press scales a value, and a mutation press scales the rates.
+const TUNE_STEP: f64 = 1.25;
+const MUTATION_STEP: f64 = 1.5;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Group {
+    Energy,
+    Speed,
+    Diffusion,
+    Decay,
+    Mutation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Control {
+    Tune(Group, f64),
+    Drift(f64),
+    Reset,
+}
+
+/// Keys that change the running world. Lower and upper neighbours on the keyboard are
+/// the down and up pair for each quantity.
+fn control_for(key: &str) -> Option<Control> {
+    Some(match key.to_ascii_lowercase().as_str() {
+        "q" => Control::Tune(Group::Energy, 1.0 / TUNE_STEP),
+        "w" => Control::Tune(Group::Energy, TUNE_STEP),
+        "a" => Control::Tune(Group::Speed, 1.0 / TUNE_STEP),
+        "s" => Control::Tune(Group::Speed, TUNE_STEP),
+        "d" => Control::Tune(Group::Diffusion, 1.0 / TUNE_STEP),
+        "f" => Control::Tune(Group::Diffusion, TUNE_STEP),
+        "c" => Control::Tune(Group::Decay, 1.0 / TUNE_STEP),
+        "v" => Control::Tune(Group::Decay, TUNE_STEP),
+        "z" => Control::Tune(Group::Mutation, 1.0 / MUTATION_STEP),
+        "x" => Control::Tune(Group::Mutation, MUTATION_STEP),
+        "j" => Control::Drift(5.0),
+        "k" => Control::Drift(25.0),
+        "r" => Control::Reset,
+        _ => return None,
+    })
+}
+
+const MUTATION_PARAMS: [Param; 5] =
+    [Param::MutationWeightProbability, Param::MutationWeightSd, Param::MutationReplacementProbability, Param::MutationChemistrySd, Param::MutationSensingSd];
+
+/// What the viewer has asked of the world so far. The world holds the truth; this is
+/// the request side, shown on the HUD and used to compute the next step.
+struct Tuner {
+    /// Values at launch, in `Param::ALL` order.
+    base: [f64; 9],
+    /// Latest requested values, same order.
+    want: [f64; 9],
+    mutation_scale: f64,
+    /// The source a drift key acts on; `None` is every source.
+    source: Option<u32>,
+    drift_degrees: f64,
+    log: Vec<serde_json::Value>,
+    log_file: Option<PathBuf>,
+}
+
+impl Tuner {
+    fn new(cfg: &Config, log_file: Option<PathBuf>) -> Self {
+        let base: [f64; 9] = std::array::from_fn(|i| Param::ALL[i].get(cfg));
+        Tuner { base, want: base, mutation_scale: 1.0, source: None, drift_degrees: 0.0, log: Vec::new(), log_file }
+    }
+
+    fn record(&mut self, tick: u64, entry: serde_json::Value) {
+        let line = serde_json::json!({ "tick": tick, "change": entry });
+        eprintln!("live change at tick {tick}: {entry}");
+        if let Some(path) = &self.log_file {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        self.log.push(line);
+    }
+
+    fn set(&mut self, world: &mut World, param: Param, value: f64) -> bool {
+        match world.schedule(world.tick, Command::SetParam { param, value }) {
+            Ok(_) => {
+                self.want[param.tag() as usize] = value;
+                self.record(world.tick, serde_json::json!({ "param": param.label(), "value": value }));
+                true
+            }
+            Err(e) => {
+                eprintln!("{}: {e}", param.label());
+                false
+            }
+        }
+    }
+
+    fn scale(&mut self, world: &mut World, param: Param, factor: f64, floor: f64) {
+        let i = param.tag() as usize;
+        let (cur, base) = (self.want[i], self.base[i]);
+        let lo = if base > 0.0 { base / 256.0 } else { 0.0 };
+        let hi = if base > 0.0 { base * 256.0 } else { floor * 1000.0 };
+        let next = if cur <= 0.0 { if factor > 1.0 { floor } else { 0.0 } } else { cur * factor };
+        self.set(world, param, next.clamp(lo, hi));
+    }
+
+    /// Apply one control key to `world`. Returns whether the key was a control.
+    fn press(&mut self, world: &mut World, key: &str) -> bool {
+        let Some(control) = control_for(key) else { return false };
+        match control {
+            Control::Tune(Group::Energy, f) => self.scale(world, Param::SourcePower, f, 1.0),
+            Control::Tune(Group::Speed, f) => self.scale(world, Param::SourceSpeed, f, 0.25),
+            Control::Tune(Group::Diffusion, f) => self.scale(world, Param::Diffusion, f, 0.01),
+            Control::Tune(Group::Decay, f) => self.scale(world, Param::Decay, f, 0.005),
+            Control::Tune(Group::Mutation, f) => {
+                let s = (self.mutation_scale * f).clamp(1.0 / 64.0, 64.0);
+                for p in MUTATION_PARAMS {
+                    let mut v = self.base[p.tag() as usize] * s;
+                    if matches!(p, Param::MutationWeightProbability | Param::MutationReplacementProbability) {
+                        v = v.min(1.0);
+                    }
+                    self.set(world, p, v);
+                }
+                self.mutation_scale = s;
+            }
+            Control::Drift(degrees) => {
+                let source = self.source;
+                if world.schedule(world.tick, Command::DriftChemistry { source, degrees }).is_ok() {
+                    self.drift_degrees += degrees;
+                    self.record(world.tick, serde_json::json!({ "chemistry_drift_degrees": degrees, "source": source }));
+                }
+            }
+            Control::Reset => {
+                for p in [Param::SourcePower, Param::SourceSpeed, Param::Diffusion, Param::Decay] {
+                    let b = self.base[p.tag() as usize];
+                    self.set(world, p, b);
+                }
+                for p in MUTATION_PARAMS {
+                    let b = self.base[p.tag() as usize];
+                    self.set(world, p, b);
+                }
+                self.mutation_scale = 1.0;
+            }
+        }
+        true
+    }
+
+    /// `@N` selects source N, `@` clears; anything else is a control key.
+    fn press_script(&mut self, world: &mut World, keys: &str) {
+        let mut chars = keys.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '@' {
+                let mut n = String::new();
+                while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                    n.push(*d);
+                    chars.next();
+                }
+                self.source = n.parse::<u32>().ok().filter(|&k| k < world.cfg.sources.count);
+            } else {
+                self.press(world, &c.to_string());
+            }
+        }
+    }
+
+    fn hud_line(&self) -> String {
+        let g = |p: Param| self.want[p.tag() as usize];
+        let chem = match self.source {
+            Some(k) => format!("SRC {k}"),
+            None => "ALL".into(),
+        };
+        format!(
+            "ENERGY {:.1}/S  SPEED {:.2}  DIFF {:.3}  DECAY {:.3}  MUT X{:.2}  CHEM {chem} DRIFT {:.0} DEG",
+            g(Param::SourcePower),
+            g(Param::SourceSpeed),
+            g(Param::Diffusion),
+            g(Param::Decay),
+            self.mutation_scale,
+            self.drift_degrees
+        )
+    }
+}
+
+/// Where each source is drawn: its center for the tick the next step will take.
+fn source_centers(world: &World) -> Vec<[f64; 2]> {
+    world
+        .sources
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            s.advance_to(world.tick, &world.cfg, &world.rng);
+            s.center_mid(world.tick, &world.cfg)
+        })
+        .collect()
+}
+
+/// The source whose center lies within `reach` world units of `(wx, wy)`, nearest first.
+fn source_at(world: &World, wx: f64, wy: f64, reach: f64) -> Option<u32> {
+    let (ww, wh) = (world.field.width(), world.field.height());
+    source_centers(world)
+        .iter()
+        .enumerate()
+        .map(|(k, c)| {
+            let (dx, dy) = (min_image(c[0] - wx, ww), min_image(c[1] - wy, wh));
+            (dx * dx + dy * dy, k as u32)
+        })
+        .filter(|&(d, _)| d <= reach * reach)
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, k)| k)
+}
+
 struct Session {
     args: ViewArgs,
     world: World,
@@ -185,6 +399,8 @@ struct Session {
     camera: Camera,
     pace: Pace,
     inspect: Option<String>,
+    tune: Tuner,
+    presses: Vec<(u64, String, bool)>,
     wall0: Instant,
     #[cfg(feature = "gpu")]
     device_planes: Option<fl_gpu::FieldPlanes>,
@@ -236,6 +452,10 @@ impl Session {
             world.cfg.name, world.cfg.seed, args.backend, world.cfg.world.tick_denominator
         );
         eprintln!("controls: space pause | . step | 1 realtime | 2 2x | 4 4x | 0 unlimited | tab view | drag pan | wheel zoom | click inspect | esc quit");
+        eprintln!("live tuning: q/w energy | a/s source speed | d/f diffusion | c/v decay | z/x mutation | j/k chemistry drift | click a source to pick it | r reset");
+        let tune_cfg = world.cfg.clone();
+        let tune_log = args.out.join("controls.jsonl");
+        let presses: Vec<(u64, String, bool)> = args.press.iter().map(|(t, k)| (*t, k.clone(), false)).collect();
         Session {
             args,
             world,
@@ -253,6 +473,8 @@ impl Session {
             camera,
             pace: Pace::new(),
             inspect: None,
+            tune: Tuner::new(&tune_cfg, Some(tune_log)),
+            presses,
             wall0: Instant::now(),
             #[cfg(feature = "gpu")]
             device_planes: None,
@@ -273,6 +495,12 @@ impl Session {
             self.pace.paused = true;
             self.stop_reason = "completed".into();
             return Ok(());
+        }
+        for (tick, keys, applied) in self.presses.iter_mut() {
+            if !*applied && *tick <= self.world.tick {
+                *applied = true;
+                self.tune.press_script(&mut self.world, keys);
+            }
         }
         let t = Instant::now();
         let stepped = step_world(&mut self.world, self.backend, #[cfg(feature = "gpu")] &mut self.gpu);
@@ -368,6 +596,7 @@ impl Session {
             "present_cpu_ms_per_step": present_per_step,
             "simulation_mean_step_ms": sim_ms,
             "wall_steps_per_second": wall_rate,
+            "live_changes": self.tune.log,
             "config": self.world.cfg,
         });
         std::fs::write(self.args.out.join("manifest.json"), serde_json::to_string_pretty(&manifest).unwrap()).ok();
@@ -553,6 +782,22 @@ impl Session {
                 }
             }
         }
+        // Source markers: a ring of half a sigma around each center, a full-sigma white
+        // ring around the selected one.
+        let sigma = self.world.cfg.sources.sigma_world_units;
+        for (k, c) in source_centers(&self.world).iter().enumerate() {
+            let selected = self.tune.source == Some(k as u32);
+            let (n, radius, col, bright) = if selected { (72, sigma, [1.0f32, 1.0, 1.0], 1.8f32) } else { (28, 0.5 * sigma, [0.65f32, 0.8, 0.95], 0.8f32) };
+            for s in 0..n {
+                let a = std::f64::consts::TAU * s as f64 / n as f64;
+                let (px, py) = (c[0] + radius * a.cos(), c[1] + radius * a.sin());
+                for ty in y0..=y1 {
+                    for tx in x0..=x1 {
+                        out.extend_from_slice(&[(px + tx as f64 * ww) as f32, (py + ty as f64 * wh) as f32, col[0], col[1], col[2], bright]);
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -575,12 +820,34 @@ impl Session {
             format!("{:.0} STEPS/S  {:.2}X REALTIME  SPEED {speed}  {state}", rate, realtime),
             format!("VIEW {:?}  ZOOM {:.2}X", self.view_mode, self.camera.zoom),
             "SPACE PAUSE  . STEP  1 REALTIME  2 2X  4 4X  0 MAX  TAB VIEW  ESC QUIT".into(),
+            self.tune.hud_line(),
+            "Q/W ENERGY  A/S SOURCE SPEED  D/F DIFFUSION  C/V DECAY  Z/X MUTATION  J/K CHEM DRIFT  CLICK SOURCE  R RESET".into(),
         ];
         if let Some(s) = &self.inspect {
             lines.push(s.clone());
         }
         let scale = if screen.0 >= 1600 { 3 } else { 2 };
         blit_hud(&lines, scale)
+    }
+
+    /// A click selects the source under the cursor (click it again to clear), else
+    /// inspects the organism there. Clicking empty space clears the source selection.
+    fn click(&mut self, px: f64, py: f64, screen: (u32, u32)) {
+        let ww = self.world.field.width();
+        let wh = self.world.field.height();
+        let (wx, wy) = self.camera.screen_to_world(px, py, screen.0 as f64, screen.1 as f64, ww, wh);
+        let z = self.camera.px_per_unit(screen.0 as f64, screen.1 as f64, ww, wh).max(1e-9);
+        // Close to the center, so organisms feeding on a source stay clickable.
+        let reach = (14.0 / z).max(0.5 * self.world.cfg.sources.sigma_world_units);
+        if let Some(k) = source_at(&self.world, wx, wy, reach) {
+            self.tune.source = if self.tune.source == Some(k) { None } else { Some(k) };
+            self.inspect = None;
+            return;
+        }
+        self.inspect = self.pick(px, py, screen);
+        if self.inspect.is_none() {
+            self.tune.source = None;
+        }
     }
 
     fn pick(&self, px: f64, py: f64, screen: (u32, u32)) -> Option<String> {
@@ -1098,6 +1365,9 @@ impl winit::application::ApplicationHandler for WindowApp<'_> {
                     Key::Character(s) if s.as_str() == "0" => {
                         session.pace.speed = Speed::Unlimited;
                     }
+                    Key::Character(s) if control_for(s.as_str()).is_some() => {
+                        session.tune.press(&mut session.world, s.as_str());
+                    }
                     _ => {}
                 }
                 if let Some(w) = self.swap.as_ref() {
@@ -1135,7 +1405,7 @@ impl winit::application::ApplicationHandler for WindowApp<'_> {
                             (z.width, z.height)
                         });
                         if let Some(screen) = screen {
-                            self.session.inspect = self.session.pick(self.cursor.0, self.cursor.1, screen);
+                            self.session.click(self.cursor.0, self.cursor.1, screen);
                             if let Some(w) = self.swap.as_ref() {
                                 w.window.request_redraw();
                             }
@@ -1253,6 +1523,96 @@ mod tests {
         pace.last = Instant::now() - Duration::from_millis(100);
         let n = pace.take(128.0, Duration::from_millis(14), false);
         assert!((12..=13).contains(&n), "0.1s at 128 Hz schedules {n} ticks");
+    }
+
+    fn tuned_world() -> World {
+        let mut c = tiny_config();
+        c.sources.count = 3;
+        c.sources.path_speed = 2.0;
+        World::new(c).unwrap()
+    }
+
+    #[test]
+    fn control_keys_map_to_opposite_pairs() {
+        for (down, up) in [("q", "w"), ("a", "s"), ("d", "f"), ("c", "v"), ("z", "x")] {
+            let (Some(Control::Tune(g1, f1)), Some(Control::Tune(g2, f2))) = (control_for(down), control_for(up)) else { panic!("{down}/{up}") };
+            assert_eq!(g1, g2);
+            assert!(f1 < 1.0 && f2 > 1.0 && (f1 * f2 - 1.0).abs() < 1e-12, "{down}/{up} undo each other");
+            assert_eq!(control_for(&up.to_uppercase()), control_for(up), "shift does not matter");
+        }
+        assert_eq!(control_for("j"), Some(Control::Drift(5.0)));
+        assert_eq!(control_for("r"), Some(Control::Reset));
+        for k in [" ", ".", "n", "0", "1", "2", "4", "tab", "e", "u"] {
+            assert_eq!(control_for(k), None, "{k} keeps its old meaning");
+        }
+    }
+
+    #[test]
+    fn keys_change_the_running_world_and_reset_restores_it() {
+        let mut w = tuned_world();
+        let mut tune = Tuner::new(&w.cfg, None);
+        let (power, speed, diff, decay, mw) = (w.cfg.sources.power_per_source, w.cfg.sources.path_speed, w.cfg.world.diffusion, w.cfg.world.decay_per_second, w.cfg.mutation.weight_standard_deviation);
+        assert!(tune.press(&mut w, "w") && tune.press(&mut w, "w"));
+        assert!(tune.press(&mut w, "s"));
+        assert!(tune.press(&mut w, "d"));
+        assert!(tune.press(&mut w, "v"));
+        assert!(tune.press(&mut w, "x"));
+        assert!(!tune.press(&mut w, "e"), "not a control");
+        w.step().unwrap();
+        assert!((w.cfg.sources.power_per_source - power * 1.25 * 1.25).abs() < 1e-9);
+        assert!((w.cfg.sources.path_speed - speed * 1.25).abs() < 1e-9);
+        assert!((w.cfg.world.diffusion - diff / 1.25).abs() < 1e-9);
+        assert!((w.cfg.world.decay_per_second - decay * 1.25).abs() < 1e-9);
+        assert!((w.cfg.mutation.weight_standard_deviation - mw * 1.5).abs() < 1e-9);
+        assert!((tune.mutation_scale - 1.5).abs() < 1e-12);
+        assert!(tune.hud_line().contains("MUT X1.50"));
+        tune.press(&mut w, "r");
+        w.step().unwrap();
+        assert!((w.cfg.sources.power_per_source - power).abs() < 1e-9);
+        assert!((w.cfg.sources.path_speed - speed).abs() < 1e-9);
+        assert!((w.cfg.mutation.weight_standard_deviation - mw).abs() < 1e-12);
+        assert_eq!(tune.log.len(), 2 + 1 + 1 + 1 + 5 + 4 + 5);
+    }
+
+    #[test]
+    fn drift_keys_act_on_the_selected_source_only() {
+        let mut w = tuned_world();
+        let mut tune = Tuner::new(&w.cfg, None);
+        let before: Vec<_> = w.sources.iter().map(|s| s.chem).collect();
+        tune.press_script(&mut w, "@1k");
+        w.step().unwrap();
+        assert_eq!(w.sources[0].chem, before[0]);
+        assert_ne!(w.sources[1].chem, before[1]);
+        assert_eq!(w.sources[2].chem, before[2]);
+        tune.press_script(&mut w, "@j");
+        assert_eq!(tune.source, None);
+        w.step().unwrap();
+        assert_ne!(w.sources[0].chem, before[0], "with nothing selected every source drifts");
+        assert!(tune.hud_line().contains("CHEM ALL DRIFT 30 DEG"));
+        tune.press_script(&mut w, "@9");
+        assert_eq!(tune.source, None, "a source that does not exist is not selected");
+    }
+
+    #[test]
+    fn clicking_near_a_source_center_picks_it() {
+        let w = tuned_world();
+        let centers = source_centers(&w);
+        for (k, c) in centers.iter().enumerate() {
+            assert_eq!(source_at(&w, c[0] + 0.1, c[1] - 0.1, 0.5), Some(k as u32));
+            assert_eq!(source_at(&w, c[0] + 100.0, c[1], 0.5), None);
+        }
+    }
+
+    #[test]
+    fn hud_text_uses_only_drawable_glyphs() {
+        let mut w = tuned_world();
+        let mut tune = Tuner::new(&w.cfg, None);
+        tune.press_script(&mut w, "@2wk");
+        for line in [tune.hud_line(), "Q/W ENERGY  A/S SOURCE SPEED  D/F DIFFUSION  C/V DECAY  Z/X MUTATION  J/K CHEM DRIFT  CLICK SOURCE  R RESET".to_string()] {
+            for c in line.chars().filter(|c| *c != ' ') {
+                assert_ne!(glyph(c), "000000000000000", "no glyph for {c:?} in {line}");
+            }
+        }
     }
 
     #[test]

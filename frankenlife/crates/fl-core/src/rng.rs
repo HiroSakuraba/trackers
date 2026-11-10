@@ -18,6 +18,8 @@ pub enum Lane {
     SourceCenter = 10,
     SourceChemistry = 11,
     SourcePathDirection = 12,
+    /// Random perpendicular direction of a live chemistry drift command.
+    SourceChemistryDrift = 13,
     ReproductionAttempt = 20,
     ChildOffset = 21,
     MutationTopology = 30,

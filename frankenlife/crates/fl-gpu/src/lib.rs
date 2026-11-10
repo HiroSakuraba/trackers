@@ -2663,6 +2663,51 @@ mod tests {
         assert!(a.orgs.len() > 500);
     }
 
+    /// Live tuning commands (source power and speed, diffusion, decay, chemistry drift)
+    /// reach the device: the single-wait GPU world follows the CPU reference through the
+    /// change, injects exactly what the new power says, and its ledger still closes.
+    #[test]
+    fn live_tuning_reaches_the_gpu_and_matches_the_cpu() {
+        use fl_core::world::Param;
+        let Ok(mut g) = GpuBackend::new() else {
+            eprintln!("no GPU adapter available; skipping");
+            return;
+        };
+        g.set_single_wait(true);
+        let mut cpu = fl_core::World::new(vivid_small()).unwrap();
+        let mut gpu = fl_core::World::new(vivid_small()).unwrap();
+        let base = vivid_small();
+        for w in [&mut cpu, &mut gpu] {
+            w.schedule(10, fl_core::Command::SetParam { param: Param::SourcePower, value: base.sources.power_per_source * 2.0 }).unwrap();
+            w.schedule(10, fl_core::Command::SetParam { param: Param::SourceSpeed, value: base.sources.path_speed * 3.0 + 1.0 }).unwrap();
+            w.schedule(10, fl_core::Command::SetParam { param: Param::Diffusion, value: base.world.diffusion * 1.5 }).unwrap();
+            w.schedule(10, fl_core::Command::SetParam { param: Param::Decay, value: base.world.decay_per_second * 2.0 }).unwrap();
+            w.schedule(10, fl_core::Command::DriftChemistry { source: Some(0), degrees: 40.0 }).unwrap();
+        }
+        let (mut before, mut after) = (0.0, 0.0);
+        for k in 0..20 {
+            cpu.step().unwrap();
+            let r = gpu.step_inference(fl_core::Inference::Resident(&mut g)).unwrap();
+            if k == 9 {
+                before = r.ledger.injected_sources;
+            }
+            if k == 10 {
+                after = r.ledger.injected_sources;
+            }
+        }
+        gpu.sync_field(&mut g).unwrap();
+        assert!((after / before - 2.0).abs() < 1e-4, "device injection {before} -> {after}");
+        assert_eq!(gpu.cfg.sources.power_per_source, base.sources.power_per_source * 2.0);
+        assert_eq!(cpu.sources, gpu.sources, "sources (positions, chemistry) agree");
+        let total: f64 = cpu.field.e.iter().map(|&v| v as f64).sum();
+        let worst = cpu.field.e.iter().zip(&gpu.field.e).map(|(&a, &b)| (a as f64 - b as f64).abs()).fold(0.0, f64::max);
+        eprintln!("live tuning: field energy {total:.3}, worst cell difference {worst:.2e}");
+        assert!(worst / total.max(1e-9) < 1e-3, "field differs from the CPU reference after the change");
+        let l = &gpu.ledger;
+        let expected = l.initial_endowment + l.injected - l.removed - l.dissipated.total();
+        assert!((gpu.total_energy() - expected).abs() / l.transferred.max(1.0) < 1e-5, "ledger closes through the change");
+    }
+
     /// The single-wait path (`--backend gpu-realtime`) against the classic resident path.
     /// Only the uptake request differs (f32 on the device instead of f64 on the host), so
     /// a short run stays close; two single-wait runs are bit-identical; the ledger closes

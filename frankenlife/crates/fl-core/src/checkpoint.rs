@@ -225,6 +225,22 @@ fn put_command(w: &mut W, c: &ScheduledCommand) {
                 None => w.u8(0),
             }
         }
+        Command::SetParam { param, value } => {
+            w.u8(3);
+            w.u8(param.tag());
+            w.f64(*value);
+        }
+        Command::DriftChemistry { source, degrees } => {
+            w.u8(4);
+            match source {
+                Some(k) => {
+                    w.u8(1);
+                    w.u32(*k);
+                }
+                None => w.u8(0),
+            }
+            w.f64(*degrees);
+        }
     }
 }
 
@@ -251,6 +267,19 @@ fn get_command(r: &mut R) -> Res<ScheduledCommand> {
                 t => return Err(format!("bad direction tag {t}")),
             };
             Command::EnergyBrush { x, y, radius, amount, direction }
+        }
+        3 => {
+            let tag = r.u8()?;
+            let param = crate::world::Param::from_tag(tag).ok_or(format!("bad parameter tag {tag}"))?;
+            Command::SetParam { param, value: r.f64()? }
+        }
+        4 => {
+            let source = match r.u8()? {
+                0 => None,
+                1 => Some(r.u32()?),
+                t => return Err(format!("bad source tag {t}")),
+            };
+            Command::DriftChemistry { source, degrees: r.f64()? }
         }
         t => return Err(format!("unknown command tag {t}")),
     };
@@ -554,6 +583,32 @@ mod tests {
         same_science(&a, &b);
         assert!(a.totals.births > 0, "the comparison covered births");
         assert_eq!(a.pending.len(), 1, "the tick-1000 command is still pending");
+    }
+
+    #[test]
+    fn live_tuning_survives_a_checkpoint() {
+        use crate::world::Param;
+        let mut a = World::new(small()).unwrap();
+        a.schedule(2, Command::SetParam { param: Param::SourcePower, value: 55.0 }).unwrap();
+        a.schedule(2, Command::DriftChemistry { source: Some(1), degrees: 30.0 }).unwrap();
+        a.schedule(500, Command::SetParam { param: Param::MutationWeightSd, value: 0.3 }).unwrap();
+        a.schedule(501, Command::DriftChemistry { source: None, degrees: 10.0 }).unwrap();
+        for _ in 0..5 {
+            a.step().unwrap();
+        }
+        assert_eq!(a.cfg.sources.power_per_source, 55.0, "the applied change is part of the configuration");
+        let bytes = save(&a);
+        let mut b = load(&bytes).unwrap();
+        same_science(&a, &b);
+        assert_eq!(b.cfg.sources.power_per_source, 55.0);
+        assert_eq!(save(&b), bytes);
+        for _ in 0..600 {
+            a.step().unwrap();
+            b.step().unwrap();
+        }
+        same_science(&a, &b);
+        assert_eq!(b.cfg.mutation.weight_standard_deviation, 0.3);
+        assert!(a.pending.is_empty());
     }
 
     #[test]
